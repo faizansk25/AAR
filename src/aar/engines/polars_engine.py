@@ -17,8 +17,9 @@ from typing import Any, Sequence
 
 from ..capability import Device
 from ..failures import SourceUnavailable
-from ..interchange import Table, require_arrow
+from ..interchange import Table, reconcile, require_arrow
 from ..ir import Expr, JoinType, Node
+from ..lineage import taint as _lineage
 from .base import Engine, PredicateCompiler
 
 __all__ = ["PolarsEngine"]
@@ -38,9 +39,16 @@ class PolarsEngine(Engine):
     def _wrap(table: Table) -> Any:
         return table.arrow
 
-    def _table(self, frame: Any) -> Table:
-        """Polars -> Arrow -> AAR, with the schema preserved."""
-        return Table(frame.to_arrow())
+    def _table(self, frame: Any, source: Table | None = None,
+               derived: Any = None) -> Table:
+        """Polars -> Arrow -> AAR, with the schema preserved.
+
+        ``source``/``derived`` restore what Polars cannot carry. A Polars
+        DataFrame has nowhere to put an AAR classification, so the round trip
+        returns a table whose fields are all unclassified - which would make a
+        CONFIDENTIAL column silently public after any Polars filter.
+        """
+        return reconcile(Table(frame.to_arrow()), source, derived)
 
     # ------------------------------------------------------------------ read
     def read_scan(self, node: Node) -> Table:
@@ -82,7 +90,7 @@ class PolarsEngine(Engine):
             from .arrow_engine import ArrowEngine
             return ArrowEngine().filter(table, predicate)
         frame = self._pl.from_arrow(table.arrow).filter(expr)
-        return self._table(frame)
+        return self._table(frame, source=table)
 
     def project(self, table: Table, columns: Sequence[str]) -> Table:
         return table.select(list(columns))
@@ -98,7 +106,9 @@ class PolarsEngine(Engine):
             return ArrowEngine().group_by(table, keys, aggs)
         frame = (self._pl.from_arrow(table.arrow)
                  .group_by(list(keys)).agg(**spec).sort(list(keys)))
-        return self._table(frame)
+        return self._table(
+            frame, source=table,
+            derived=_lineage.aggregate_tags(table.schema, aggs))
 
 
     def sort(self, table: Table, keys: Sequence[tuple[str, bool]]) -> Table:
@@ -114,7 +124,7 @@ class PolarsEngine(Engine):
         by = [self._pl.col(str(k)) for k, _ in keys]
         descending = [not bool(asc) for _, asc in keys]
         return self._table(self._pl.from_arrow(table.arrow)
-                           .sort(by, descending=descending))
+                           .sort(by, descending=descending), source=table)
 
 
 
@@ -123,7 +133,8 @@ class PolarsEngine(Engine):
             raise ValueError("limit must be non-negative")
         if table.num_rows <= n:
             return table
-        return self._table(self._pl.from_arrow(table.arrow).head(n))
+        return self._table(self._pl.from_arrow(table.arrow).head(n),
+                           source=table)
 
     def join(self, left: Table, right: Table, keys: Sequence[str],
              how: str) -> Table:
@@ -137,7 +148,14 @@ class PolarsEngine(Engine):
         lf = self._pl.from_arrow(left.arrow)
         rf = self._pl.from_arrow(right.arrow)
         joined = lf.join(rf, on=list(keys), how=polars_how)
-        return self._table(joined)
+        # A joined row can draw from either input, so every output column is
+        # as sensitive as the more sensitive of the two sides. Left alone,
+        # this boundary dropped both sides' tags on the floor.
+        both = _lineage.merge_schemas(left.schema, right.schema)
+        out_names = list(left.column_names) + [
+            c for c in right.column_names if c not in keys]
+        return self._table(joined, source=left,
+                           derived={n: both for n in out_names})
 
     def udf(self, table: Table, fn: Any, mode: str = "row") -> Table:
         from .arrow_engine import ArrowEngine

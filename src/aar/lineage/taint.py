@@ -28,15 +28,16 @@ still needs a way out, or analysts will simply strip the tags off the source.
 
 from __future__ import annotations
 
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from ..types import Field, Schema, Sensitivity, sensitivity_of
 
 __all__ = [
     "LineageEvent", "derive_from", "inherit_all", "merge_schemas",
-    "declassify", "is_derived_from", "describe", "AGGREGATE_RULE",
-    "COUNT_STAR_RULE", "UDF_RULE", "JOIN_RULE",
+    "declassify", "is_derived_from", "describe", "aggregate_tags",
+    "AGGREGATE_RULE", "COUNT_STAR_RULE", "UDF_RULE", "JOIN_RULE",
 ]
+
 
 #: Rule names, recorded on every derivation so an audit can say *why* a
 #: column is sensitive rather than only that it is.
@@ -135,6 +136,22 @@ def for_aggregate(schema: Any, agg: Any) -> frozenset[str]:
     if isinstance(agg.arg, Col):
         return derive_from(schema, (agg.arg.name,))
     return inherit_all(schema)
+
+
+def aggregate_tags(schema: Any,
+                   aggs: Mapping[str, Any]) -> dict[str, frozenset[str]]:
+    """The tags every aggregate output column inherits, by output name.
+
+    Without this, ``SUM(salary)`` is born unlabelled and a policy that
+    trusts classification has nothing to act on - a derived column leaking
+    straight past a privacy layer that looks like it is working.
+
+    It lives here rather than in an engine because every engine needs the
+    same answer, and a per-engine copy would eventually be a second and
+    different answer.
+    """
+    return {name: for_aggregate(schema, agg) for name, agg in aggs.items()}
+
 
 
 def declassify(field: Field, justification: str) -> Field:

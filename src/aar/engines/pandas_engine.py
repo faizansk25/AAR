@@ -17,7 +17,7 @@ from typing import Any, Sequence
 
 from ..capability import Device
 from ..failures import SourceUnavailable
-from ..interchange import Table, require_arrow
+from ..interchange import Table, reconcile, require_arrow
 from ..ir import Expr, Node
 from .base import Engine, PredicateCompiler
 
@@ -37,9 +37,18 @@ class PandasEngine(Engine):
     def _frame(self, table: Table) -> Any:
         return self._pd.DataFrame(table.arrow.to_pandas())
 
-    def _table(self, frame: Any) -> Table:
+    def _table(self, frame: Any, source: Table | None = None,
+               derived: Any = None) -> Table:
+        """pandas -> Arrow -> AAR, with the schema preserved.
+
+        ``source``/``derived`` restore what pandas cannot carry. A DataFrame
+        has nowhere to put an AAR classification, so without them a
+        CONFIDENTIAL column silently becomes public after a pandas filter.
+        """
         pa = require_arrow()
-        return Table(pa.Table.from_pandas(frame, preserve_index=False))
+        return reconcile(Table(pa.Table.from_pandas(frame,
+                                                     preserve_index=False)),
+                         source, derived)
 
     def read_scan(self, node: Node) -> Table:
         spec = node.scan
@@ -66,7 +75,7 @@ class PandasEngine(Engine):
     def filter(self, table: Table, predicate: Expr) -> Table:
         frame = self._frame(table)
         test = PredicateCompiler.compile(predicate)
-        return self._table(frame[frame.apply(test, axis=1)])
+        return self._table(frame[frame.apply(test, axis=1)], source=table)
 
     def project(self, table: Table, columns: Sequence[str]) -> Table:
         return table.select(list(columns))
@@ -82,7 +91,7 @@ class PandasEngine(Engine):
         frame = self._frame(table).sort_values(
             by=[k for k, _ in keys], ascending=[asc for _, asc in keys],
             kind="mergesort")
-        return self._table(frame)
+        return self._table(frame, source=table)
 
     def limit(self, table: Table, n: int) -> Table:
         if n < 0:

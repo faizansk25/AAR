@@ -256,9 +256,22 @@ class ArrowEngine(Engine):
 
     # ----------------------------------------------------------------- sort
     def sort(self, table: Table, keys: Sequence[tuple[str, bool]]) -> Table:
+        """Order rows, keeping every column's classification.
+
+        Sorting is a kernel, not a method: ``pa.Table`` has no
+        ``sort_indices`` - it is ``pyarrow.compute.sort_indices`` - and its
+        sort order is an enum whose *spelling* differs from Arrow's docs in a
+        way that raises rather than falling back. Calling it on the wrapper
+        was a latent crash on any non-empty sort: the reference engine
+        failing at the one operation every other engine could do.
+        """
         if not keys or table.num_rows == 0:
             return table
-        return table.take(table.sort_indices(list(keys)))
+        import pyarrow.compute as pc
+
+        order = [(str(name), "ascending" if asc else "descending")
+                 for name, asc in keys]
+        return table.take(pc.sort_indices(table.arrow, order))
 
     # ---------------------------------------------------------------- limit
     def limit(self, table: Table, n: int) -> Table:
@@ -532,15 +545,13 @@ def _field(name: str, arrow_type: Any) -> Any:
 
 
 def _aggregate_tags(schema: Any,
-                   aggs: dict[str, Any]) -> dict[str, frozenset[str]]:
+                    aggs: dict[str, Any]) -> dict[str, frozenset[str]]:
     """What each aggregate output column inherits from its argument.
 
-    Without this, ``SUM(salary)`` is born unlabelled and a policy that
-    trusts classification has nothing to act on - a derived column leaking
-    straight past a privacy layer that looks like it is working.
+    Delegates to the lineage layer so every engine applies the same rule; a
+    second implementation here would eventually be a second answer.
     """
-    return {name: _lineage.for_aggregate(schema, agg)
-            for name, agg in aggs.items()}
+    return _lineage.aggregate_tags(schema, aggs)
 
 
 def _udf_output_name(fn: Any) -> str:

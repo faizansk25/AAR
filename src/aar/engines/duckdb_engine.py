@@ -22,8 +22,9 @@ from typing import Any, Sequence
 
 from ..capability import Device
 from ..failures import SourceUnavailable
-from ..interchange import Table, require_arrow
+from ..interchange import Table, reconcile, require_arrow
 from ..ir import Col, Expr, JoinType, Lit, Node, NodeType
+from ..lineage import taint as _lineage
 from .base import Engine, PredicateCompiler
 
 __all__ = ["DuckDBEngine"]
@@ -79,23 +80,36 @@ class DuckDBEngine(Engine):
             self._registered.add(name)
         return _Relation(self.conn, name)
 
-    def _to_table(self, result: Any) -> Table:
-        """A DuckDB result -> an AAR Table.
+    def _to_table(self, result: Any, source: Table | None = None,
+                  derived: Any = None) -> Table:
+        """A DuckDB result -> an AAR Table, keeping AAR's metadata.
 
         DuckDB exposes results as its own relation type, not Arrow. Calling
         ``.arrow()`` on it is not a real method, so the result is materialised
         through ``fetch_arrow_table`` - which is also the zero-copy path
         rather than a row-by-row conversion.
+
+        ``source`` and ``derived`` are not optional politeness. A DuckDB
+        result is a bare Arrow table, and ``Table(arrow)`` builds a schema
+        whose every field is unclassified - so without reconciliation a
+        CONFIDENTIAL column silently becomes public the moment a filter runs
+        on DuckDB, and a policy trusting classification has nothing to act
+        on. The numbers stay right, which is what makes it dangerous.
         """
         pa = require_arrow()
         if isinstance(result, pa.Table):
-            return Table(result)
-        fetch = getattr(result, "fetch_arrow_table", None)
-        if fetch is None:
-            raise TypeError(
-                f"DuckDB returned {type(result).__name__}, which has no "
-                f"fetch_arrow_table(); this build of duckdb is not supported")
-        return Table(fetch())
+            arrow = result
+        else:
+            fetch = getattr(result, "fetch_arrow_table", None)
+            if fetch is None:
+                raise TypeError(
+                    f"DuckDB returned {type(result).__name__}, which has no "
+                    f"fetch_arrow_table(); this build of duckdb is not "
+                    f"supported")
+            arrow = fetch()
+        return reconcile(Table(_denormalise_decimals(arrow, pa)),
+                         source, derived)
+
 
     # ------------------------------------------------------------------ read
     def read_scan(self, node: Node) -> Table:
@@ -142,7 +156,8 @@ class DuckDBEngine(Engine):
         rel = self._register(table)
         try:
             return self._to_table(
-                rel.sql(f'SELECT * FROM "{rel.name}" WHERE {sql_where}'))
+                rel.sql(f'SELECT * FROM "{rel.name}" WHERE {sql_where}'),
+                source=table)
         finally:
             rel.release()
 
@@ -177,7 +192,9 @@ class DuckDBEngine(Engine):
             # Materialise *before* releasing. Unregistering the relation
             # invalidates the pending result, and fetching afterwards returns
             # an empty table rather than an error - a silent wrong answer.
-            return self._to_table(result)
+            return self._to_table(
+                result, source=table,
+                derived=_lineage.aggregate_tags(table.schema, aggs))
         finally:
             rel.release()
 
@@ -190,8 +207,9 @@ class DuckDBEngine(Engine):
                           for k, asc in keys)
         rel = self._register(table)
         try:
-            return self._to_table(rel.sql(
-                f'SELECT * FROM {_quote_ident(rel.name)} ORDER BY {order}'))
+            return self._to_table(
+                rel.sql(f'SELECT * FROM {_quote_ident(rel.name)} ORDER BY '
+                        f'{order}'), source=table)
         finally:
             rel.release()
 
@@ -203,8 +221,9 @@ class DuckDBEngine(Engine):
             return table
         rel = self._register(table)
         try:
-            return self._to_table(rel.sql(
-                f'SELECT * FROM {_quote_ident(rel.name)} LIMIT {int(n)}'))
+            return self._to_table(
+                rel.sql(f'SELECT * FROM {_quote_ident(rel.name)} '
+                        f'LIMIT {int(n)}'), source=table)
         finally:
             rel.release()
 
@@ -222,9 +241,16 @@ class DuckDBEngine(Engine):
                 [f"l.{_quote_ident(c)}" for c in left.column_names]
                 + [f"r.{_quote_ident(c)}" for c in right.column_names
                    if c not in keys])
-            return self._to_table(rel_l.sql(
-                f'SELECT {cols} FROM {_quote_ident(rel_l.name)} l '
-                f'{how_sql} JOIN {_quote_ident(rel_r.name)} r ON {on}'))
+            # Either input can contribute to a joined row, so every output
+            # column is as sensitive as the more sensitive of the two sides.
+            both = _lineage.merge_schemas(left.schema, right.schema)
+            out_names = list(left.column_names) + [
+                c for c in right.column_names if c not in keys]
+            return self._to_table(
+                rel_l.sql(
+                    f'SELECT {cols} FROM {_quote_ident(rel_l.name)} l '
+                    f'{how_sql} JOIN {_quote_ident(rel_r.name)} r ON {on}'),
+                source=left, derived={n: both for n in out_names})
         finally:
             rel_l.release()
             rel_r.release()
@@ -313,6 +339,47 @@ class _Relation:
 def _quote_ident(name: str) -> str:
     """Quote an identifier for DuckDB, escaping embedded quotes."""
     return '"' + str(name).replace('"', '""') + '"'
+
+
+def _denormalise_decimals(arrow: Any, pa: Any) -> Any:
+    """Collapse DuckDB's ``DECIMAL`` results to the canonical numeric type.
+
+    DuckDB types ``SUM(INTEGER)`` as ``DECIMAL(38, 0)`` and returns
+    ``Decimal('400')``, where Arrow returns the integer ``400``. Both are
+    "the right number", so nothing is wrong in a narrow sense - but AAR
+    exists to make engine differences invisible, and this one changes the
+    Python type a caller receives and the canonical type of the output
+    schema depending on which engine the planner chose. A pipeline that
+    returns ``int`` on one run and ``Decimal`` on the next, purely because
+    the cost model had a different opinion, is precisely the surprise the
+    interchange layer is meant to remove.
+
+    A decimal with a zero scale is an integer; anything else becomes a
+    float. ``NaN``/infinity are left to Arrow, which already represents
+    them in the float domain.
+    """
+    arrays = []
+    changed = False
+    for field, column in zip(arrow.schema, arrow.columns):
+        if not pa.types.is_decimal(field.type):
+            arrays.append(column)
+            continue
+        if field.type.scale == 0:
+            arrays.append(pa.array(
+                [None if v is None else int(v) for v in column.to_pylist()],
+                type=pa.int64()))
+        else:
+            arrays.append(pa.array(
+                [None if v is None else float(v) for v in column.to_pylist()],
+                type=pa.float64()))
+        changed = True
+    if not changed:
+        return arrow
+    return pa.Table.from_arrays(
+        arrays,
+        schema=pa.schema([pa.field(f.name, a.type, nullable=f.nullable)
+                          for f, a in zip(arrow.schema, arrays)]))
+
 
 
 def _quote_value(value: Any) -> str:

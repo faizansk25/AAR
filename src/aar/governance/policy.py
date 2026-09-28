@@ -119,6 +119,14 @@ NETWORK_SINKS: frozenset[str] = frozenset({
     "email", "lakesnow", "bigquery", "databricks", "snowflake",
 })
 
+#: The sinks AAR knows write to the local filesystem. Membership here is what
+#: earns a name the benefit of the doubt, which is why the list is explicit
+#: and short rather than a default.
+LOCAL_SINKS: frozenset[str] = frozenset({
+    "excel", "xlsx", "parquet", "csv", "json", "jsonl", "arrow", "feather",
+    "sqlite", "memory", "in_memory", "local", "local_file", "none", "stdout",
+})
+
 
 @dataclass(frozen=True, slots=True)
 class Sink:
@@ -138,12 +146,23 @@ class Sink:
         """Infer the sink kind from a connector name.
 
         Inference is not a shortcut past the policy - it is the default
-        description, and an explicit :class:`Sink` always overrides it. The
-        inference errs towards ``network=True``, because a sink wrongly
-        believed to be local is a data leak and the reverse is an annoyance.
+        description, and an explicit :class:`Sink` always overrides it.
+
+        The inference **fails closed**: only a name in :data:`LOCAL_SINKS`
+        is believed to be local, and everything else - an unknown connector,
+        a typo, an empty string - is treated as network egress. The
+        asymmetry is the point. Believing a remote sink is local is a data
+        leak; believing a local sink is remote is an inconvenience the
+        analyst can fix by naming it.
+
+        The earlier version of this inferred locality by *absence* from
+        ``NETWORK_SINKS``, which inverted that: ``ftp``, ``smb`` and any
+        name AAR had not heard of were all classified local and therefore
+        permitted, under a default-deny policy that documented the opposite.
+        A test pins the difference.
         """
         k = (kind or "").strip().lower()
-        return cls(kind=k, network=k in NETWORK_SINKS)
+        return cls(kind=k, network=k not in LOCAL_SINKS)
 
     def describe(self) -> str:
         where = "network" if self.network else "local"
@@ -151,6 +170,7 @@ class Sink:
 
     def __str__(self) -> str:
         return self.describe()
+
 
 
 # ------------------------------------------------------------------ policy

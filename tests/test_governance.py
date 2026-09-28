@@ -56,16 +56,47 @@ class TestEgress:
         assert "postgres" in d.reason
 
     def test_every_network_sink_is_recognised(self):
-        """A sink AAR does not know about is treated as a network sink.
+        """Unknown sinks fail closed, and local ones are named explicitly.
 
         The failure guarded against is a new connector added without updating
         the list, silently writing a customer's data somewhere it should not.
+        So the test is a *partition*: everything is either a known local sink
+        or treated as egress, and nothing sits in an unclassified middle.
         """
+        from aar.governance import LOCAL_SINKS
+
         for kind in ("postgres", "mongodb", "s3", "kafka", "http", "webhook",
-                     "bigquery", "snowflake"):
+                     "bigquery", "snowflake", "smb", "ftp", "nfs"):
             assert Sink.of(kind).network, kind
-        for kind in ("excel", "parquet", "csv", "sqlite"):
+        for kind in ("excel", "parquet", "csv", "json", "sqlite"):
             assert not Sink.of(kind).network, kind
+
+    def test_an_unknown_sink_is_egress_not_local(self):
+        """A name AAR has never heard of must not be trusted as local.
+
+        This was the fail-open: inference tested membership of NETWORK_SINKS
+        and concluded "not in it, therefore local", so `ftp`, `smb` and any
+        unknown connector were permitted to receive data under a policy
+        documented as default-deny. It is exactly the case the failure above
+        was about, and it passed anyway.
+        """
+        for kind in ("totally_unknown_thing", "", "   ", "sqlite_network"):
+            assert Sink.of(kind).network, kind
+
+    def test_a_local_sink_needs_no_rule_to_earn_its_belief(self):
+        """The benefit of the doubt is explicit membership, not absence.
+
+        A short, named LOCAL_SINKS list means adding a connector is a
+        deliberate decision rather than the side effect of forgetting to
+        update a deny-list.
+        """
+        from aar.governance import LOCAL_SINKS, NETWORK_SINKS
+
+        assert LOCAL_SINKS.isdisjoint(NETWORK_SINKS)
+        assert len(LOCAL_SINKS) < len(NETWORK_SINKS), (
+            "the local list should be the short one; a long list of "
+            "known-local sinks is a deny-list with extra steps")
+
 
     def test_a_permitted_network_sink_still_obeys_sensitivity(
             self, confidential, analyst):

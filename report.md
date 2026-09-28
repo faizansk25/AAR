@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, and enforces it · 485 tests
+**Status:** AAR runs pipelines, propagates privacy, and enforces it · 509 tests
 **Last updated:** 2026-09-28
 
 ---
@@ -632,6 +632,58 @@ document and a string in the next. Nested objects and arrays are rendered as
 JSON text: Arrow has nested types, but a document store's nesting is
 free-form, and mapping it to a fixed Arrow struct would either fail or invent
 a shape the data does not have.
+
+### 3.13 Five real bugs found by cross-engine parity probing
+
+A probe ran filter, project, sort, limit and group-by on every installed
+engine against the same CONFIDENTIAL-tagged input. It found **ten tag-losses
+and three further defects**, all of the "correct numbers, wrong privacy
+label" variety. Every one is now fixed and pinned by a test.
+
+**1. Ten tag-losses across DuckDB, Polars and pandas.** An engine that
+round-trips a table through its own native representation — a DuckDB
+relation, a Polars DataFrame, a pandas DataFrame — comes back as a *bare*
+Arrow table. `Table(arrow)` derives a schema whose every field is
+unclassified. The data is right, the plan is right, and a CONFIDENTIAL
+column has silently become public, so a policy trusting classification has
+nothing to act on. The fix is a single `interchange.reconcile(result,
+source, derived)` applied at every engine boundary, rather than a
+correction in each engine: the classification rule now lives in one place,
+and a new engine gets it by calling the boundary helper.
+
+**2. `ArrowEngine.sort` could not sort.** It called `table.sort_indices(...)`
+on AAR's `Table` wrapper, which has no such method — sorting is a
+`pyarrow.compute` kernel — and the IR's booleans also had to be translated
+into Arrow's sort-order enum. Every other engine could sort; the
+*reference* engine raised `AttributeError` on any non-empty sort. No test
+covered it.
+
+**3. `Sink.of()` failed open.** Inference tested membership of
+`NETWORK_SINKS` and concluded "not in it, therefore local", so `ftp`, `smb`
+and every name AAR had never heard of were classified local and therefore
+**permitted** — under a default-deny policy whose own docstring said the
+opposite. There was already a test named for this failure, and it passed,
+because it only checked sinks on both sides of the divide. The fix inverts
+the inference: only a name in a short, explicit `LOCAL_SINKS` is believed
+local, everything else is egress. A test now asserts the two sets are
+disjoint and that the local one is the short one.
+
+**4. DuckDB returned `Decimal` where Arrow returned `int`.** `SUM(INTEGER)`
+is typed `DECIMAL(38,0)` by DuckDB, so a group-by handed back
+`Decimal('400')` while Arrow handed back `400`. Both are the right *number*,
+which is why it is easy to miss — but a pipeline that returns `int` on one
+run and `Decimal` on the next, purely because the cost model chose a
+different engine, is exactly the surprise the canonical type system exists to
+remove. Fixed at the DuckDB boundary.
+
+**5. Polars joins dropped both sides' tags** — its own join path went
+through the unreconciled boundary.
+
+Also recorded, and deliberately **not** "fixed": a group-by emits rows in
+first-appearance order on Arrow and hash order on DuckDB and Polars. The set
+of groups is the contract; the order is not. Making it deterministic is a
+real change with a real cost, so it is pinned by a test that says so rather
+than quietly assumed either way.
 
 ### 3.12 Build-time source guards — `tests/test_connectors.py::TestSourceParses`
 

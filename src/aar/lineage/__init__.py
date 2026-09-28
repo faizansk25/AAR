@@ -2,12 +2,13 @@
 
 from .taint import (  # noqa: F401
     AGGREGATE_RULE, COUNT_STAR_RULE, JOIN_RULE, UDF_RULE, LineageEvent,
-    declassify, derive_from, describe, for_aggregate, inherit_all,
-    is_derived_from, merge_schemas,
+    aggregate_tags, declassify, derive_from, describe, for_aggregate,
+    inherit_all, is_derived_from, merge_schemas,
 )
 
 __all__ = [
     "AGGREGATE_RULE", "COUNT_STAR_RULE", "JOIN_RULE", "UDF_RULE",
-    "LineageEvent", "declassify", "derive_from", "describe", "for_aggregate",
-    "inherit_all", "is_derived_from", "merge_schemas",
+    "LineageEvent", "aggregate_tags", "declassify", "derive_from",
+    "describe", "for_aggregate", "inherit_all", "is_derived_from",
+    "merge_schemas",
 ]

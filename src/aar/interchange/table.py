@@ -28,7 +28,7 @@ from typing import Any, Iterator, Sequence
 from ..types import (Field, LineageRef, Schema, TypeKind, UnmappableType,
                      from_source, lossy)
 
-__all__ = ["Table", "arrow_to_canonical", "canonical_to_arrow",
+__all__ = ["Table", "arrow_to_canonical", "canonical_to_arrow", "reconcile",
            "require_arrow"]
 
 
@@ -379,4 +379,51 @@ class Table:
 
     def classifications(self) -> dict[str, frozenset[str]]:
         return {f.name: f.classification for f in self._schema}
+
+
+
+# ------------------------------------------------------- boundary reconcile
+def reconcile(result: Table, source: Table | None = None,
+              derived: Mapping[str, frozenset[str]] | None = None) -> Table:
+    """Re-attach AAR metadata that an engine's own conversion discarded.
+
+    This exists because of a specific, silent privacy bug. An engine that
+    round-trips through its native frame - DuckDB's relation, a Polars
+    DataFrame, a pandas DataFrame - comes back as a bare Arrow table, and
+    ``Table(arrow)`` derives a schema whose every field is *unclassified*.
+    The data is right, the numbers are right, the plan is right, and a
+    CONFIDENTIAL column has silently become public. A policy that trusts
+    classification then has nothing to act on and the data reaches the sink
+    unmasked, with no error anywhere to notice.
+
+    The rule, applied per output column:
+
+    * a column that also exists in ``source`` keeps that column's tags -
+      filter, sort, limit and join preserve columns, so the tags still
+      describe the same data;
+    * otherwise a column named in ``derived`` gets the tags the lineage
+      rules computed for it - an aggregate over a confidential column, a
+      UDF that could have read every column, a join that saw both sides;
+    * otherwise it is unclassified, which is the honest answer for a column
+      that genuinely came from nowhere.
+
+    Note the first rule is *not* a general identity. It holds only because
+    the caller passes the table the operation was derived from, and
+    ``reconcile`` cannot verify that, so being right about the ``source`` is
+    the caller's job.
+    """
+    if source is None and not derived:
+        return result
+    derived = derived or {}
+    fields = []
+    for name, field in zip(result.column_names, result.schema.fields):
+        classification: frozenset[str] = frozenset()
+        if source is not None and source.schema.has(name):
+            classification = source.schema.get(name).classification
+        elif name in derived:
+            classification = frozenset(derived[name])
+        fields.append(Field(name, field.type, nullable=field.nullable,
+                            classification=classification))
+    return result.with_schema(Schema(tuple(fields)))
+
 
