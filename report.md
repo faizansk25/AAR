@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, and enforces it · 440 tests
+**Status:** AAR runs pipelines, propagates privacy, and enforces it · 485 tests
 **Last updated:** 2026-09-28
 
 ---
@@ -34,7 +34,7 @@ not GPU utilisation.
 | 9 | Execution engines (Arrow, DuckDB, Polars, pandas, UDF, Excel) | §8 | ✅ **Complete** | cross-engine agreement |
 | 10 | Arrow interchange layer | §9 | ✅ **Complete** | 16 tests |
 | 11 | Connectors — Excel + Parquet/CSV/JSON | §10 | ✅ **Complete** | 9 tests + live |
-| 11b | Connectors — SQL, MongoDB | §10 | ⬜ Not started | — |
+| 11b | Connectors — SQL, MongoDB | §10 | 🟡 **Partial — pushdown + typing done** | SQLite: real database · Mongo: mongomock |
 | 11c | Topological executor + `aar run` | §7, §16 | ✅ **Complete** | end-to-end + smoke |
 | 12 | Metadata & lineage | §12 | ✅ **Complete** | 28 tests + live |
 | 13 | Privacy, security & governance | §13 | ✅ **Complete** | 37 tests + live |
@@ -46,8 +46,8 @@ not GPU utilisation.
 | 18 | CLI — `aar explain plan` | §16 | ⬜ Blocked on the planner | — |
 | 19 | Analyst Workbench UI | §17 | ⬜ Not started | — |
 
-**Progress: 7 of 19 layers complete (37% of the specified system), plus
-2 partial.** The completed layers form the chain from "what does this data
+**Progress: 8 of 19 layers complete (42% of the specified system), plus
+3 partial.** The completed layers form the chain from "what does this data
 mean" through "what can this machine do" to "what will it cost" to "let me
 see and change it". Each was built to be independently useful and testable
 before its consumer existed.
@@ -596,13 +596,79 @@ than asserted in prose**: given an 80 ms GPU kernel against 400 ms of CPU work
 and 240+160 ms of transfers, `node_cost` reports a faster kernel and a slower
 total, and picks the CPU.
 
-### Honest limitations
+### 3.11 SQL and MongoDB connectors — `src/aar/connectors/sql.py`, `mongo.py`
+
+The interesting property of a data connector is **pushdown**: turning a
+scan, a filter and a projection into one statement the database executes
+itself. A filter over two of forty columns should make the *database* read
+two, not make AAR move forty and filter on arrival.
+
+**The design refuses to approximate.** Both `render_where` (SQL) and
+`render_match` (MongoDB) return `None` when a predicate cannot be
+translated *exactly*, and the caller then filters after the fetch instead.
+This is the central correctness decision in the layer: a SQL clause that
+means something slightly different from the predicate returns the wrong rows
+and nothing downstream can tell, whereas a slower query is merely slower. An
+unsupported function returns `None`, it is not approximated.
+
+SQL's three-valued logic is preserved rather than flattened. `x IS NULL` is
+never rewritten as a comparison against a literal, because a comparison
+involving NULL is *unknown*, and unknown is not true — rewriting one as the
+other silently changes which rows a filter keeps.
+
+**Verification is recorded as data, not prose.** Every dialect and connector
+carries a `verified_live` field and a `verification` property that returns
+the distinction in words. `SQLITE.verified_live` is `True` because SQLite is
+in the standard library and the tests execute real SQL against real database
+files. `POSTGRESQL.verified_live` is `False` and `MongoConnector` built on
+`mongomock` reports `False`, because a connector that has only had its SQL
+generation tested is a different thing from one that has moved a customer's
+rows. A test asserts `postgresql_connector(...).verified_live is False` —
+**constructing a connector is not evidence that it works.**
+
+The MongoDB connector widens each output column to one type and reports it,
+because a document store has no schema and a field can be an Int64 in one
+document and a string in the next. Nested objects and arrays are rendered as
+JSON text: Arrow has nested types, but a document store's nesting is
+free-form, and mapping it to a fixed Arrow struct would either fail or invent
+a shape the data does not have.
+
+### 3.12 Build-time source guards — `tests/test_connectors.py::TestSourceParses`
+
+Two structural checks now live *inside* the test suite rather than in a
+separate script, because pytest must not be able to report a green run for
+code that does not compile:
+
+- **Every module parses.** A docstring split by an interrupted edit produces a
+  module that imports nothing, so every other test in the file fails with a
+  confusing error instead of pointing at the one wrong line.
+- **No function is truncated to a docstring and imports.** A function that
+  lost its body returns `None` where a `Table` was expected. The check is
+  deliberately narrow — only *imports* count as a harmless body — because
+  `_RUN_CACHE.clear()` is a legitimate no-return function and a check that
+  merely looked for "no return statement" would fire on every well-written
+  mutator in the codebase.
+
+Both checks found real damage during this build: an orphaned `sqlite_type_name`
+body, a duplicated `projection_sql`/`explain_pushdown` pair, a duplicated
+`read()` tail, and a duplicated docstring terminator that had been swallowing
+roughly 140 lines of the SQL connector as string content.
+
 
 - **No GPU on this machine.** Detection, the transfer-cost model and
   `ENGINE_ABSENT` degradation are written and exercised; the GPU *calibration
   curves* are unverified against real hardware.
-- **No live SQL or MongoDB server.** Those connectors are not implemented, so
-  no integration test could pass. Everything else is exercised on real files.
+- **SQL and MongoDB are verified at different levels, and the code says which.**
+  SQLite is in the standard library, so the SQL connector is tested against a
+  **real database on real files** — a wrong pushdown returns wrong rows and
+  fails the suite. MongoDB is tested against `mongomock`, which implements the
+  query, projection and aggregation semantics in Python: that genuinely
+  verifies AAR's translation, pushdown decisions and type mapping, and
+  verifies nothing about BSON encoding, the wire protocol, indexes or the
+  server's optimiser. PostgreSQL and MySQL have tested dialect and SQL
+  generation and **no** live verification. `SqlConnector.verification` and
+  `MongoConnector.verification` return this distinction as a string rather
+  than leaving it to a reader of the comments, and tests pin it.
 - **Windows disk figures are warm-cache** and labelled as such in the profile.
 - **One aggregate per output column.** The IR allows several; no engine has a
   representation for a column that is simultaneously a sum and a count, so the
@@ -615,7 +681,8 @@ total, and picks the CPU.
   only way to shed a tag, and it requires a written justification that is
   *stored* but not yet surfaced in the run trace.
 
-Next is the **SQL and MongoDB connectors**, which need a live server to
-validate against, then structured decision logging and the Analyst Workbench.
+Next is **structured decision logging** and the **Analyst Workbench**, then
+live-server integration tests for PostgreSQL and MongoDB once servers are
+available.
 
 

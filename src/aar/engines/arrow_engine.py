@@ -48,9 +48,41 @@ class ArrowEngine(Engine):
             return self._read_json(spec.path)
         if kind == "excel":
             return self._read_excel(node)
+        if kind == "sql":
+            return self._read_sql(node)
+        if kind == "mongo":
+            return self._read_mongo(node)
         raise NotImplementedError(
             f"the Arrow engine cannot read a {kind!r} source; "
             f"install the engine that can")
+
+    @staticmethod
+    def _read_sql(node: Node) -> Table:
+        """SQL sources go through the connector, which owns the connection.
+
+        A SQLite path needs no server, so this path is exercised against a
+        real database in the test suite rather than against a stub.
+        """
+        from ..connectors.sql import sqlite_connector
+
+        spec = node.scan
+        connector = sqlite_connector(spec.path or ":memory:")
+        try:
+            return connector.read(node)
+        finally:
+            connector.close()
+
+    @staticmethod
+    def _read_mongo(node: Node) -> Table:
+        from ..connectors.mongo import mock_mongo_connector, mongo_connector
+
+        spec = node.scan
+        connector = (mongo_connector(spec.dsn, spec.database)
+                     if spec.dsn else mock_mongo_connector())
+        try:
+            return connector.read(node)
+        finally:
+            connector.close()
 
     def _read_parquet(self, path: str | None,
                       columns: Sequence[str]) -> Table:
