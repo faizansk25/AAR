@@ -8,14 +8,13 @@ An orchestration layer for analytical work across Excel, SQL, NoSQL, Python,
 local files and large-scale engines. AAR does not replace those tools — it
 plans, routes, explains and audits them.
 
-> **Status: core planning stack complete.** Seven of nineteen specified layers
-> are built, tested and verified against real hardware. See
-> [`report.md`](report.md) for full status, the bugs found, and what comes
-> next.
+> **Status: AAR runs pipelines.** Nine of nineteen specified layers are built,
+> tested and verified against real data on real files. See [`report.md`](report.md)
+> for full status and what comes next.
 >
-> **Not yet available:** there is no executor, no connectors and no SDK, so
-> AAR cannot yet read your data and return an answer. Everything built so far
-> is substrate that the planner, executor and connectors will sit on.
+> `aar run` executes a pipeline end to end — read, filter, group, UDF, sort,
+> write — and reports which engine actually ran each node and anything that
+> degraded on the way.
 
 **The goal is minimum total analytical cost — not GPU utilisation.** AAR should
 proudly say "CPU selected" or "PostgreSQL selected" when that is optimal.
@@ -52,11 +51,44 @@ library alone. Engines are opt-in extras:
 ## Verify
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q           # 222 tests
-.\.venv\Scripts\python.exe tools\check_syntax.py  # parse every module
-.\.venv\Scripts\python.exe tools\smoke.py         # live end-to-end output
-.\.venv\Scripts\python.exe tools\debug_calib.py   # per-benchmark timings
+.\.venv\Scripts\python.exe -m pytest -q             # 365 tests
+.\.venv\Scripts\python.exe tools\check_syntax.py    # parse every module
+.\.venv\Scripts\python.exe tools\smoke_run.py       # build a plan, run it, check the numbers
+.\.venv\Scripts\python.exe tools\debug_calib.py     # per-benchmark timings
 ```
+
+## Run
+
+```powershell
+# `explain` plans only. It never opens your data, so it works with no file present.
+aar explain pipelines\example_orders.py
+
+# `run` needs real data. Generate the sample workbook, then execute.
+python tools\make_sample_data.py
+aar run pipelines\example_orders.py
+```
+
+```
+EXECUTION
+
+  ScanExcel    excel                  0 ->       240 rows    1467.0 ms
+  Filter       arrow                240 ->       233 rows       0.6 ms
+  GroupBy      arrow                233 ->         4 rows       1.6 ms
+  PythonUDF    python_worker          4 ->         4 rows       3.0 ms
+  Sort         arrow                  4 ->         4 rows       0.4 ms
+  Limit        arrow                  4 ->         4 rows       0.1 ms
+  Write        duckdb                 4 ->         4 rows     943.1 ms
+
+  wrote FY26-report.xlsx (4 rows)
+
+  2415.9 ms total, 4 rows out
+
+  No degradations. Full-fidelity execution.
+```
+
+`--json` emits the same run as structured output, `--head N` previews rows, and
+`--quiet` prints only the summary. A run that degraded is not hidden: every
+substitution is recorded in the ledger and shown above.
 
 ## Command line
 

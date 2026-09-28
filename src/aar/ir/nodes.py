@@ -200,6 +200,52 @@ class Col(Expr):
     def to_sql(self, dialect: str = "duckdb") -> str:
         return _quote(self.name, dialect)
 
+    # Comparisons and boolean combination, so a pipeline reads as
+    # `col("a") > 100` rather than `gt(col("a"), lit(100))`. The operator
+    # forms build exactly the same IR nodes, so the planner, pushdown and
+    # executor need to know only one spelling.
+    def __gt__(self, other: Any) -> "BinOp":
+        return BinOp(self, ">", _as_expr(other))
+
+    def __ge__(self, other: Any) -> "BinOp":
+        return BinOp(self, ">=", _as_expr(other))
+
+    def __lt__(self, other: Any) -> "BinOp":
+        return BinOp(self, "<", _as_expr(other))
+
+    def __le__(self, other: Any) -> "BinOp":
+        return BinOp(self, "<=", _as_expr(other))
+
+    def __eq__(self, other: Any) -> "BinOp":  # type: ignore[override]
+        return BinOp(self, "=", _as_expr(other))
+
+    def __ne__(self, other: Any) -> "BinOp":  # type: ignore[override]
+        return BinOp(self, "<>", _as_expr(other))
+
+    def __and__(self, other: Any) -> "BinOp":
+        return BinOp(self, "AND", _as_expr(other))
+
+    def __or__(self, other: Any) -> "BinOp":
+        return BinOp(self, "OR", _as_expr(other))
+
+    def __hash__(self) -> int:
+        return hash(("Col", self.name))
+
+
+def _as_expr(value: Any) -> Expr:
+    """Coerce a raw Python value into an expression.
+
+    Required because ``col("a") > 5`` has to mean exactly what
+    ``gt(col("a"), lit(5))`` means. Without this coercion the operator
+    spelling would either not exist or would bypass the escaping that
+    :class:`Lit` performs, and a value containing a quote would reach SQL
+    unescaped.
+    """
+    if isinstance(value, Expr):
+        return value
+    return Lit(value)
+
+
 
 @dataclass(frozen=True, slots=True)
 class Lit(Expr):
@@ -226,11 +272,24 @@ class Lit(Expr):
 
 @dataclass(frozen=True, slots=True)
 class BinOp(Expr):
-    """A binary operation; ``op`` is a SQL-ish infix operator."""
+    """A binary operation; ``op`` is a SQL-ish infix operator.
+
+    Raw Python values on either side are lifted to :class:`Lit` on
+    construction. Every consumer - the predicate compiler, the SQL renderers,
+    the planner's pushdown analysis - assumes its operands are expressions, and
+    a bare ``100`` arriving from a caller would otherwise fail deep inside
+    one of them, far from the line that created it.
+    """
 
     left: Expr
     op: str
     right: Expr
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.left, Expr):
+            object.__setattr__(self, "left", _as_expr(self.left))
+        if not isinstance(self.right, Expr):
+            object.__setattr__(self, "right", _as_expr(self.right))
 
     def to_sql(self, dialect: str = "duckdb") -> str:
         return f"({self.left.to_sql(dialect)} {self.op} {self.right.to_sql(dialect)})"
@@ -243,8 +302,13 @@ class UnaryOp(Expr):
     op: str
     operand: Expr
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.operand, Expr):
+            object.__setattr__(self, "operand", _as_expr(self.operand))
+
     def to_sql(self, dialect: str = "duckdb") -> str:
         return f"({self.op} {self.operand.to_sql(dialect)})"
+
 
 
 @dataclass(frozen=True, slots=True)
@@ -433,6 +497,7 @@ class Node:
     fill_value: Any = None
     udf: Any = None
     udf_name: str = ""
+    udf_mode: str = "row"
     limit: int | None = None
     target: str | None = None
     write_format: str | None = None

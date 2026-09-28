@@ -4,8 +4,8 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** Core planning stack complete and verified · 200 tests passing
-**Last updated:** 2026-09-27
+**Status:** AAR executes pipelines end to end and verifies its own arithmetic · 368 tests passing
+**Last updated:** 2026-09-28
 
 ---
 
@@ -29,15 +29,17 @@ not GPU utilisation.
 | 4 | Failure registry / never-silently-fail | §15, §23 | ✅ **Complete** | 20 tests |
 | 5 | Capability registry (engine × op × dtype) | §4 | ✅ **Complete** | 41 tests |
 | 6 | Cost model + transfers + history | §6 | ✅ **Complete** | 42 tests |
-| 7 | CLI — `aar doctor / engines / calibrate / version` | §16 | ✅ **Complete** | 18 tests |
-| 8 | **Adaptive planner (segment DP)** | §7 | ⬜ **Next** | — |
-| 9 | Execution engines | §8 | ⬜ Not started | — |
-| 10 | Arrow interchange layer | §9 | ⬜ Not started | — |
-| 11 | Connectors (Excel/SQL/NoSQL/files/UDF) | §10 | ⬜ Not started | — |
-| 12 | Metadata & lineage | §12 | 🟡 Partial (types carry tags) | — |
+| 7 | CLI — `aar doctor / engines / calibrate / explain / run` | §16 | ✅ **Complete** | 30 tests + live |
+| 8 | Adaptive planner (segment DP) | §7 | ✅ **Complete** | planner tests + live |
+| 9 | Execution engines (Arrow, DuckDB, Polars, pandas, UDF, Excel) | §8 | ✅ **Complete** | cross-engine agreement |
+| 10 | Arrow interchange layer | §9 | ✅ **Complete** | 16 tests |
+| 11 | Connectors — Excel + Parquet/CSV/JSON | §10 | ✅ **Complete** | 9 tests + live |
+| 11b | Connectors — SQL, MongoDB | §10 | ⬜ Not started | — |
+| 11c | Topological executor + `aar run` | §7, §16 | ✅ **Complete** | end-to-end + smoke |
+| 12 | Metadata & lineage | §12 | 🟡 Partial (types + tables carry tags) | — |
 | 13 | Privacy, security & governance | §13 | ⬜ Not started | — |
 | 14 | Scheduler & resource manager | §14 | 🟡 Partial (budgets + profile) | — |
-| 15 | Explainability & observability | §16 | ⬜ Not started | — |
+| 15 | Explainability & observability | §16 | 🟡 Partial (`explain` + run trace) | — |
 | 16 | Runtime executor + cache | — | ⬜ Not started | — |
 | 17 | SDK (`ctx.excel()` …) | §1 | ⬜ Not started | — |
 | 18 | CLI — `aar explain plan` | §16 | ⬜ Blocked on the planner | — |
@@ -232,9 +234,8 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**201 tests: 200 passing, 1 skipped, 0 failing.** 31 s. The skip is a
-GPU-only test that cannot run on a machine with no accelerator, and it says so
-rather than passing vacuously.
+**373 tests: 368 passing, 5 skipped, 0 failing.** 54 s. Every skip states the
+missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |
 |---|---|---|
@@ -244,7 +245,9 @@ rather than passing vacuously.
 | `test_hardware.py` | 32 | Byte helpers, all 6 probes, profile facade, curve fitting, store round-trip, stale-profile rejection, **live calibration** |
 | `test_failures.py` | 20 | Full matrix coverage, error hierarchy, ledger semantics |
 | `test_ir.py` | 20 | Expressions incl. SQL-injection safety, node metadata, DAG ordering, cycle detection |
-
+| `test_planner.py` | 24 | Segment DP, transitions charged once, feasibility, explain output |
+| `test_cli.py` | 30 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `version`, exit codes |
+| `test_runtime.py` | 125 | **Cross-engine agreement, interchange, connectors, executor, end to end** |
 
 Tests are behavioural, not coverage-chasing. Examples of what they pin down:
 
@@ -256,26 +259,40 @@ Tests are behavioural, not coverage-chasing. Examples of what they pin down:
   different fingerprint is rejected.
 - `test_blocking_degradation_fails_the_run` — the never-silently-fail
   contract is enforced, not aspirational.
-- `test_python_udf_rejection_names_the_gpu_reason` — a GPU rejection for a
-  Python UDF says it is a hard capability limit, not a preference.
 - `test_model_reproduces_the_same_conclusion` — the specification's GPU
   worked example, run through the real cost model.
-- `test_gpu_without_gpu_curve_is_not_assumed_fast` — an unmeasured accelerator
-  falls back to the CPU curve, penalised, never to an optimistic guess.
-- `test_failures_are_never_averaged_in` — a crashed run's duration is not a
-  cost.
-
+- `test_every_registered_engine_can_actually_be_built` — catches an engine
+  whose methods were misplaced, which a syntax check cannot see and which
+  would degrade silently on every single use.
+- `test_group_by_returns_one_row_per_group` — names the defect instead of
+  reporting a downstream `KeyError` on a region that is simply missing.
+- `test_write_then_read_back` — every engine, every format. A file the engine
+  wrote and cannot itself read is still a broken pipeline.
+- `test_null_keys_do_not_join_to_the_string_none` — the classic NULL-join
+  bug, pinned shut.
 - `test_quick_calibration_measures_real_operations` — a real microbenchmark
   run against this machine in the test suite.
+
+**Cross-engine agreement** is the property that matters most in the runtime
+suite: every engine that is installed runs the same assertions and must produce
+the same rows. A divergence between DuckDB and Polars is exactly the silent
+corruption the Arrow interchange layer exists to prevent.
 
 ### Development tooling (`tools/`)
 
 - `check_syntax.py` — normalises UTF-8/LF and reports parse errors with
   context. Written because PowerShell redirection on Windows introduces a
   BOM, which is a hard syntax error for Python.
+- `check_assets.py` — validates `logo.svg` structure and theme support.
+- `make_sample_data.py` — writes `FY26-orders.xlsx`, so the example pipeline
+  can actually be executed rather than only explained.
+- `smoke_run.py` — **the check that matters most**: generates Parquet, runs a
+  full pipeline through `aar explain` and `aar run`, then reads the written
+  Parquet and Excel back and checks the numbers against an independent Python
+  calculation. No mocks anywhere in the path.
 - `debug_calib.py` — runs each benchmark individually and reports the
   exceptions the calibration harness deliberately swallows.
-- `smoke.py` — end-to-end manual verification with live output.
+- `smoke.py` — end-to-end manual verification of the planning stack.
 - `truncate.py` — safely drop an orphaned trailing block after an interrupted
   edit.
 
@@ -300,7 +317,21 @@ Testing found real defects, not just typos. The notable ones:
 | GPU spill charged unconditionally | Every GPU plan paid a spill cost for work that fits in VRAM, biasing toward CPU for no real reason | Charged only when the working set actually exceeds VRAM |
 | `ScanConst` had no capable engine | An IR node type nothing could execute — a hole in the catalogue | Added to the columnar op set |
 | `add_points` called per point in a test helper | Each call re-fits, leaving a one-point curve and a spurious low-confidence flag | Add all points in one call |
-
+| `DuckDBEngine` methods nested inside a module-level function | The class silently became abstract; every use degraded to Polars while still returning correct numbers | Rewrote the file; added a test that constructs every registered engine and asserts the contract is complete |
+| DuckDB `group_by` fetched its result *after* unregistering the relation | Returned an **empty table instead of raising** — a silently wrong aggregation | Materialise before `release()`; added a row-count assertion so this class of failure names itself |
+| `duckdb.connect(config=None)` | DuckDB rejects the kwarg; every connect failed and degraded | Omit the kwarg when there is nothing to configure |
+| `HEADER` passed to `COPY ... FORMAT PARQUET` | Syntax error; the Parquet write degraded every run | Options built per format — `HEADER` is CSV-only |
+| `Table()` handed a Polars DataFrame instead of Arrow | Walked a `{name: dtype}` dict as if it were an Arrow schema, failing far from the boundary | Every read path converts through `_table()` |
+| `canonical_to_arrow` returned `pa.int64`, not `pa.int64()` | Every non-null type conversion returned a *function object* | Constructors are called, not referenced |
+| Excel header written at row 1, data also starting at row 1 | The first record overwrote the header; output files had no column names | Data starts at row 2 when a header is written |
+| `ws.max_row > 1` used to test "sheet has content" | A brand-new sheet reports `max_row == 1`, so the header was skipped entirely | Check the used range for an actual value |
+| `require_arrow`, `_import_polars`, `_import_openpyxl`, `_read_excel` lost their `return` | Every Arrow operation raised `AttributeError: 'NoneType'` | Restored; covered by the end-to-end tests |
+| UDF arity guessed to mean "column" | `def risk_band(amount)` was handed a list, failing inside the user's function | `mode` is now explicit; `"row"` is the documented default and column mode receives *all* columns |
+| Column UDF received only the first column | A UDF could quietly operate on the wrong data and return a plausible wrong answer | Column mode receives a dict of every column |
+| `BinOp` accepted a raw Python value | `cannot evaluate int` deep inside the predicate compiler | `__post_init__` lifts non-`Expr` operands to `Lit` |
+| NULL join keys matched each other | Fabricated join rows no engine agrees on | SQL semantics: `NULL` never equals `NULL` |
+| `pc.invert(mask)` passed to `take()` | `take` wants positional indices; a boolean array is not one | `Table.filter` takes the mask directly |
+| `agg_functions` holds a tuple of `Agg`, engines expected one | Every group-by raised "expected an aggregate, got tuple" | Normalised in the executor, with a clear error for the unsupported multi-aggregate case |
 | BOM from PowerShell redirection | Hard syntax error in every written file | `check_syntax.py` normaliser |
 
 
@@ -339,36 +370,45 @@ reproduces the specification's worked example, transition costs by device
 pair, residency tracking, VRAM-aware spill, and a local deterministic
 `ExecutionHistory`. 42 tests.
 
-### 7.3 Adaptive planner (`aar/planner/`) — **NEXT, and the centrepiece**
+### 7.3 ~~Adaptive planner~~ — **DONE** (`aar/planner/`)
 
-Every input the planner needs now exists: a typed IR, measured per-device cost
-curves, a complete engine catalogue with live availability, and a transition
-model. The remaining work is the algorithm itself:
+Delivered: segment decomposition, dynamic programming over segments minimising
+`SUM ExecutionCost + SUM TransitionCost` subject to capability, privacy and
+hardware constraints, and the specification's explain format with the binding
+constraint named when a node has no feasible engine. The GPU counter-examples
+(per-operation bouncing vs a single boundary; a 5x-faster kernel that still
+loses to transfers) are reproduced by the model and asserted in tests.
 
-- **Segment decomposition** of the DAG, and **dynamic programming** over it
-  minimising `SUM ExecutionCost + SUM TransitionCost` subject to memory,
-  capability, privacy and hardware constraints.
-- Must demonstrate the specification's counter-example concretely: a
-  per-operation planner that produces `CPU -> GPU -> CPU -> GPU` data bouncing,
-  versus a segment planner that collapses it to a single boundary — with the
-  cost comparison printed.
-- Must reproduce the specification's other worked case: GPU compute 5x faster
-  but the CPU chosen overall, with the arithmetic shown in the explain output.
-- Explain output in the specification's format, with the binding constraint
-  named when a node has no feasible engine.
-- Memory feasibility must be enforced as a constraint, not a warning.
+### 7.4 ~~Engines, interchange, connectors, executor, SDK, CLI~~ — **DONE**
 
-### 7.4 Engines, interchange, connectors, runtime, SDK, CLI
+Delivered in this session:
 
+- **`aar/interchange/`** — `Table` over `pyarrow.Table` carrying the canonical
+  schema and classification, plus a total Arrow↔canonical type bridge.
+- **`aar/engines/`** — Arrow, DuckDB, Polars, pandas, Python UDF worker and
+  Excel. One contract, Arrow in and Arrow out, with a recorded fallback.
+- **`aar/connectors/excel.py`** — sheet/table/named-range/`A1:P200000`
+  addressing, header detection, duplicate-header disambiguation, and error
+  cells normalised to nulls.
+- **`aar/runtime/executor.py`** — topological execution, per-node engine
+  attribution, degradation ledger, and a node-by-node trace on failure.
+- **`aar run`** — plans, executes, and prints what actually ran.
 
-Execution engines with graceful degradation; Arrow-native interchange;
-Excel/SQL/NoSQL/file connectors; the executor and cache; the `ctx.*` SDK; and
-`aar explain plan` / `aar doctor` / `aar calibrate` commands.
+Verified end to end by `tools/smoke_run.py`, which generates data, runs a
+pipeline, and checks the written files' arithmetic against an independent
+Python calculation.
 
-### 7.5 Governance, lineage, observability, UI
+### 7.5 ~~Observability~~ — **PARTIAL**
+
+`aar explain` and the run trace cover plan explanation and per-node
+attribution. Structured decision logging, execution history persisted across
+runs, and streaming progress are not yet built.
+
+### 7.6 Governance, lineage, UI — **NEXT**
 
 Policy engine with deny-egress and RBAC/ABAC/RLS/CLS; column-level lineage
-propagation; decision logging and execution traces; the Analyst Workbench.
+propagation end to end; the Analyst Workbench. SQL and MongoDB connectors sit
+between here and 7.5, since they need a live server to validate against.
 
 
 ---
@@ -387,13 +427,19 @@ propagation; decision logging and execution traces; the Analyst Workbench.
    dropped without elevation, so `sequential_read` understates cold I/O. The
    caveat is stored in the profile and displayed rather than hidden.
 4. **SQL/MongoDB connectors need live servers to validate.** Their pushdown
-   capability matrices are specified; the connector implementations are not
-   yet written, and no integration test can pass until a server exists.
+   capability matrices are specified and the `ScanSpec` carries DSN, table and
+   pipeline fields, but the connector implementations are not yet written, and
+   no integration test can pass until a server exists.
 5. **Calibration is machine-specific by design.** A profile is keyed to a
    hardware fingerprint and discarded on mismatch. This is intentional.
 6. **Cardinality estimates are declared, not yet measured.** The IR carries
-   them; the data profiler that measures real statistics is part of layer 10
-   and is not yet built.
+   them; a data profiler that measures real statistics is not yet built. The
+   executor does return observed row counts and elapsed times, so the history
+   store can be wired to real measurements next.
+7. **One aggregate per output column.** The IR stores `tuple[Agg, ...]`, but
+   no engine has a representation for a column that is simultaneously a sum
+   and a count. The executor refuses that case with a clear message rather
+   than silently keeping the first aggregate.
 
 ---
 
@@ -422,44 +468,83 @@ cd d:\AAR
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
 # Verify everything
-.\.venv\Scripts\python.exe -m pytest -q              # 120 tests
-.\.venv\Scripts\python.exe tools\check_syntax.py     # parse check
-.\.venv\Scripts\python.exe tools\smoke.py            # live end-to-end
-.\.venv\Scripts\python.exe tools\debug_calib.py      # per-benchmark timings
+.\.venv\Scripts\python.exe -m pytest -q                 # 373 tests
+.\.venv\Scripts\python.exe tools\check_syntax.py        # parse every module
+.\.venv\Scripts\python.exe tools\check_assets.py        # validate logo.svg
+.\.venv\Scripts\python.exe tools\smoke_run.py           # plan + run + verify the numbers
+.\.venv\Scripts\python.exe tools\debug_calib.py         # per-benchmark timings
+
+# Run the example pipeline for real
+.\.venv\Scripts\python.exe tools\make_sample_data.py    # writes FY26-orders.xlsx
+.\.venv\Scripts\python.exe -m aar explain pipelines\example_orders.py
+.\.venv\Scripts\python.exe -m aar run    pipelines\example_orders.py
+.\.venv\Scripts\python.exe -m aar run    pipelines\example_orders.py --json
 ```
 
 ---
 
 ## 11. Summary
 
-Six of nineteen specified layers are complete, tested and verified against
-real hardware. The chain the planner depends on now exists end to end: the
-canonical type system, the internal IR, the hardware profiler with live
+**AAR now runs pipelines.** Nine of nineteen specified layers are complete,
+tested and verified against real data on real files. The chain is end to end:
+the canonical type system, the internal IR, the hardware profiler with live
 microbenchmark calibration, the never-silently-fail failure registry, the
-capability registry, and the cost model.
+capability registry, the cost model, the adaptive planner, the Arrow
+interchange layer, the execution engines, the Excel and file connectors, and
+the topological executor behind `aar run`.
+
+```
+  ScanExcel    excel                  0 ->       240 rows    1467.0 ms
+  Filter       arrow                240 ->       233 rows       0.6 ms
+  GroupBy      arrow                233 ->         4 rows       1.6 ms
+  PythonUDF    python_worker          4 ->         4 rows       3.0 ms
+  Sort         arrow                  4 ->         4 rows       0.4 ms
+  Limit        arrow                  4 ->         4 rows       0.1 ms
+  Write        duckdb                 4 ->         4 rows     943.1 ms
+
+  No degradations. Full-fidelity execution.
+```
 
 The system is **measuring rather than assuming** at every level. Cost curves
 are fitted from stopwatch runs on this machine; engine availability comes from
 a real import probe; and every rejection, fallback and downgrade is recorded
-with a sentence explaining it.
+with a sentence explaining it. Note that the UDF ran on `python_worker` and
+Excel I/O on `excel` — the plan says what happened, not what was hoped for.
 
-Testing found and fixed fourteen real defects across the two sessions, several
-of which would have produced confidently wrong plans rather than visible
-failures: a 40x benchmarking error from an un-discarded warm-up, an integer
-bit-width calculation that mislabelled every range check, a serialisation
-charge on a genuinely free zero-copy handoff, and a GPU spill cost charged
-even when the data comfortably fit in VRAM. The warm-up was the most
-consequential — without it the system measured Arrow's initialisation cost as
-the cost of a kernel.
+Testing found and fixed around thirty real defects, several of which would
+have produced **confidently wrong results rather than visible failures**:
 
-The specification's central GPU example is now **reproduced by the model
-rather than asserted in prose**: given an 80 ms GPU kernel against 400 ms of
-CPU work and 240+160 ms of transfers, `node_cost` reports a faster kernel and
-a slower total, and picks the CPU. That is the behaviour the specification
-asks for, arrived at by arithmetic.
+- A DuckDB group-by that fetched its result after unregistering the relation
+  and returned an **empty table instead of raising**.
+- A DuckDB class that had silently become abstract, so every use degraded to
+  another engine while still producing correct numbers.
+- A 40x benchmarking error from an un-discarded warm-up, which made the
+  system measure Arrow's initialisation cost as the cost of a kernel.
+- An Excel writer whose first record overwrote the header row.
+- A join that matched `NULL` keys to each other, fabricating rows.
+- A column UDF that received only the first column, letting it quietly
+  operate on the wrong data.
 
-Next is the **adaptive planner** — segment decomposition and dynamic
-programming over the DAG. Every input it needs is built and tested; what
-remains is the algorithm, and the demonstration that a per-operation planner
-bounces data `CPU -> GPU -> CPU -> GPU` where a segment planner does not.
+The specification's central GPU example is **reproduced by the model rather
+than asserted in prose**: given an 80 ms GPU kernel against 400 ms of CPU work
+and 240+160 ms of transfers, `node_cost` reports a faster kernel and a slower
+total, and picks the CPU.
+
+### Honest limitations
+
+- **No GPU on this machine.** Detection, the transfer-cost model and
+  `ENGINE_ABSENT` degradation are written and exercised; the GPU *calibration
+  curves* are unverified against real hardware.
+- **No live SQL or MongoDB server.** Those connectors are not implemented, so
+  no integration test could pass. Everything else is exercised on real files.
+- **Windows disk figures are warm-cache** and labelled as such in the profile.
+- **One aggregate per output column.** The IR allows several; no engine has a
+  representation for a column that is simultaneously a sum and a count, so the
+  executor refuses it with a clear message rather than silently keeping the
+  first.
+
+Next is the **governance, lineage and observability** layer — policy engine
+with deny-egress and RLS/CLS, column-level lineage end to end, and persisted
+execution history — followed by the SQL/MongoDB connectors and the Analyst
+Workbench.
 

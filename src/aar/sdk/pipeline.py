@@ -281,13 +281,44 @@ def limit(input_node: Node, n: int) -> Node:
 
 
 def udf(input_node: Node, fn: Callable[..., Any] | None = None,
-        name: str = "", estimated_bytes: int | None = None) -> Node:
-    """Apply a Python function. Always CPU-resident; never a GPU candidate."""
+        name: str = "", mode: str = "row",
+        estimated_bytes: int | None = None) -> Node:
+    """Apply a Python function. Always CPU-resident; never a GPU candidate.
+
+    ``mode`` says how ``fn`` is called and is never inferred:
+
+    * ``"row"`` (default) - ``fn(row_dict)`` returns one value per record.
+      The record holds every column, so the function's parameter name does
+      not have to encode a convention.
+    * ``"column"`` - ``fn(columns_dict)`` returns a list of one value per
+      record, where ``columns_dict`` maps each column name to its full list
+      of values.
+    * ``"auto"`` - inspect the signature. Offered, but not the default,
+      because a one-argument function is ambiguous between the first two.
+
+    ```python
+    def risk_band(row):                     # row mode: the whole record
+        return "high" if row["total"] > 1000 else "low"
+
+    def as_ints(columns):                  # column mode: every column
+        return [int(v) for v in columns["id"]]
+    ```
+
+    ```python
+    udf(orders, risk_band)                              # row
+    udf(orders, as_ints, mode="column")                 # column
+    ```
+    """
+    if mode not in ("row", "column", "auto"):
+        raise ValueError(
+            f"mode must be 'row', 'column' or 'auto'; got {mode!r}")
     n = Node(NodeType.PYTHON_UDF, inputs=[input_node], udf=fn,
-             udf_name=name or getattr(fn, "__name__", "udf"))
+             udf_name=name or getattr(fn, "__name__", "udf"),
+             udf_mode=mode)
     n.deterministic = False     # unknown until measured
     n.estimated_bytes = estimated_bytes
     return _inherit(input_node, n)
+
 
 
 # ------------------------------------------------------------------- writes
