@@ -224,9 +224,11 @@ def audit_agreement() -> None:
     reference = create_engine(reference_id)
 
     # A numeric aggregate: the operation most sensitive to how an engine
-    # types its own intermediate results.
-    aggs = {"total": Agg("SUM", Col("fare_amount"), "total"),
-            "n": Agg("COUNT", Col("fare_amount"), "n")}
+    # types its own intermediate results. Note `Agg(func, arg, distinct)` -
+    # the third positional is `distinct`, not an alias. Passing an alias
+    # there is a truthy string and silently makes every aggregate DISTINCT.
+    aggs = {"total": Agg("SUM", Col("fare_amount")),
+            "n": Agg("COUNT", Col("fare_amount"))}
     want = sorted(repr(r) for r in reference.group_by(
         table, ["PULocationID"], aggs).arrow.to_pylist())
     for engine_id in engines[1:]:

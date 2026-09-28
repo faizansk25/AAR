@@ -247,6 +247,13 @@ def _to_polars_aggs(pl: Any, aggs: dict[str, Any]) -> dict[str, Any] | None:
             return None
         func = agg.func.upper()
         col = pl.col(agg.arg.name)
+        # `DISTINCT` has to be honoured for every aggregate, not just COUNT.
+        # A plain `col.sum()` silently ignores it, so `SUM(DISTINCT x)` would
+        # quietly return the sum *with duplicates* - the right number for a
+        # different question, which is the worst kind of wrong. Polars has no
+        # `sum(distinct=...)`, so the distinct values are taken first.
+        if agg.distinct:
+            col = col.unique()
         if func == "SUM":
             spec[name] = col.sum()
         elif func == "AVG":
@@ -256,9 +263,9 @@ def _to_polars_aggs(pl: Any, aggs: dict[str, Any]) -> dict[str, Any] | None:
         elif func == "MAX":
             spec[name] = col.max()
         elif func == "COUNT":
-            spec[name] = (col.n_unique() if agg.distinct
-                          else col.count())
+            spec[name] = col.n_unique() if agg.distinct else col.count()
         else:
             return None
     return spec
+
 

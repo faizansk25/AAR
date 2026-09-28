@@ -271,6 +271,66 @@ class TestDerivedMetadata:
                 assert type(row["total"]) is int, engine_id
 
 
+class TestDistinctIsHonouredEverywhere:
+    """`DISTINCT` changes the answer, so every engine must apply it.
+
+    The bug this pins: Polars' `SUM`/`AVG`/`MIN`/`MAX` were rendered as
+    plain `col.sum()` etc. and only `COUNT` looked at `agg.distinct`. So
+    `SUM(DISTINCT x)` quietly returned the sum *including duplicates* - the
+    right shape of answer to a different question, with nothing to tell you.
+
+    It surfaced only because the audit harness itself got the `Agg`
+    constructor wrong (`Agg(func, arg, distinct)` - the third positional is
+    `distinct`, not an alias), computed `SUM(DISTINCT ...)` by accident, and
+    got a 38x-wrong answer from three engines. Worth recording both halves.
+    """
+
+    def _dupes(self):
+        import pyarrow as pa
+
+        from aar.interchange import Table
+        from aar.types import Field, INT64, Schema, UTF8
+
+        schema = Schema((Field("k", UTF8), Field("v", INT64)))
+        return Table(pa.table({"k": ["a", "a", "a", "b"],
+                               "v": [1, 2, 7, 7]}), schema)
+
+    def test_sum_distinct_differs_from_sum_with_duplicates(self):
+        """1+1+2+2 is 6 with duplicates and 3 distinct.
+
+        A fixture whose two answers coincide tests nothing, so the values
+        are chosen to make the difference the whole point of the assertion.
+        """
+        import pyarrow as pa
+
+        from aar.interchange import Table
+        from aar.types import Field, INT64, Schema, UTF8
+
+        schema = Schema((Field("k", UTF8), Field("v", INT64)))
+        table = Table(pa.table({"k": ["a", "a", "a", "a"],
+                                "v": [1, 1, 2, 2]}), schema)
+        for engine_id in available_engines():
+            engine = engine_of(engine_id)
+            distinct = engine.group_by(
+                table, ["k"],
+                {"total": Agg("SUM", Col("v"), distinct=True)})
+            with_dupes = engine.group_by(
+                table, ["k"], {"total": Agg("SUM", Col("v"))})
+            got = distinct.arrow.to_pylist()[0]["total"]
+            other = with_dupes.arrow.to_pylist()[0]["total"]
+            assert (got, other) == (3, 6), (
+                f"{engine_id}: SUM(DISTINCT)={got}, SUM={other}, "
+                f"expected 3 and 6")
+
+    def test_count_distinct_counts_values_not_rows(self):
+        for engine_id in available_engines():
+            out = engine_of(engine_id).group_by(
+                self._dupes(), ["k"],
+                {"n": Agg("COUNT", Col("v"), distinct=True)})
+            by_key = {r["k"]: r["n"] for r in out.arrow.to_pylist()}
+            assert by_key == {"a": 3, "b": 1}, f"{engine_id} gave {by_key}"
+
+
 class TestNullSemanticsAgreeAcrossEngines:
     """Null handling must be identical everywhere, or it is wrong somewhere.
 

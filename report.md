@@ -765,19 +765,42 @@ it means a common filter loses 160x. Worth a real fix, not yet done.
 
 ### Honest limitations of this audit
 
-- The full CLI and spec sweeps **had not completed** when this section was
-  written. The engine and agreement sweeps are complete; the CLI sweep
-  (16 commands on a 3M-row pipeline) and the specification sweep are
-  recorded as not yet run rather than as passing.
-- The agreement sweep reported a **discrepancy in `group_by` totals** between
-  Arrow and DuckDB/Polars on identical input — `total=6741.86` on Arrow for
-  the first group. The most likely cause is floating-point summation order,
-  which differs between a Python loop and a vectorised kernel, but that is
-  a hypothesis, not a diagnosis. It is **unresolved** and is the next thing
-  to investigate: either it is benign last-bit drift and should be
-  documented as such, or it is a null-handling difference and is a real bug.
+- The float difference that this section previously reported as an
+  unresolved discrepancy **was a bug in the audit harness, not in AAR.**
+  `Agg` is `Agg(func, arg, distinct, custom)` — the third positional
+  parameter is `distinct`, not an output alias. The harness passed the alias
+  string `"total"` there, which is truthy, so every engine computed
+  `SUM(DISTINCT …)` and `COUNT(DISTINCT …)`. The 38x-wrong total and the
+  `n=609` were the *correct* answers to that different question. It took
+  computing plain-Python ground truth (`tools/diag_groupby.py`) to see it:
+  truth is `2038047.96` with `n=34393`, and all four engines now match it
+  exactly. The harness is fixed, and a comment at the call site records why
+  the third positional is not an alias.
+
+  This is worth recording rather than quietly correcting. I reported a
+  "likely float drift, maybe a null-handling bug" hypothesis when the
+  actual cause was a mistake in my own test, and the way to tell them apart
+  was to compute the answer independently rather than compare engines to
+  each other.
+
+- The harness error did expose one **genuine** product bug underneath it:
+  `PolarsEngine` rendered `SUM`/`AVG`/`MIN`/`MAX` as plain `col.sum()` etc.
+  and consulted `agg.distinct` only for `COUNT`. So `SUM(DISTINCT x)`
+  returned the sum *including duplicates* — the right shape of answer to a
+  different question, with nothing to signal it. Fixed by taking distinct
+  values first, and pinned by
+  `TestDistinctIsHonouredEverywhere`, which asserts `SUM(DISTINCT)` is 3
+  while `SUM` is 6 on the same rows — a fixture chosen so the two answers
+  differ, because a fixture where they coincide tests nothing.
+
+- A residual difference of about **3e-16 relative** remains between DuckDB
+  and the other engines on float sums (`2038047.959999998` vs
+  `2038047.9600000046`). This is floating-point summation order — a Python
+  loop and a vectorised kernel accumulate in a different order — and it is
+  benign, but it is real and is not asserted to be bit-identical.
 - `data/` is not committed. The 100 MB of Parquet is fetched on demand, and
   the manifest records exactly which bytes were measured.
+
 
 
 Two structural checks now live *inside* the test suite rather than in a
