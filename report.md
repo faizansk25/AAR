@@ -2,6 +2,7 @@
 
 **Project:** Adaptive Analytics Runtime
 **Workspace:** `d:\AAR`
+**Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
 **Status:** Core planning stack complete and verified · 200 tests passing
 **Last updated:** 2026-09-27
