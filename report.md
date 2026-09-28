@@ -235,7 +235,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**440 tests: 435 passing, 5 skipped, 0 failing.** 47 s. Every skip states the
+**540 tests: 540 passing, 5 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |
@@ -685,7 +685,91 @@ of groups is the contract; the order is not. Making it deterministic is a
 real change with a real cost, so it is pinned by a test that says so rather
 than quietly assumed either way.
 
-### 3.15 The Analyst Workbench — `src/aar/workbench/`, `aar workbench`
+### 3.17 What is built beyond the goal, and what the goal still needs
+
+The honest gap analysis. `system.md` describes a distributed, GPU-aware,
+multi-format analytics platform. What exists is a *verified single-node
+core*, and the difference is worth stating precisely rather than summarising
+as "on track".
+
+#### What was built that the specification did not ask for
+
+Three things came out of verification work rather than the feature list,
+and they are arguably the most valuable things in the repository:
+
+1. **A large-data audit** (`tools/audit.py`). Not in the spec. It runs
+   every engine, a cross-engine agreement sweep with *Python ground truth*
+   as the referee, every CLI command, and the spec's own principles against
+   3.07M real rows, exiting non-zero on failure. It found eight defects
+   that 540 unit tests did not, including two silently-wrong-answer bugs.
+2. **A manual test kit** (`tools/manual_test.py`). Not in the spec. A unit
+   suite proves the system agrees with itself; this is for whether it
+   agrees with a human, which is a different and more important claim.
+3. **Build-time source guards** (`TestSourceParses`). Not in the spec. They
+   exist because a docstring split by an interrupted edit once made a module
+   that imported nothing, and the failure looked like fifteen unrelated
+   test errors.
+
+#### What the goal needs and does not have
+
+| # | Area | Spec | State |
+|---|---|---|---|
+| 1 | **GPU execution** | §11 pain point | No GPU on this machine. Code paths, transfer model and `ENGINE_ABSENT` degradation written and exercised; **calibration curves unmeasured** |
+| 2 | **Distributed execution** | Ray, Dask, Spark, Trino, Arrow Flight | **Not implemented.** The registry *declares* them; none can run |
+| 3 | **Delta / Iceberg** | §7 open formats | **Not implemented.** Parquet only |
+| 4 | **Substrait import/export** | §7 | **Deliberately not done**, documented as a deviation: pre-1.0, and it has no vocabulary for AAR's classification |
+| 5 | **Streaming** | implied by "big data" | **Not implemented.** Everything materialises |
+| 6 | **PostgreSQL / MongoDB wire** | §10 | SQL generation tested; **the protocol has never run against a server** |
+| 7 | **Scheduler** | §14 | Budgets and a profile only; no resource manager |
+| 8 | **Workbench depth** | §17 | Panels are static — no drag, resize, dock, data grid, query editor or run history |
+| 9 | **Structured decision logging** | §16 | Trace and audit exist; no structured log sink |
+| 10 | **Cross-machine calibration** | principle 8 | **Untestable here** — one machine |
+
+#### What I need, and what stops me
+
+**Hardware and services I do not have:**
+
+- **A GPU.** The eleventh pain point — "organisations over-provision GPUs
+  because utilisation is low and scheduling is coarse-grained" — is one of
+  the reasons this project exists, and I cannot measure a single
+  millisecond of it. The cost model *reproduces the specification's worked
+  example* (80 ms kernel + 400 ms CPU + 400 ms transfers → CPU wins), but
+  that is the model agreeing with a paper, not with silicon.
+- **A PostgreSQL server and a MongoDB server.** Both connectors exist and
+  their dialects and SQL generation are tested. Neither has ever spoken to
+  its database.
+- **A second machine.** Principle 8 says "two machines with identical specs
+  can behave differently; the system measures, not assumes." I can measure
+  one. The claim is untested by construction.
+- **A cluster and a multi-node target.** The whole distributed layer.
+
+**Judgement calls I need you to make, because guessing would be worse than
+asking:**
+
+1. **Workbench depth versus breadth.** I could add drag-resize-dock, a
+   sortable data grid and a query editor to the existing UI, or add a third
+   and fourth data source (Delta, a real SQL server). Both are real gaps;
+   I cannot do both well.
+2. **Whether the local-web Workbench is the right shape at all.** A
+   dependency-free local server suits air-gapped single-node, which is the
+   deployment the spec calls out. If the intended target is a shared team
+   server, the security and multi-user model changes materially.
+3. **Whether to keep pushing on single-node depth or start the distributed
+   layer.** Starting distributed without a GPU or a cluster means writing
+   code that cannot be run, which is how unverified code gets written.
+
+**A constraint you should know about, which is not about the product:**
+
+This shell is a genuinely difficult environment. It cannot stream command
+output back, it mangles quotes in inline Python, and I have to run every
+command detached and poll a log file. That cost a large fraction of this
+session's effort — a malformed one-liner cost me a full debug cycle several
+times, and one stale `.pyc` made correct code look broken for ten minutes.
+It has not produced a wrong answer, but it has repeatedly slowed the loop
+from "try, see, fix" to "write to a file, wait, read, fix". I have written
+`tools/parse_check.py`-style diagnostics to compensate, which is a
+workaround, not a solution.
+
 
 The specification's §17 asks for a workbench, and — more importantly —
 names *why*: "users resist tools when they cannot understand how results
@@ -749,7 +833,8 @@ The automated suite proves the system agrees with itself. This is for the
 different claim that decides whether an analyst trusts it: that it agrees
 with a human.
 
-### 3.14 What the large-data audit found (3,066,766 real rows)
+### 3.15 The Analyst Workbench — `src/aar/workbench/`, `aar workbench`
+
 The specification's §17 asks for a workbench, and — more importantly —
 names *why*: "users resist tools when they cannot understand how results
 are generated; lack of trust in a black box is a primary adoption

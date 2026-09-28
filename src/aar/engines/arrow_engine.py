@@ -299,7 +299,16 @@ class ArrowEngine(Engine):
 
     def _empty_group(self, table: Table, keys: list[str],
                      aggs: dict[str, Any]) -> Table:
-        """A group-by over no rows still yields the right columns and types."""
+        """A group-by over no rows still yields the right columns and types.
+
+        It must also yield the right *classification*. This path used to
+        build the aggregate columns with no tags, so a group-by over an
+        empty table returned `SUM(confidential)` as an unlabelled column on
+        the Arrow and pandas engines while DuckDB and Polars labelled it
+        correctly. The data is empty either way, which is exactly why it
+        went unnoticed - but a policy that masks on classification would
+        disagree with itself depending on which engine the planner chose.
+        """
         import pyarrow as pa
 
         from ..interchange import canonical_to_arrow
@@ -310,12 +319,16 @@ class ArrowEngine(Engine):
                   for k in keys]
         arrow_schema = pa.schema(fields + [pa.field(a, pa.float64())
                                            for a in aggs])
+        derived = _aggregate_tags(table.schema, aggs)
         return Table(pa.Table.from_pylist([], schema=arrow_schema),
                      Schema(tuple(
                          Field(k, table.schema.get(k).type
-                               if table.schema.has(k) else _canonical_string())
+                               if table.schema.has(k)
+                               else _canonical_string())
                          for k in keys)
-                         + tuple(Field(a, _canonical_float()) for a in aggs)))
+                     + tuple(Field(a, _canonical_float(),
+                                   classification=derived.get(a, frozenset()))
+                             for a in aggs)))
 
     # ----------------------------------------------------------------- sort
     def sort(self, table: Table, keys: Sequence[tuple[str, bool]]) -> Table:

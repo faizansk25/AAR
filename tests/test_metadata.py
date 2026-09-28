@@ -331,6 +331,48 @@ class TestDistinctIsHonouredEverywhere:
             assert by_key == {"a": 3, "b": 1}, f"{engine_id} gave {by_key}"
 
 
+class TestEmptyGroupByKeepsTheLabel:
+    """A group-by over no rows must still classify its output.
+
+    Found by the large-data audit, then carried as a long-open risk until
+    it was actually checked. The Arrow empty-group path built its
+    aggregate columns with no tags, so `SUM(confidential)` came back
+    unlabelled on arrow and pandas while DuckDB and Polars labelled it
+    correctly. The rows are empty either way, which is why nobody noticed
+    - but a policy that masks on classification would then behave
+    differently depending on which engine the planner happened to pick.
+    """
+
+    def _empty(self):
+        import pyarrow as pa
+
+        from aar.interchange import Table
+        from aar.types import Field, INT64, Schema, UTF8
+
+        schema = Schema((Field("region", UTF8),
+                         Field("salary", INT64, classification=CONF)))
+        return Table(pa.table({"region": pa.array([], pa.string()),
+                               "salary": pa.array([], pa.int64())}), schema)
+
+    def test_the_derived_column_keeps_its_tag_on_every_engine(self):
+        for engine_id in available_engines():
+            out = engine_of(engine_id).group_by(
+                self._empty(), ["region"],
+                {"total": Agg("SUM", Col("salary"))})
+            assert out.num_rows == 0
+            assert out.column_names == ("region", "total"), engine_id
+            assert out.schema.get("total").classification == CONF, (
+                f"{engine_id} dropped the classification on an empty "
+                f"group-by")
+
+    def test_count_star_is_still_unclassified_on_every_engine(self):
+        for engine_id in available_engines():
+            out = engine_of(engine_id).group_by(
+                self._empty(), ["region"],
+                {"n": Agg("COUNT", None)})
+            assert not out.schema.get("n").classification, engine_id
+
+
 class TestNullSemanticsAgreeAcrossEngines:
     """Null handling must be identical everywhere, or it is wrong somewhere.
 

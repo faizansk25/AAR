@@ -51,10 +51,20 @@ library alone. Engines are opt-in extras:
 ## Verify
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q             # 365 tests
+.\.venv\Scripts\python.exe -m pytest -q             # 540 tests
 .\.venv\Scripts\python.exe tools\check_syntax.py    # parse every module
 .\.venv\Scripts\python.exe tools\smoke_run.py       # build a plan, run it, check the numbers
+.\.venv\Scripts\python.exe tools\manual_test.py     # guided tour, by hand
 .\.venv\Scripts\python.exe tools\debug_calib.py     # per-benchmark timings
+```
+
+The large-data audit needs a one-off download (~100 MB, NYC taxi
+Parquet) and then runs every engine, every CLI command and the
+specification's principles against it, exiting non-zero on any failure:
+
+```powershell
+python tools\fetch_data.py     # one time; records SHA-256 in data/MANIFEST.json
+python tools\audit.py          # writes data/audit/audit.txt
 ```
 
 ## Run
@@ -353,9 +363,14 @@ src/aar/
   failures/registry.py  22 failure modes + DegradationLedger
   capability/registry.py 16 engines, 6 tiers, feasible sets, availability probe
   cost/model.py         six-term breakdown, transfers, residency, history
-  cli.py                aar doctor / engines / calibrate / version
-tests/                  222 behavioural tests
-tools/                  check_syntax, debug_calib, smoke, truncate
+  cli.py                aar doctor / engines / calibrate / explain / run /
+                        policy / workbench / version
+  workbench/            the Analyst Workbench: local HTTP server, i18n, UI
+  connectors/           Excel, Parquet/CSV/JSON, SQL, MongoDB
+tests/                  540 behavioural tests
+tools/                  check_syntax, smoke_run, manual_test, audit,
+                        fetch_data, diag_groupby, debug_calib,
+                        make_sample_data, check_assets
 report.md               build status, bugs found, what comes next
 system.md               the specification
 ```
