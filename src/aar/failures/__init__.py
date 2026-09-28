@@ -5,7 +5,7 @@ from .registry import (  # noqa: F401
     DegradationLedger, FailureKind, FailureMode, FailureRegistry, PlanInfeasible,
     PolicyDenied, PrivacyViolation, QualityCheckFailed, ResourceExhausted,
     SchemaDriftError, Severity, SourceUnavailable, TypeMismatchError,
-    UDFExecutionError, capture, register_modes,
+    UDFExecutionError, capture, process_ledger, register_modes,
 )
 
 __all__ = [
@@ -13,5 +13,6 @@ __all__ = [
     "DegradationLedger", "FailureKind", "FailureMode", "FailureRegistry",
     "PlanInfeasible", "PolicyDenied", "PrivacyViolation", "QualityCheckFailed",
     "ResourceExhausted", "SchemaDriftError", "Severity", "SourceUnavailable",
-    "TypeMismatchError", "UDFExecutionError", "capture", "register_modes",
+    "TypeMismatchError", "UDFExecutionError", "capture", "process_ledger",
+    "register_modes",
 ]

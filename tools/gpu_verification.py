@@ -103,38 +103,25 @@ def check_gpu_engines(result: dict) -> None:
     section("4. Can AAR actually construct a GPU engine here?")
     try:
         from aar.engines.factory import create_engine
-        from aar.failures import default_registry as failure_registry
 
         for engine_id in ("cudf", "polars_gpu"):
             entry = result["engines"].setdefault(engine_id, {})
-            # `create_engine` degrades rather than raising, so "it returned
-            # something" is NOT evidence the GPU engine loaded - it may have
-            # handed back a CPU fallback. Without a ledger nothing records
-            # that, which is precisely why one is passed here.
-            ledger = failure_registry()
+            # allow_degradation=False is the whole point: "cudf" must mean
+            # cudf here. Anything that quietly returns an Arrow engine would
+            # file CPU timings under a GPU label, which is the exact lie this
+            # script exists to prevent.
             try:
-                engine = create_engine(engine_id, ledger=ledger)
+                engine = create_engine(engine_id, allow_degradation=False)
             except Exception as exc:  # noqa: BLE001
                 entry["available"] = False
                 entry["reason"] = str(exc)[:200]
-                print(f"{engine_id}: FAILED - {str(exc)[:90]}", flush=True)
-                continue
-            events = getattr(ledger, "events", None) or []
-            degraded = [e for e in events
-                        if getattr(e, "kind", "") == "ENGINE_ABSENT"]
-            if degraded:
-                entry["available"] = False
-                entry["degraded_to"] = type(engine).__name__
-                entry["reason"] = str(
-                    getattr(degraded[0], "detail", "engine absent"))[:200]
-                print(f"{engine_id}: DEGRADED to "
-                      f"{type(engine).__name__} - {entry['reason'][:70]}",
+                print(f"{engine_id}: UNAVAILABLE - {str(exc)[:90]}",
                       flush=True)
-            else:
-                entry["available"] = True
-                entry["engine_class"] = type(engine).__name__
-                print(f"{engine_id}: constructed OK "
-                      f"({type(engine).__name__})", flush=True)
+                continue
+            entry["available"] = True
+            entry["engine_class"] = type(engine).__name__
+            print(f"{engine_id}: constructed OK "
+                  f"({type(engine).__name__})", flush=True)
     except Exception as exc:  # noqa: BLE001
         result["errors"].append(f"engine construction failed: {exc}")
 
@@ -160,7 +147,6 @@ def benchmark(result: dict) -> None:
     section("5. The same work on every engine that can do it")
     try:
         from aar.engines.factory import create_engine
-        from aar.failures import default_registry
         from aar.ir import Agg, BinOp, Col, Lit
     except Exception as exc:  # noqa: BLE001
         result["errors"].append(f"cannot import the engines: {exc}")
@@ -180,21 +166,15 @@ def benchmark(result: dict) -> None:
     for engine_id in ("arrow", "duckdb", "polars_cpu", "pandas",
                       "cudf", "polars_gpu"):
         entry: dict = {}
-        # A ledger is not optional here. Without it, a request for cudf on a
-        # machine without cudf returns Arrow, and the row would be filed
-        # under "cudf" with Arrow's timings - a benchmark that lies.
-        ledger = default_registry()
+        # Same rule here as in section 4: a row filed under "cudf" must have
+        # been produced by cudf. Anything less and the benchmark lies.
         try:
-            engine = create_engine(engine_id, ledger=ledger)
-        except Exception:  # noqa: BLE001
-            continue
-        if [e for e in (getattr(ledger, "events", None) or [])
-                if getattr(e, "kind", "") == "ENGINE_ABSENT"]:
+            engine = create_engine(engine_id, allow_degradation=False)
+        except Exception as exc:  # noqa: BLE001
             result["benchmark"][engine_id] = {
-                "skipped": "degraded to a fallback engine",
-                "ran_as": type(engine).__name__}
-            print(f"  {engine_id:11s} skipped - degraded to "
-                  f"{type(engine).__name__}", flush=True)
+                "skipped": "engine unavailable",
+                "reason": f"{type(exc).__name__}: {exc}"[:200]}
+            print(f"  {engine_id:11s} skipped - unavailable", flush=True)
             continue
         entry["engine_class"] = type(engine).__name__
         try:

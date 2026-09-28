@@ -1,9 +1,20 @@
 {
   "python": "3.14.7",
   "platform": "Windows-10-10.0.19045-SP0",
-  "timestamp": "2026-09-28T19:02:21",
+  "timestamp": "2026-09-28T19:20:24",
   "rows": 2000000,
-  "cuda": {},
+  "cuda": {
+    "available": false,
+    "vendor": null,
+    "model": null,
+    "device_count": 0,
+    "vram_gb": null,
+    "driver": null,
+    "cuda": null,
+    "compute_capability": null,
+    "uvm": false,
+    "reason": "no accelerator driver or runtime detected"
+  },
   "engines": {
     "postgresql": {
       "available": true,
@@ -46,13 +57,13 @@
       "version": "25.0.1"
     },
     "polars_gpu": {
-      "available": true,
-      "reason": "cudf is not installed",
+      "available": false,
+      "reason": "[GPU_OP_UNSUPPORTED] engine 'polars_gpu' was required but is not available: polars_gpu has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_cpu, pandas, arro",
       "version": null
     },
     "cudf": {
-      "available": true,
-      "reason": "cudf is not installed",
+      "available": false,
+      "reason": "[GPU_OP_UNSUPPORTED] engine 'cudf' was required but is not available: cudf has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_cpu, pandas, arrow instead. (",
       "version": null
     },
     "ray": {
@@ -88,51 +99,49 @@
   },
   "benchmark": {
     "arrow": {
-      "group_by_ms": 16670.6,
-      "filter_ms": 18.6,
+      "engine_class": "ArrowEngine",
+      "group_by_ms": 11897.4,
+      "filter_ms": 15.9,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "duckdb": {
-      "group_by_ms": 538.1,
-      "filter_ms": 30.3,
+      "engine_class": "DuckDBEngine",
+      "group_by_ms": 418.6,
+      "filter_ms": 24.3,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "polars_cpu": {
-      "group_by_ms": 187.4,
-      "filter_ms": 11.8,
+      "engine_class": "PolarsEngine",
+      "group_by_ms": 167.9,
+      "filter_ms": 10.6,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "pandas": {
-      "group_by_ms": 15266.0,
-      "filter_ms": 86873.8,
+      "engine_class": "PandasEngine",
+      "group_by_ms": 15765.9,
+      "filter_ms": 83393.8,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "cudf": {
-      "group_by_ms": 584.5,
-      "filter_ms": 30.6,
-      "groups": 512,
-      "checksum": 31968000.0,
-      "agrees": true
+      "skipped": "engine unavailable",
+      "reason": "CapabilityError: [GPU_OP_UNSUPPORTED] engine 'cudf' was required but is not available: cudf has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_cpu, pandas,"
     },
     "polars_gpu": {
-      "group_by_ms": 523.2,
-      "filter_ms": 35.6,
-      "groups": 512,
-      "checksum": 31968000.0,
-      "agrees": true
+      "skipped": "engine unavailable",
+      "reason": "CapabilityError: [GPU_OP_UNSUPPORTED] engine 'polars_gpu' was required but is not available: polars_gpu has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_"
     }
   },
   "decisions": [],
   "errors": [
-    "hardware probe failed: 'GpuInfo' object has no attribute 'present'",
+    "no usable GPU: no accelerator driver or runtime detected",
     "cost model: 'CostModel' object has no attribute 'node_cost_for'"
   ],
   "aar_version": "0.1.0"

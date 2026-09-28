@@ -539,13 +539,38 @@ streaming progress are not yet built.
    each engine was chosen; and the cost model correctly prefers CPU in all
    nine sampled size/parallelism combinations on a machine with no GPU.
 
-   **A defect this exercise found:** `create_engine("cudf")` on a host
-   without cuDF returns an Arrow engine instead of raising, and records
-   nothing unless the caller passes a `ledger`. A verification script
-   trusting the return value would file Arrow's timings under the label
-   "cudf". The script now passes a ledger and marks degraded engines
-   `skipped` with `ran_as`. Generalising that into `create_engine` itself,
-   so the substitution is impossible to miss, is still open.
+   **Two defects, one much larger than the other.**
+
+   *First*: `create_engine("cudf")` on a host without cuDF returned an
+   Arrow engine and recorded nothing unless the caller passed a `ledger`.
+   A verification script trusting the return value would have filed
+   Arrow's timings under the label "cudf". **Now fixed.** `create_engine`
+   guarantees three things: with no ledger the substitution goes to
+   `aar.failures.process_ledger()` *and* raises a `RuntimeWarning`; with a
+   ledger it is recorded and the warning is suppressed (the caller is
+   listening); and `allow_degradation=False` refuses the substitution
+   outright. `tools/gpu_verification.py` now uses that third form, and six
+   tests in `TestSubstitutionsAreNeverSilent` lock it in.
+
+   *Second, and the real one*: **there is no cudf engine to run.** No
+   `CudfEngine` or `PolarsGPUEngine` class exists anywhere in the
+   codebase. The capability registry *declares* sixteen engines across six
+   tiers, and `ENGINE_FACTORIES` implements six. For the other ten -
+   `cudf`, `polars_gpu`, `ray`, `dask`, `spark_rapids`, `postgresql`,
+   `mysql`, `sqlite`, `mongodb`, `trino` - `create_engine` can only ever
+   return a fallback.
+
+   This means a GPU verification run today would test detection, the cost
+   model and the degradation path, and would produce **no cudf benchmark at
+   all**. The gap is now tracked explicitly by
+   `TestDeclaredIsNotImplemented`, which fails the moment that set changes -
+   so implementing `CudfEngine` is a deliberate act that shrinks a list
+   rather than an accident nobody notices.
+
+   *The consequence for the Colab plan*: the notebook is still worth
+   running, but its purpose is narrower than it looked. It validates that
+   AAR degrades correctly on a real GPU-equipped machine, not that cudf is
+   fast. Getting the latter needs the engine written first.
 
    **A T4 would not prove everything.** It is compute capability 7.5: no
    bfloat16, FP64 at 1/64 of FP32. A workload that wins on a T4 may lose on
@@ -597,7 +622,7 @@ cd d:\AAR
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
 # Verify everything
-.\.venv\Scripts\python.exe -m pytest -q                 # 547 tests
+.\.venv\Scripts\python.exe -m pytest -q                 # 555 tests
 .\.venv\Scripts\python.exe tools\check_syntax.py        # parse every module
 .\.venv\Scripts\python.exe tools\check_assets.py        # validate logo.svg
 .\.venv\Scripts\python.exe tools\smoke_run.py           # plan + run + verify the numbers

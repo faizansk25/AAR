@@ -457,6 +457,24 @@ def _fmt_exception(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"
 
 
+#: Where degradations go when nobody supplied a ledger. Module-level on
+#: purpose: the whole point is that a caller who forgot to pass a ledger
+#: still leaves a trace behind. ``create_engine`` additionally warns, so this
+#: is a backstop, not the primary signal.
+_PROCESS_LEDGER = DegradationLedger()
+
+
+def process_ledger() -> DegradationLedger:
+    """The process-wide ledger for degradations nobody asked to be recorded.
+
+    Exists because the alternative is worse. Before this, a caller who
+    omitted ``ledger=`` lost the degradation entirely, and a verification
+    script wrote a CPU engine's timings to disk under a GPU engine's name
+    without anything anywhere recording that it had happened.
+    """
+    return _PROCESS_LEDGER
+
+
 def capture(fn, *args, ledger: DegradationLedger | None = None,
             where: str = "", kind: FailureKind = FailureKind.UDF_FAILURE,
             on_error: Callable[[BaseException], Any] | None = None,
