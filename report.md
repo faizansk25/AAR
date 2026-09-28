@@ -499,10 +499,18 @@ Two defects were fixed, both of which only appear *after* publishing:
 
 Also: the `all` extra no longer pulls `cudf`, because installing RAPIDS on a
 CPU-only host *fails at install time* rather than degrading, which would
-break `pip install aar[all]` for most users. GPU is explicitly opt-in.
+break `pip install adaptive-analytics-runtime[all]` for most users. GPU is
+explicitly opt-in.
 
 **A missing `LICENSE` was found and added.** The package declared Apache-2.0
 but shipped no licence text.
+
+**The PyPI name is `adaptive-analytics-runtime`, not `aar`.** Confirmed free
+at the time of writing. The bare name `aar` is **taken** on PyPI by an
+unrelated project (an AI application library, since 2024), so anyone typing
+`pip install aar` gets that instead. The import name and the console script
+are both still `aar`; only the distribution name is spelled out. Every
+install instruction in the repository says so explicitly for that reason.
 
 ### 7.10 GPU verification — **IN PROGRESS**
 

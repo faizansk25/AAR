@@ -8,7 +8,33 @@ uploading, that the wheel was missing a data file.
 
 ---
 
-## 0. The one fact that causes the most pain
+## 0. The name is not `aar`, and that is deliberate
+
+Three names, and only one of them has to be unique:
+
+| Role | Name | Has to be free on PyPI? |
+|---|---|---|
+| Distribution (`pip install X`) | `adaptive-analytics-runtime` | **Yes** |
+| Import (`import aar`) | `aar` | No — local namespace only |
+| Console script (`aar --version`) | `aar` | No — local command only |
+
+**`aar` is already taken on PyPI** by an unrelated project ("aar is a
+collection of libraries for building AI applications", first uploaded
+November 2024). Anyone who types `pip install aar` gets *that* project, not
+this one. So every install instruction in this repository spells the
+distribution name out in full. Do not "simplify" them.
+
+`adaptive-analytics-runtime` was confirmed free (HTTP 404 on the PyPI JSON
+API) at the time of writing. Re-check immediately before publishing:
+names are permanent, and a squatter could take it in between.
+
+A related consequence: searching PyPI for "AAR" returns dozens of unrelated
+projects, because the acronym is short and heavily used. The project
+description and keywords carry the full expansion for that reason.
+
+---
+
+## 0.1 The one fact that causes the most pain
 
 **You cannot re-upload the same filename. Ever.**
 

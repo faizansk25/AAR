@@ -50,8 +50,11 @@ gpu-cu11  = ["cudf-cu11>=24.4", "pynvml>=11.5"]
 dev       = ["pytest>=7.4", "pyarrow>=14", "openpyxl>=3.1", "duckdb>=0.10", "polars>=1.0"]
 # Everything except the GPU stack, which needs a matching CUDA and is
 # deliberately opt-in: pulling cudf on a CPU-only host fails at install
-# time rather than degrading, which would break `pip install aar[all]`
-# for the majority of users who do not have a GPU.
+# time rather than degrading, which would break
+# `pip install adaptive-analytics-runtime[all]` for most users.
+# NB the name is NOT `aar` - that name is taken on PyPI by an unrelated
+# project. The import name and the console script are both `aar`; only the
+# distribution name is spelled out.
 all       = ["adaptive-analytics-runtime[arrow,excel,duckdb,polars,pandas,sql]"]
 
 [project.scripts]
