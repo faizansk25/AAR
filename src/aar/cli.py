@@ -88,15 +88,25 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_policy = sub.add_parser(
         "policy", help="inspect, validate or write a policy file")
-    p_policy.add_argument("action", choices=("show", "check"),
+    p_policy.add_argument("action", nargs="?", default=None,
+                          choices=("show", "check"),
                           help="show: print a policy; check: validate one")
     p_policy.add_argument("path", nargs="?", default=None,
                           help="policy JSON file")
     p_policy.add_argument("--write-example", default=None, metavar="PATH",
                           help="write a documented example policy and exit")
 
+    w = sub.add_parser("workbench",
+                       help="open the Analyst Workbench in a browser")
+    w.add_argument("--port", type=int, default=8765)
+    w.add_argument("--host", default="127.0.0.1",
+                   help="bind address (loopback by default)")
+    w.add_argument("--open", action="store_true",
+                   help="open a browser window immediately")
+
     sub.add_parser("version", help="version and optional-dependency status")
     return parser
+
 
 
 
@@ -352,6 +362,14 @@ def _cmd_version(_args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _cmd_workbench(args: argparse.Namespace) -> int:
+    from .workbench import WorkbenchServer
+
+    WorkbenchServer(host=args.host, port=args.port,
+                    open_browser=args.open).serve_forever()
+    return _EXIT_OK
+
+
 _COMMANDS = {
     "doctor": _cmd_doctor,
     "engines": _cmd_engines,
@@ -359,6 +377,7 @@ _COMMANDS = {
     "explain": _cmd_explain,
     "run": _cmd_run,
     "policy": _cmd_policy,
+    "workbench": _cmd_workbench,
     "version": _cmd_version,
 }
 

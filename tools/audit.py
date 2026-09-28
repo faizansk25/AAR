@@ -38,6 +38,49 @@ _results: list[dict] = []
 #: exists to finish; the finding itself is measured and reported separately.
 GROUP_BY_ROWS = 300_000
 
+#: Relative tolerance for comparing float aggregates across engines. A
+#: Python loop and a vectorised kernel accumulate a sum in a different
+#: order, so last-bit differences are expected and are not a defect. Exact
+#: equality would report a correct engine as broken, which is worse than
+#: missing a real one - so the tolerance is tight enough to catch a wrong
+#: answer and loose enough to admit rounding.
+FLOAT_TOLERANCE = 1e-9
+
+
+def _grouped(result) -> dict:
+    """A group-by result as {key: {column: value}}, order-independent."""
+    return {r["PULocationID"]: r for r in result.arrow.to_pylist()}
+
+
+def _values_match(a, b) -> bool:
+    """Equal, allowing for float summation order across engines."""
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            scale = max(abs(float(a)), abs(float(b)), 1.0)
+        except (TypeError, ValueError):
+            return a == b
+        return abs(float(a) - float(b)) <= FLOAT_TOLERANCE * scale
+    return a == b
+
+
+def _same_groups(want: dict, got: dict, want_name: str,
+                 got_name: str) -> tuple:
+    if set(want) != set(got):
+        only_want = sorted(set(want) - set(got))[:3]
+        only_got = sorted(set(got) - set(want))[:3]
+        return False, (f"different groups: only in {want_name} {only_want}, "
+                       f"only in {got_name} {only_got}")
+    for key, expected in want.items():
+        actual = got[key]
+        for column, value in expected.items():
+            if column == "PULocationID":
+                continue
+            if not _values_match(value, actual.get(column)):
+                return False, (f"group {key} {column}: {want_name}="
+                               f"{value!r} {got_name}={actual.get(column)!r}")
+    return True, f"{len(got):,} groups agree within {FLOAT_TOLERANCE:.0e}"
+
+
 
 
 def record(group: str, name: str, ok: bool, detail: str = "",
@@ -229,21 +272,14 @@ def audit_agreement() -> None:
     # there is a truthy string and silently makes every aggregate DISTINCT.
     aggs = {"total": Agg("SUM", Col("fare_amount")),
             "n": Agg("COUNT", Col("fare_amount"))}
-    want = sorted(repr(r) for r in reference.group_by(
-        table, ["PULocationID"], aggs).arrow.to_pylist())
+    want = _grouped(reference.group_by(table, ["PULocationID"], aggs))
     for engine_id in engines[1:]:
         def compare(eid=engine_id, want=want):
-            got = sorted(repr(r) for r in create_engine(eid).group_by(
-                table, ["PULocationID"], aggs).arrow.to_pylist())
-            if got == want:
-                return True, f"{len(got):,} groups match {reference_id}"
-            for i, (a, b) in enumerate(zip(want, got)):
-                if a != b:
-                    return False, (f"group {i}: {reference_id}={a[:52]} "
-                                   f"| {eid}={b[:52]}")
-            return False, (f"row counts: {reference_id}={len(want)} "
-                           f"{eid}={len(got)}")
+            got = _grouped(create_engine(eid).group_by(
+                table, ["PULocationID"], aggs))
+            return _same_groups(want, got, reference_id, eid)
         check("agreement", f"{engine_id}.group_by == {reference_id}", compare)
+
 
     predicate = BinOp(Col("fare_amount"), ">", Lit(10.0))
     want_rows = reference.filter(table, predicate).num_rows
@@ -259,18 +295,25 @@ def audit_agreement() -> None:
 
 # ------------------------------------------------------ 3. every command
 def _write_pipeline() -> str:
-    """A real pipeline over the real dataset, written to a file."""
+    """A real pipeline over the real dataset, written to a file.
+
+    The paths are emitted with ``!r`` rather than by hand-escaping
+    backslashes: a Windows path written into an ``r'...'`` literal with
+    doubled separators is a *different, non-existent* path, and the
+    pipeline then fails to load for a reason that has nothing to do with
+    AAR. Repr produces a literal that is correct on every platform.
+    """
     os.makedirs(OUT, exist_ok=True)
     path = os.path.join(OUT, "pipeline_audit.py")
-    source = taxi_parquet().replace("\\", "\\\\")
-    target = os.path.join(OUT, "audit_out.parquet").replace("\\", "\\\\")
+    source = taxi_parquet()
+    target = os.path.join(OUT, "audit_out.parquet")
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(
             '"""Real-data pipeline for the audit."""\n'
             "from aar.sdk import (classify, group_by, limit, parquet, sort,\n"
             "                      sum_, write_parquet)\n\n"
-            f"SRC = r'{source}'\n"
-            f"OUT = r'{target}'\n\n\n"
+            f"SRC = {source!r}\n"
+            f"OUT = {target!r}\n\n\n"
             "def build():\n"
             "    t = parquet(SRC)\n"
             "    t = classify(t, 'fare_amount', 'confidential')\n"

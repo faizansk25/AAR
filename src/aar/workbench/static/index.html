@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<!--
+  AAR Analyst Workbench.
+
+  Three decisions worth stating, because they are what "reduce cognitive
+  load" means in practice:
+
+  1. The interface is **translated at runtime, not hard-coded**, and a
+     missing string falls back to English rather than rendering blank. A
+     blank control is unusable with a screen reader, so the fallback is an
+     accessibility requirement, not a nicety.
+
+  2. **Nothing is hidden behind a hover.** Every reason AAR made a
+     decision is rendered as text. The specification calls the
+     explainability panel a requirement for adoption, and a tooltip nobody
+     can screenshot is not evidence.
+
+  3. **Keyboard first.** Tab order follows reading order, every control
+     has a visible focus ring, and the shortcuts are discoverable in Help
+     rather than being folklore.
+-->
+<html lang="en" dir="ltr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AAR Analyst Workbench</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<a class="skip" href="#workspace" data-i18n="panel.workspace">SQL / Python workspace</a>
+<header>
+  <h1 data-i18n="app.title">AAR Analyst Workbench</h1>
+  <nav id="tabs" role="tablist" aria-label="Sections">
+    <button role="tab" aria-current="page" data-i18n="tab.project">Project</button>
+    <button role="tab" data-i18n="tab.connections">Connections</button>
+    <button role="tab" data-i18n="tab.runs">Runs</button>
+    <button role="tab" data-i18n="tab.resources">Resources</button>
+    <button role="tab" data-i18n="tab.help">Help</button>
+  </nav>
+  <span class="spacer"></span>
+  <label class="sr" for="lang" data-i18n="label.language">Language</label>
+  <select id="lang"></select>
+  <label class="sr" for="theme" data-i18n="label.theme">Theme</label>
+  <select id="theme">
+    <option value="system" data-i18n="theme.system">System</option>
+    <option value="light" data-i18n="theme.light">Light</option>
+    <option value="dark" data-i18n="theme.dark">Dark</option>
+  </select>
+  <label class="sr" for="density" data-i18n="label.density">Density</label>
+  <select id="density">
+    <option value="comfortable" data-i18n="density.comfortable">Comfortable</option>
+    <option value="compact" data-i18n="density.compact">Compact</option>
+    <option value="spacious" data-i18n="density.spacious">Spacious</option>
+  </select>
+</header>
+<main>
+  <section class="panel" id="sources" aria-labelledby="src-h">
+    <h2 id="src-h" data-i18n="panel.sources">Sources</h2>
+    <ul id="engine-list" role="list"></ul>
+    <p class="empty" id="engine-empty" data-i18n="empty.engines">No engines probed yet.</p>
+  </section>
+  <section class="panel" id="workspace" aria-labelledby="ws-h" tabindex="-1">
+    <h2 id="ws-h" data-i18n="panel.workspace">SQL / Python workspace</h2>
+    <form id="form">
+      <label class="sr" for="path" data-i18n="label.pipeline">Pipeline file</label>
+      <input id="path" placeholder="pipelines/example_orders.py">
+      <label class="sr" for="role" data-i18n="label.role">Your role</label>
+      <input id="role" value="analyst">
+      <button class="act" id="btn-explain" type="button" data-i18n="action.explain">Explain plan</button>
+      <button class="act primary" id="btn-run" type="button" data-i18n="action.run">Run</button>
+    </form>
+    <p class="empty" id="plan-empty" data-i18n="empty.plan">Load a pipeline.</p>
+    <pre id="plan" hidden aria-live="polite"></pre>
+  </section>
+  <section class="panel" id="inspector" aria-labelledby="ins-h">
+    <h2 id="ins-h" data-i18n="panel.inspector">Plan inspector</h2>
+    <div id="meters"></div>
+  </section>
+  <section class="panel" id="bottom" aria-labelledby="bot-h">
+    <h2 id="bot-h" data-i18n="panel.preview">Data preview</h2>
+    <nav id="bottom-tabs" role="tablist" aria-label="Detail panels">
+      <button role="tab" data-panel="preview" aria-current="page" data-i18n="panel.preview">Data preview</button>
+      <button role="tab" data-panel="schema" data-i18n="panel.schema">Schema</button>
+      <button role="tab" data-panel="lineage" data-i18n="panel.lineage">Lineage</button>
+      <button role="tab" data-panel="log" data-i18n="panel.log">Execution log</button>
+      <button role="tab" data-panel="explain" data-i18n="panel.explain">Why</button>
+      <button role="tab" data-panel="help" data-i18n="tab.help">Help</button>
+    </nav>
+    <div id="panel-body"><p class="empty" data-i18n="empty.result">Run a pipeline.</p></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

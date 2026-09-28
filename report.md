@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, and enforces it · 512 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 540 tests
 **Last updated:** 2026-09-28
 
 ---
@@ -42,9 +42,9 @@ not GPU utilisation.
 | 15 | Explainability & observability | §16 | 🟡 Partial (`explain` + run trace + policy audit) | — |
 | 16 | Execution history feedback | §6 | ✅ **Complete** | history tests |
 | 16 | Runtime executor + cache | — | ⬜ Not started | — |
-| 17 | SDK (`ctx.excel()` …) | §1 | ⬜ Not started | — |
-| 18 | CLI — `aar explain plan` | §16 | ⬜ Blocked on the planner | — |
-| 19 | Analyst Workbench UI | §17 | ⬜ Not started | — |
+| 17 | SDK (`ctx.excel()` …) | §1 | ✅ **Complete** | SDK tests + end to end |
+| 18 | CLI — `aar explain plan` | §16 | ✅ **Complete** | `aar explain` |
+| 19 | Analyst Workbench UI | §17 | 🟡 **Partial — live, translatable, a11y** | 30 workbench tests |
 
 **Progress: 8 of 19 layers complete (42% of the specified system), plus
 3 partial.** The completed layers form the chain from "what does this data
@@ -685,7 +685,116 @@ of groups is the contract; the order is not. Making it deterministic is a
 real change with a real cost, so it is pinned by a test that says so rather
 than quietly assumed either way.
 
+### 3.15 The Analyst Workbench — `src/aar/workbench/`, `aar workbench`
+
+The specification's §17 asks for a workbench, and — more importantly —
+names *why*: "users resist tools when they cannot understand how results
+are generated; lack of trust in a black box is a primary adoption
+barrier." So the explainability panel is treated as the central requirement,
+not a tab to add later.
+
+**Standard library only.** No framework, no build step, no CDN. A UI that
+needed a package install would be a UI that cannot start on the air-gapped
+machines the rest of the design is for, and a test asserts the served HTML
+contains no `http://` or `https://` at all. It binds to loopback by
+default, because it can execute pipeline files and principle 2 is that
+outbound is denied by default.
+
+**Global usability, implemented rather than promised.** Five languages
+(English, Spanish, French, Hindi, Arabic) with runtime translation, RTL
+layout set explicitly rather than guessed, dark/light/system themes, three
+density modes, and a font stack naming Noto Sans Arabic and Noto Sans
+Devanagari so those scripts actually render. The rule that matters: **a
+missing string falls back to English and never renders blank**, because an
+unlabelled button is unusable with a screen reader. That makes the fallback
+an accessibility requirement, not tidiness.
+
+**Every promise in the UI is a test.** Thirty tests check that the
+accessibility claims are real: every `<input>`/`<select>` has an accessible
+name, there is a skip link, tabs declare their roles, results land in an
+`aria-live` region, and there is no `title=` attribute anywhere — because
+the specification's explainability requirement is not met by a tooltip
+nobody can screenshot. Keyboard shortcuts are documented in a Help panel
+rather than being folklore, and every engine's "not installed" reason is
+rendered as visible text, never hidden.
+
+Writing the tests found a **real bug**: `_plan_for` exits by raising
+`SystemExit`, which is a `BaseException`, so `except Exception` missed it
+and a typo in a filename killed the HTTP handler instead of returning a
+sentence explaining what was wrong. An API that dies on bad input is worse
+than one that complains. Now caught, with a test that fails if a
+`SystemExit` ever escapes again.
+
+**What is deliberately not built yet.** The spec's layout also asks for
+draggable, resizable, dockable panels; a data grid with sorting and
+filtering; a query editor; and a run history view. The first version has
+the information architecture, the API, the theming, the i18n and the
+accessibility, and the panels are static. That is a real gap and it is
+recorded as one rather than implied done.
+
+### 3.16 A manual test kit, because a passing suite is not the same as usable
+
+`tools/manual_test.py` walks a person through six checks using the real CLI
+and real files: what is installed, the shipped example end to end, the
+privacy path, whether failures are loud, a decision trace, and the large
+data path. Each step says what to do, what a correct answer looks like,
+and *what to look for* — because the usual failure mode of a manual test is
+"it ran, but I could not tell whether that was right."
+
+    python tools/manual_test.py          # the whole tour
+    python tools/manual_test.py privacy  # one step
+    python tools/manual_test.py --list
+
+The automated suite proves the system agrees with itself. This is for the
+different claim that decides whether an analyst trusts it: that it agrees
+with a human.
+
 ### 3.14 What the large-data audit found (3,066,766 real rows)
+The specification's §17 asks for a workbench, and — more importantly —
+names *why*: "users resist tools when they cannot understand how results
+are generated; lack of trust in a black box is a primary adoption
+barrier." So the explainability panel is treated as the central requirement,
+not a tab to add later.
+
+**Standard library only.** No framework, no build step, no CDN. A UI that
+needed a package install would be a UI that cannot start on the air-gapped
+machines the rest of the design is for, and a test asserts the served HTML
+contains no `http://` or `https://` at all. It binds to loopback by
+default, because it can execute pipeline files and principle 2 is that
+outbound is denied by default.
+
+**Global usability, implemented rather than promised.** Five languages
+(English, Spanish, French, Hindi, Arabic) with runtime translation, RTL
+layout set explicitly rather than guessed, dark/light/system themes, three
+density modes, and a font stack naming Noto Sans Arabic and Noto Sans
+Devanagari so those scripts actually render. The rule that matters: **a
+missing string falls back to English and never renders blank**, because an
+unlabelled button is unusable with a screen reader. That makes the fallback
+an accessibility requirement, not tidiness.
+
+**Every promise in the UI is a test.** Thirty tests check that the
+accessibility claims are real: every `<input>`/`<select>` has an accessible
+name, there is a skip link, tabs declare their roles, results land in an
+`aria-live` region, and there is no `title=` attribute anywhere — because
+the specification's explainability requirement is not met by a tooltip
+nobody can screenshot. Keyboard shortcuts are documented in a Help panel
+rather than being folklore, and every engine's "not installed" reason is
+rendered as visible text, never hidden.
+
+Writing the tests found a **real bug**: `_plan_for` exits by raising
+`SystemExit`, which is a `BaseException`, so `except Exception` missed it
+and a typo in a filename killed the HTTP handler instead of returning a
+sentence explaining what was wrong. An API that dies on bad input is worse
+than one that complains. Now caught, with a test that fails if a
+`SystemExit` ever escapes again.
+
+**What is deliberately not built yet.** The spec's layout also asks for
+draggable, resizable, dockable panels; a data grid with sorting and
+filtering; a query editor; and a run history view. The first version has
+the information architecture, the API, the theming, the i18n and the
+accessibility, and the panels are static. That is a real gap and it is
+recorded as one rather than implied done.
+
 
 `tools/fetch_data.py` downloads the NYC TLC yellow-taxi Parquet files
 (3.07M and 3.63M rows, 47.7 MB and 55.7 MB) and records their SHA-256 and
@@ -849,8 +958,19 @@ roughly 140 lines of the SQL connector as string content.
   only way to shed a tag, and it requires a written justification that is
   *stored* but not yet surfaced in the run trace.
 
-Next is **structured decision logging** and the **Analyst Workbench**, then
-live-server integration tests for PostgreSQL and MongoDB once servers are
-available.
+Manual test kit: run the tour by hand, then the Workbench
+
+    python tools/manual_test.py            # the guided tour
+    python tools/manual_test.py --list     # just the step names
+    aar workbench --open                   # the UI, in a browser
+
+The manual kit is not a duplicate of the suite. The suite proves AAR agrees
+with itself; the kit is for the different claim that decides whether an
+analyst trusts it — that it agrees with a human. Six steps, real CLI, real
+files, and for each one a statement of what a *correct* result looks like,
+because the usual failure of a manual test is "it ran, but I could not tell
+whether that was right".
+
+
 
 

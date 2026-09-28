@@ -1,0 +1,98 @@
+/* AAR Workbench styles.
+
+   Theme and density are CSS custom properties on <html> so switching is a
+   single attribute write with no reflow of the layout, and so the choice
+   can be applied before first paint from localStorage. */
+
+:root {
+  --bg: #fff; --panel: #f7f8fa; --ink: #14181f; --muted: #5a6472;
+  --line: #d8dee7; --accent: #2f5fd0; --ok: #17795e; --bad: #b3261e;
+  --chip: #eef1f6; --row: 30px; --gap: 10px; --fs: 14px; --lh: 1.45;
+  --focus: 3px solid #ffbf47;
+}
+html[data-theme="dark"] {
+  --bg: #12151b; --panel: #1a1f27; --ink: #e8ecf3; --muted: #9aa6b6;
+  --line: #2b323d; --accent: #7aa2f7; --ok: #4ec9a5; --bad: #f7768e;
+  --chip: #232a35;
+}
+html[data-density="compact"]  { --row: 24px; --gap: 6px;  --lh: 1.3; }
+html[data-density="spacious"] { --row: 38px; --gap: 16px; --lh: 1.6; }
+
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink);
+  font: var(--fs)/var(--lh) system-ui, "Segoe UI", "Noto Sans",
+       "Noto Sans Arabic", "Noto Sans Devanagari", sans-serif;
+}
+/* A visible focus ring everywhere. Keyboard-first is a claim; this is it. */
+:focus-visible { outline: var(--focus); outline-offset: 2px; }
+
+.skip { position: absolute; inset-inline-start: -9999px; top: 0; z-index: 99;
+        background: var(--accent); color: #fff; padding: 10px 16px; }
+.skip:focus { inset-inline-start: 0; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden;
+      clip: rect(0 0 0 0); white-space: nowrap; }
+
+header { display: flex; align-items: center; gap: var(--gap);
+         padding: 8px var(--gap); border-bottom: 1px solid var(--line);
+         background: var(--panel); flex-wrap: wrap; }
+h1 { font-size: 1.05rem; margin: 0 12px 0 0; }
+.spacer { flex: 1; }
+nav { display: flex; gap: 2px; }
+nav button { background: none; border: 0; color: var(--muted);
+             padding: 6px 10px; border-radius: 6px; cursor: pointer;
+             font: inherit; }
+nav button[aria-current="page"] { background: var(--accent); color: #fff; }
+
+main { display: grid; gap: var(--gap); padding: var(--gap);
+       grid-template-columns: 240px minmax(0, 1fr) 320px;
+       grid-template-rows: minmax(220px, 1fr) auto;
+       min-height: calc(100vh - 52px); }
+/* Logical properties throughout, so `dir="rtl"` needs no extra CSS. */
+.panel { background: var(--panel); border: 1px solid var(--line);
+         border-radius: 8px; overflow: auto; min-height: 0; }
+.panel > h2 { margin: 0; padding: 8px var(--gap); font-size: .82rem;
+              text-transform: uppercase; letter-spacing: .06em;
+              color: var(--muted); border-bottom: 1px solid var(--line);
+              position: sticky; top: 0; background: var(--panel);
+              z-index: 2; }
+#bottom { grid-column: 1 / -1; grid-row: 2; max-height: 46vh; }
+
+ul { list-style: none; margin: 0; padding: 6px; }
+li.engine { display: flex; align-items: center; gap: 8px;
+            min-height: var(--row); padding: 2px 6px; }
+li.engine + li.engine { border-top: 1px solid var(--line); }
+.name { font-weight: 600; }
+.reason { color: var(--muted); font-size: .85em; }
+.dot { width: 9px; height: 9px; border-radius: 50%;
+       background: var(--ok); flex: none; }
+.dot.off { background: var(--bad); }
+.chip { background: var(--chip); border-radius: 999px; padding: 1px 8px;
+        font-size: .78em; color: var(--muted); }
+.chip.hot { color: var(--bad); font-weight: 700; }
+
+form { display: flex; flex-wrap: wrap; gap: 6px; padding: var(--gap); }
+input, select, button.act { font: inherit; padding: 6px 9px;
+                           border-radius: 6px; border: 1px solid var(--line);
+                           background: var(--bg); color: var(--ink); }
+input { flex: 1 1 220px; min-width: 0; }
+button.act { cursor: pointer; }
+button.act.primary { background: var(--accent); color: #fff;
+                     border-color: var(--accent); }
+
+table { border-collapse: collapse; width: 100%; font-size: .92em; }
+th, td { text-align: start; padding: 4px 8px;
+         border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; }
+pre { margin: 0; padding: var(--gap); white-space: pre-wrap;
+      word-break: break-word;
+      font: .88em/1.5 ui-monospace, Consolas, monospace; }
+.bar { height: 7px; background: var(--chip); border-radius: 4px;
+       overflow: hidden; }
+.bar > i { display: block; height: 100%; background: var(--accent); }
+.meter { display: grid; grid-template-columns: 3.4em 1fr auto; gap: 8px;
+         align-items: center; padding: 3px var(--gap); }
+.empty { padding: 18px var(--gap); color: var(--muted); }
+[hidden] { display: none !important; }
+
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
