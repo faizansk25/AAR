@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.svg" alt="AAR - Adaptive Analytics Runtime" width="600">
+</p>
+
 # Adaptive Analytics Runtime (AAR)
 
 An orchestration layer for analytical work across Excel, SQL, NoSQL, Python,

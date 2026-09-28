@@ -60,8 +60,15 @@ def build_parser() -> argparse.ArgumentParser:
                        help="profile path (default: AAR_HOME or the "
                             "per-user AAR directory)")
 
+    p_explain = sub.add_parser(
+        "explain", help="plan a pipeline file and print the decision trace")
+    p_explain.add_argument("pipeline", help="path to a Python pipeline file")
+    p_explain.add_argument("--json", action="store_true",
+                           help="emit JSON instead of text")
+
     sub.add_parser("version", help="version and optional-dependency status")
     return parser
+
 
 
 def _cmd_doctor(args: argparse.Namespace) -> int:
@@ -118,6 +125,52 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _cmd_explain(args: argparse.Namespace) -> int:
+    """Plan a pipeline file and print why each engine was chosen."""
+    import json
+
+    from .failures import PlanInfeasible
+    from .planner import AdaptivePlanner
+    from .sdk import build_pipeline, load_pipeline
+
+    path = args.pipeline
+    if not os.path.isfile(path):
+        print(f"aar: no such pipeline: {path}", file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    try:
+        root = load_pipeline(path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"aar: could not load {path}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    planner = AdaptivePlanner()
+    try:
+        plan = planner.plan(root)
+    except PlanInfeasible as exc:
+        print(f"aar: {exc}", file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    if args.json:
+        print(json.dumps({
+            "total_ms": plan.total_s * 1e3,
+            "segments": [{
+                "index": sp.segment.index,
+                "device": str(sp.device),
+                "engine": sp.engine,
+                "nodes": list(sp.segment.op_types),
+                "total_ms": sp.total_s * 1e3,
+                "inbound_ms": sp.inbound_s * 1e3,
+                "reason": sp.reason,
+            } for sp in plan.segments],
+            "boundaries": plan.boundaries,
+        }, indent=2))
+    else:
+        print(plan.render())
+    return _EXIT_OK
+
+
 def _cmd_version(_args: argparse.Namespace) -> int:
     from .hardware import probe_software
 
@@ -138,6 +191,7 @@ _COMMANDS = {
     "doctor": _cmd_doctor,
     "engines": _cmd_engines,
     "calibrate": _cmd_calibrate,
+    "explain": _cmd_explain,
     "version": _cmd_version,
 }
 

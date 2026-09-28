@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 560" width="100%" height="100%" role="img" aria-label="AAR - Adaptive Analytics Runtime">
+  <!--
+    Theme: the colour is driven by prefers-color-scheme inside the file.
+    When the SVG is embedded inline in HTML, an ancestor setting `color`
+    wins over the media query, so the same asset adapts to a page theme and
+    to a terminal without a second variant.
+
+        <div style="color:#00ff00;background:#000"> <svg>...</svg> </div>
+  -->
+  <style>
+    svg {
+      --aar-color: #1a1a1a;
+    }
+    @media (prefers-color-scheme: dark) {
+      svg { --aar-color: #e5e7eb; }
+    }
+    .aar-stroke { stroke: var(--aar-color); fill: none; }
+    .aar-fill   { fill: var(--aar-color); stroke: none; }
+    .alpha-20 { opacity: 0.20; }
+    .alpha-50 { opacity: 0.50; }
+    .alpha-80 { opacity: 0.80; }
+    .text-logo {
+      font-family: ui-monospace, "JetBrains Mono", Consolas, SFMono-Regular, monospace;
+      font-weight: 800; font-size: 96px; letter-spacing: 12px;
+    }
+    .text-sub {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      font-weight: 600; font-size: 20px; letter-spacing: 6px; text-transform: uppercase;
+    }
+    .text-cli {
+      font-family: ui-monospace, "JetBrains Mono", Consolas, SFMono-Regular, monospace;
+      font-weight: 500; font-size: 15px;
+    }
+  </style>
+
+  <g transform="translate(0, -20)" stroke-width="12" stroke-linecap="round" stroke-linejoin="round" class="aar-stroke">
+    <!-- Left leg: CPU / standard routing, with its fallback path. -->
+    <path d="M 375 140 L 250 350" />
+    <path d="M 340 145 L 195 350" stroke-width="6" class="alpha-50" />
+    <!-- Right leg: GPU / accelerated routing, with its fallback path. -->
+    <path d="M 425 140 L 550 350" />
+    <path d="M 460 145 L 605 350" stroke-width="6" class="alpha-50" />
+    <!-- Crossbar: orchestration and calibration. -->
+    <path d="M 285 280 L 515 280" />
+    <path d="M 240 315 L 560 315" stroke-width="4" stroke-dasharray="8 12" class="alpha-80" />
+    <!-- Apex: the planner. -->
+    <circle cx="400" cy="110" r="26" stroke-width="8" />
+    <circle cx="400" cy="110" r="10" class="aar-fill" />
+    <!-- Mid-nodes: cost model and degradation ledger. -->
+    <rect x="269" y="264" width="32" height="32" rx="8" stroke-width="6" />
+    <rect x="499" y="264" width="32" height="32" rx="8" stroke-width="6" />
+    <!-- Data source. -->
+    <ellipse cx="230" cy="375" rx="32" ry="14" stroke-width="6" />
+    <path d="M 198 375 L 198 400 A 32 14 0 0 0 262 400 L 262 375" stroke-width="6" />
+    <path d="M 198 388 L 198 413 A 32 14 0 0 0 262 413 L 262 388" stroke-width="6" class="alpha-50" />
+    <!-- Engine execution. -->
+    <polygon points="570,355 598,372 598,406 570,423 542,406 542,372" stroke-width="6" />
+    <path d="M 556 389 L 584 389 M 570 375 L 570 403" stroke-width="4" class="alpha-80" />
+  </g>
+
+  <text x="408" y="460" text-anchor="middle" class="aar-fill text-logo">AAR</text>
+  <text x="400" y="500" text-anchor="middle" class="aar-fill text-sub alpha-80">Adaptive Analytics Runtime</text>
+  <text x="400" y="540" text-anchor="middle" class="aar-fill text-cli alpha-50">&gt; orchestrate --optimize --explain</text>
+</svg>
