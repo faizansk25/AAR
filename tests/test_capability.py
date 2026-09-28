@@ -121,8 +121,51 @@ class TestAvailabilityProbe:
                 assert "not installed" in cap.reason
                 assert cap.version is None
 
+    def test_every_availability_claim_is_backed_by_a_real_probe(self):
+        """An engine must not claim availability without a way to know it.
+
+        `postgresql` once carried `probe=None`, so it reported "available"
+        while its driver (`psycopg`) was not installed. A plan that trusts
+        such a claim fails at run time, on a machine that said yes.
+        """
+        reg = CapabilityRegistry()
+        caps = reg.probe()
+        for spec in reg.engines:
+            if spec.probe is None and not spec.intrinsic:
+                pytest.fail(
+                    f"{spec.id} has neither a probe nor intrinsic=True, so its "
+                    f"availability is unknowable")
+            if caps[spec.id].available and spec.probe is None:
+                assert spec.intrinsic, (
+                    f"{spec.id} reports available with no probe module")
+
+    def test_intrinsic_engines_are_always_available(self):
+        """An intrinsic engine is the running interpreter; it cannot vanish."""
+        reg = CapabilityRegistry()
+        for spec in reg.engines:
+            if spec.intrinsic:
+                assert reg.is_available(spec.id), spec.id
+
+    def test_remote_engines_have_a_driver_probe(self):
+        """Anything remote needs a driver, and therefore a probe."""
+        reg = CapabilityRegistry()
+        for spec in reg.engines:
+            if spec.remote:
+                assert spec.probe, (
+                    f"{spec.id} is remote but has no driver probe, so its "
+                    f"availability is unknowable")
+
+    def test_version_is_not_printed_twice(self):
+        """Regression: the version appeared in both reason and suffix."""
+        for cap in CapabilityRegistry().probe().values():
+            text = cap.render()
+            if cap.version:
+                assert text.count(cap.version) == 1, text
+
+
     def test_default_registry_is_a_singleton(self):
         assert default_registry() is default_registry()
+
 
 
 class TestFeasibleSet:

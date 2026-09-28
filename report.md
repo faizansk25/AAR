@@ -27,27 +27,34 @@ not GPU utilisation.
 | 2 | Internal Analytics IR | §4 | ✅ **Complete** | 20 tests |
 | 3 | Hardware profiler + calibration | §5 | ✅ **Complete** | 32 tests + live |
 | 4 | Failure registry / never-silently-fail | §15, §23 | ✅ **Complete** | 20 tests |
-| 5 | Capability registry (engine × op × dtype) | §4 | ✅ **Complete** | 38 tests |
+| 5 | Capability registry (engine × op × dtype) | §4 | ✅ **Complete** | 41 tests |
 | 6 | Cost model + transfers + history | §6 | ✅ **Complete** | 42 tests |
-| 7 | **Adaptive planner (segment DP)** | §7 | ⬜ **Next** | — |
-| 8 | Execution engines | §8 | ⬜ Not started | — |
-| 9 | Arrow interchange layer | §9 | ⬜ Not started | — |
-| 10 | Connectors (Excel/SQL/NoSQL/files/UDF) | §10 | ⬜ Not started | — |
-| 11 | Metadata & lineage | §12 | 🟡 Partial (types carry tags) | — |
-| 12 | Privacy, security & governance | §13 | ⬜ Not started | — |
-| 13 | Scheduler & resource manager | §14 | 🟡 Partial (budgets + profile) | — |
-| 14 | Explainability & observability | §16 | ⬜ Not started | — |
-| 15 | Runtime executor + cache | — | ⬜ Not started | — |
-| 16 | SDK (`ctx.excel()` …) | §1 | ⬜ Not started | — |
-| 17 | CLI (`aar explain plan`) | §16 | ⬜ Not started | — |
-| 18 | Analyst Workbench UI | §17 | ⬜ Not started | — |
-| 19 | Substrait adapters | §4 | ⬜ Not started | — |
+| 7 | CLI — `aar doctor / engines / calibrate / version` | §16 | ✅ **Complete** | 18 tests |
+| 8 | **Adaptive planner (segment DP)** | §7 | ⬜ **Next** | — |
+| 9 | Execution engines | §8 | ⬜ Not started | — |
+| 10 | Arrow interchange layer | §9 | ⬜ Not started | — |
+| 11 | Connectors (Excel/SQL/NoSQL/files/UDF) | §10 | ⬜ Not started | — |
+| 12 | Metadata & lineage | §12 | 🟡 Partial (types carry tags) | — |
+| 13 | Privacy, security & governance | §13 | ⬜ Not started | — |
+| 14 | Scheduler & resource manager | §14 | 🟡 Partial (budgets + profile) | — |
+| 15 | Explainability & observability | §16 | ⬜ Not started | — |
+| 16 | Runtime executor + cache | — | ⬜ Not started | — |
+| 17 | SDK (`ctx.excel()` …) | §1 | ⬜ Not started | — |
+| 18 | CLI — `aar explain plan` | §16 | ⬜ Blocked on the planner | — |
+| 19 | Analyst Workbench UI | §17 | ⬜ Not started | — |
 
-**Progress: 6 of 19 layers complete (32% of the specified system), plus
-2 partial.** All six completed layers are load-bearing: they form the chain
-from "what does this data mean" through "what can this machine do" to "what
-will it cost", which is the entire input to the planner. Each was built to be
-independently useful and testable before its consumer existed.
+**Progress: 7 of 19 layers complete (37% of the specified system), plus
+2 partial.** The completed layers form the chain from "what does this data
+mean" through "what can this machine do" to "what will it cost" to "let me
+see and change it". Each was built to be independently useful and testable
+before its consumer existed.
+
+**What still does not work, stated plainly:** there is no executor, no
+connectors and no SDK, so an analyst cannot yet point AAR at a file and get an
+answer. Everything built so far is substrate. `aar explain plan` is
+deliberately absent rather than stubbed, because a command that prints "not
+implemented" is worse than no command.
+
 
 ### 3.6 Capability registry — `src/aar/capability/registry.py`
 

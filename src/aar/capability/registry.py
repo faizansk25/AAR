@@ -124,7 +124,17 @@ class EngineSpec:
     remote: bool = False
     #: Minimum GPU compute capability, or None if no GPU required.
     min_compute_capability: tuple[int, int] | None = None
+    #: True when the engine is available with nothing installed, because it is
+    #: the running interpreter itself. A Python UDF worker qualifies; a
+    #: PostgreSQL connector does not, because it needs a driver.
+    #:
+    #: Declared explicitly rather than inferred from `probe is None`, because
+    #: "no probe" means two very different things and conflating them produced
+    #: a registry that claimed PostgreSQL was available on a machine without
+    #: `psycopg`.
+    intrinsic: bool = False
     notes: str = ""
+
 
     def supports(self, node_type: NodeType) -> bool:
         return node_type in self.ops
@@ -178,13 +188,13 @@ ENGINES: tuple[EngineSpec, ...] = (
     # --- tier 1: source pushdown
     EngineSpec(
         id="postgresql", label="PostgreSQL", device=Device.REMOTE,
-        tier=Tier.SOURCE_PUSHDOWN, probe=None, distribution="psycopg",
+        tier=Tier.SOURCE_PUSHDOWN, probe="psycopg", distribution="psycopg",
         ops=_PUSHDOWN_OPS, remote=True,
         notes="filter/projection/aggregate/join/window/regex pushdown verified",
     ),
     EngineSpec(
         id="mysql", label="MySQL/MariaDB", device=Device.REMOTE,
-        tier=Tier.SOURCE_PUSHDOWN, probe=None, distribution="pymysql",
+        tier=Tier.SOURCE_PUSHDOWN, probe="pymysql", distribution="pymysql",
         ops=_PUSHDOWN_OPS, remote=True,
         notes="Arrow Flight SQL partial",
     ),
@@ -316,7 +326,7 @@ ENGINES: tuple[EngineSpec, ...] = (
     EngineSpec(
         id="python_worker", label="Python UDF worker", device=Device.CPU,
         tier=Tier.ISOLATED_WORKER, probe=None, distribution=None,
-        ops=frozenset({NodeType.PYTHON_UDF}),
+        ops=frozenset({NodeType.PYTHON_UDF}), intrinsic=True,
         notes="arbitrary Python is unsupported on GPU by construction",
     ),
 
@@ -352,9 +362,15 @@ class Capability:
     blocked_by: str | None = None
 
     def render(self) -> str:
+        """Operator-facing one-liner.
+
+        The version appears in ``reason`` when known, so it is not appended
+        again here - printing it twice looks like a bug in the probe, and it
+        is one that an operator would reasonably report.
+        """
         mark = "yes" if self.available else "no "
-        ver = f" {self.version}" if self.version else ""
-        return f"  [{mark}] {self.engine:<14} {self.reason}{ver}"
+        return f"  [{mark}] {self.engine:<14} {self.reason}"
+
 
 
 def _module_importable(name: str) -> bool:

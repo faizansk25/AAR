@@ -43,14 +43,12 @@ all       = ["aar[arrow,excel,duckdb,polars,pandas,sql,gpu]"]
 aar = "aar.cli:main"
 
 [project.urls]
-Documentation = "https://example.invalid/aar/docs"
-Source = "https://example.invalid/aar"
+Homepage = "https://github.com/faizansk25/AAR"
+Repository = "https://github.com/faizansk25/AAR.git"
+Issues = "https://github.com/faizansk25/AAR/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-aar = ["resources/*.json"]
 
 [tool.pytest.ini_options]
 minversion = "7.0"

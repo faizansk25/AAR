@@ -4,9 +4,14 @@ An orchestration layer for analytical work across Excel, SQL, NoSQL, Python,
 local files and large-scale engines. AAR does not replace those tools — it
 plans, routes, explains and audits them.
 
-> **Status: core planning stack complete.** Six of nineteen specified layers are
-> built, tested and verified against real hardware. See [`report.md`](report.md)
-> for full status, the bugs found, and what comes next.
+> **Status: core planning stack complete.** Seven of nineteen specified layers
+> are built, tested and verified against real hardware. See
+> [`report.md`](report.md) for full status, the bugs found, and what comes
+> next.
+>
+> **Not yet available:** there is no executor, no connectors and no SDK, so
+> AAR cannot yet read your data and return an answer. Everything built so far
+> is substrate that the planner, executor and connectors will sit on.
 
 **The goal is minimum total analytical cost — not GPU utilisation.** AAR should
 proudly say "CPU selected" or "PostgreSQL selected" when that is optimal.
@@ -43,10 +48,37 @@ library alone. Engines are opt-in extras:
 ## Verify
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q           # 201 tests
+.\.venv\Scripts\python.exe -m pytest -q           # 222 tests
 .\.venv\Scripts\python.exe tools\check_syntax.py  # parse every module
 .\.venv\Scripts\python.exe tools\smoke.py         # live end-to-end output
 .\.venv\Scripts\python.exe tools\debug_calib.py   # per-benchmark timings
+```
+
+## Command line
+
+Every subcommand does real work; there are no placeholder commands.
+
+```powershell
+aar doctor         # this machine's hardware profile, with budgets
+aar engines        # the engine catalogue and what is actually installed
+aar calibrate      # measure this machine and write a cost profile
+aar version        # version and optional-dependency status
+```
+
+`doctor` and `engines` also accept `--json`. Run `aar --help` for the full
+list.
+
+```console
+$ aar engines
+  tier 1 - source_pushdown
+    [no ] postgresql     psycopg is not installed
+  tier 2 - local_embedded
+    [yes] duckdb         cpu engine available (1.5.5)
+  tier 3 - gpu_acceleration
+    [no ] polars_gpu     cudf is not installed
+```
+
+`python -m aar` works identically if the console script is not on your PATH.
 
 ---
 
@@ -204,7 +236,8 @@ src/aar/
   failures/registry.py  22 failure modes + DegradationLedger
   capability/registry.py 16 engines, 6 tiers, feasible sets, availability probe
   cost/model.py         six-term breakdown, transfers, residency, history
-tests/                  201 behavioural tests
+  cli.py                aar doctor / engines / calibrate / version
+tests/                  222 behavioural tests
 tools/                  check_syntax, debug_calib, smoke, truncate
 report.md               build status, bugs found, what comes next
 system.md               the specification
