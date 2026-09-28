@@ -1,0 +1,37 @@
+{
+  "name": "example-strict",
+  "allow_network": false,
+  "allow_network_kinds": [
+    "postgres"
+  ],
+  "max_sensitivity": "INTERNAL",
+  "mask_threshold": "CONFIDENTIAL",
+  "mask_default": "redact",
+  "rls": {
+    "emea": "region = EU"
+  },
+  "cls_drop": {
+    "junior": [
+      "ssn",
+      "national_id"
+    ]
+  },
+  "cls_mask": {
+    "analyst": [
+      [
+        "email",
+        "email"
+      ]
+    ],
+    "junior": [
+      [
+        "email",
+        "email"
+      ],
+      [
+        "amount",
+        "redact"
+      ]
+    ]
+  }
+}

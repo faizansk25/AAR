@@ -9,7 +9,9 @@ must be tested, not assumed.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+
 import sys
 
 import pytest
@@ -179,4 +181,85 @@ class TestErrorHandling:
 
         monkeypatch.setattr(hw.HardwareProfile, "render", interrupt)
         assert main(["doctor"]) == 130
+
+
+# ------------------------------------------------------------------- policy
+class TestPolicyCommand:
+    def _write(self, tmp_path, payload):
+        path = tmp_path / "policy.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return str(path)
+
+    def test_write_example_then_check_it(self, tmp_path, capsys):
+        from aar.governance import EXAMPLE_POLICY
+
+        path = str(tmp_path / "p.json")
+        assert main(["policy", "check", "--write-example", path]) == 0
+        assert os.path.exists(path)
+        assert main(["policy", "check", path]) == 0
+        assert "valid policy" in capsys.readouterr().out
+        with open(path, encoding="utf-8") as fh:
+            assert json.load(fh) == EXAMPLE_POLICY
+
+    def test_show_prints_the_rules(self, tmp_path, capsys):
+        path = self._write(tmp_path, {
+            "name": "corp", "rls": {"emea": "region = EU"},
+            "cls_drop": {"junior": ["ssn"]}})
+        assert main(["policy", "show", path]) == 0
+        out = capsys.readouterr().out
+        assert "corp" in out
+        assert "region = EU" in out
+        assert "ssn" in out
+
+    def test_a_typo_in_a_key_is_rejected(self, tmp_path, capsys):
+        """A misspelled key must not silently disable the rule it was for.
+
+        This is the failure that matters most for this command: a policy
+        that loads, looks configured, and enforces nothing.
+        """
+        path = self._write(tmp_path, {"name": "x", "mask_threshhold": 2})
+        assert main(["policy", "check", path]) == 2
+        assert "unknown policy key" in capsys.readouterr().err
+
+    def test_a_missing_policy_file_is_an_error(self, capsys):
+        assert main(["policy", "show", "no/such/policy.json"]) == 2
+        assert "no such policy file" in capsys.readouterr().err
+
+    def test_policy_without_a_path_is_an_error(self, capsys):
+        assert main(["policy", "show"]) == 2
+        assert "needs a path" in capsys.readouterr().err
+
+    def test_run_rejects_a_missing_policy_file(self, tmp_path, capsys):
+        # `_load_policy` raises SystemExit because a missing policy must
+        # not degrade to "no policy": that would turn a typo into a
+        # silently unprotected run.
+        with pytest.raises(SystemExit) as exc:
+            main(["run", "pipelines/example_orders.py",
+                  "--policy", str(tmp_path / "absent.json")])
+        assert exc.value.code == 2
+        assert "no such policy file" in capsys.readouterr().err
+
+    def test_run_with_a_valid_policy_still_executes(self, tmp_path):
+        """Enforcement must not break an ordinary, unclassified pipeline."""
+        import pyarrow as _pa
+        import pyarrow.parquet as pq
+
+        from aar.governance import EXAMPLE_POLICY
+
+        src = str(tmp_path / "plain.parquet")
+        out = str(tmp_path / "o.csv")
+        pq.write_table(_pa.table({
+            "amount": _pa.array([1.0, 2.0], type=_pa.float64())}), src)
+        pipeline = tmp_path / "p.py"
+        pipeline.write_text(
+            "from aar.sdk import parquet, write_csv\n\n\n"
+            "def build():\n"
+            f"    return write_csv(parquet(r'{src}'), r'{out}')\n",
+            encoding="utf-8")
+
+        path = self._write(tmp_path, EXAMPLE_POLICY)
+        assert main(["run", str(pipeline), "--policy", path,
+                     "--role", "analyst", "--as", "tester"]) == 0
+        assert os.path.exists(out)
+
 

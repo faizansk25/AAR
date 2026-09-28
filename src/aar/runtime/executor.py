@@ -65,6 +65,10 @@ class ExecutionResult:
     started_at: float = 0.0
     finished_at: float = 0.0
     written: list[tuple[str, int]] = field(default_factory=list)
+    #: The cost model's history store, if one was supplied. Every node's
+    #: observed duration lands here, so the next run on this machine plans
+    #: from measurement rather than from a prior.
+    history: Any = None
 
     @property
     def elapsed_s(self) -> float:
@@ -99,9 +103,12 @@ class ExecutionResult:
 class Executor:
     """Runs a plan and reports what actually happened."""
 
-    __slots__ = ("_engines", "_options", "_strict", "_last_result")
+    __slots__ = ("_engines", "_options", "_strict", "_last_result",
+                 "_policy", "_subject", "_history")
 
-    def __init__(self, strict: bool = False, **options: Any) -> None:
+    def __init__(self, strict: bool = False, policy: Any = None,
+                 subject: Any = None, history: Any = None,
+                 **options: Any) -> None:
         #: One engine instance per id, reused across every node in the run.
         self._engines: dict[str, Any] = {}
         self._options = dict(options)
@@ -114,11 +121,30 @@ class Executor:
         #: raised. Without it, a failure reports only the exception and the
         #: nodes that already succeeded are thrown away.
         self._last_result: ExecutionResult | None = None
+        #: Privacy policy. ``None`` means the permissive default: a run with
+        #: no policy is allowed, and says so, rather than silently obeying
+        #: rules nobody wrote down.
+        self._policy = policy
+        #: Who is running. Drives RLS and CLS.
+        self._subject = subject
+        #: Where observed timings are recorded so the next plan is better.
+        self._history = history
 
     @property
     def last_result(self) -> "ExecutionResult | None":
         return self._last_result
 
+    @property
+    def policy(self) -> Any:
+        return self._policy
+
+    @property
+    def subject(self) -> Any:
+        return self._subject
+
+    @property
+    def history(self) -> Any:
+        return self._history
 
     # ------------------------------------------------------------- lifecycle
     def close(self) -> None:
@@ -149,7 +175,9 @@ class Executor:
     # ------------------------------------------------------------------ run
     def execute(self, plan: Plan) -> ExecutionResult:
         """Run every node of ``plan`` in dependency order."""
-        result = ExecutionResult(table=None, started_at=time.time())
+        result = ExecutionResult(table=None, started_at=time.time(),
+                                 history=self._history)
+
         values: dict[int, Table] = {}
 
         for node in topological_order(plan.root):
@@ -183,6 +211,7 @@ class Executor:
                 outcome.elapsed_ms = (time.perf_counter() - started) * 1e3
                 result.outcomes.append(outcome)
                 self._record_failure(result.ledger, node, exc)
+                self._observe(result.history, outcome, node, success=False)
                 result.finished_at = time.time()
                 self._last_result = result
                 raise
@@ -191,6 +220,7 @@ class Executor:
             outcome.elapsed_ms = (time.perf_counter() - started) * 1e3
             values[id(node)] = table
             result.outcomes.append(outcome)
+            self._observe(result.history, outcome, node, success=True)
             if node.type is NodeType.WRITE and node.target:
                 result.written.append((node.target, table.num_rows))
 
@@ -200,7 +230,32 @@ class Executor:
         self._last_result = result
         return result
 
+    @staticmethod
+    def _observe(history: Any, outcome: "NodeOutcome", node: Node,
+                 success: bool) -> None:
+        """Record what actually happened, for the next run to learn from.
+
+        A failure is recorded too, flagged ``success=False``. The history
+        model excludes failed runs from its averages - a crashed operation's
+        duration is not a cost - but keeping it means a plan can be asked
+        "how often does this fail?" without a second store.
+        """
+        if history is None:
+            return
+        record = getattr(history, "record", None)
+        if record is None:
+            return
+        try:
+            record(node.id, outcome.engine_used, outcome.bytes_in,
+                   outcome.rows_in, outcome.elapsed_ms, success=success)
+        except Exception:  # noqa: BLE001
+            # Learning must never break the run it is learning from. A
+            # history store that cannot accept a record loses one sample,
+            # not the analyst's results.
+            return
+
     # ------------------------------------------------------------- dispatch
+
     def _dispatch(self, node: Node, engine: Any, inputs: list[Table]) -> Table:
         """Run one node on its engine."""
         t = node.type
@@ -232,8 +287,36 @@ class Executor:
                     f"declared one but did not pass it")
             return engine.udf(_one(inputs), node.udf, node.udf_mode)
         if t is NodeType.WRITE:
-            engine.write(_one(inputs), node)
-            return _one(inputs)
+            return self._write(node, engine, _one(inputs))
+
+
+    def _write(self, node: Node, engine: Any, table: Table) -> Table:
+        """Write, after the policy has had its say.
+
+        Enforcement happens *before* the bytes move, not after. A write that
+        lands and is then noticed is a breach that already happened; the
+        only useful time to refuse is here.
+
+        The table returned is the one that was written, not the one that
+        arrived, so a caller reading the pipeline's result sees the masked
+        values rather than the original ones. Returning the unmasked input
+        would let a caller print a "successful" result containing values the
+        policy just removed.
+        """
+        payload = table
+        if self._policy is not None:
+            from ..governance import PolicyEngine, Sink, Subject
+
+            engine_policy = (self._policy if
+                             isinstance(self._policy, PolicyEngine)
+                             else PolicyEngine(self._policy))
+            subject = self._subject or Subject()
+            sink = Sink.of(node.write_format or "unknown")
+            payload = engine_policy.enforce_write(table, sink, subject)
+        engine.write(payload, node)
+        return payload
+
+
         if t in (NodeType.MATERIALIZE, NodeType.CACHE):
             return _one(inputs)
         if t is NodeType.UNION:

@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR executes pipelines end to end and verifies its own arithmetic · 368 tests passing
+**Status:** AAR executes pipelines and enforces policy on them · 412 tests passing
 **Last updated:** 2026-09-28
 
 ---
@@ -37,9 +37,10 @@ not GPU utilisation.
 | 11b | Connectors — SQL, MongoDB | §10 | ⬜ Not started | — |
 | 11c | Topological executor + `aar run` | §7, §16 | ✅ **Complete** | end-to-end + smoke |
 | 12 | Metadata & lineage | §12 | 🟡 Partial (types + tables carry tags) | — |
-| 13 | Privacy, security & governance | §13 | ⬜ Not started | — |
+| 13 | Privacy, security & governance | §13 | ✅ **Complete** | 37 tests + live |
 | 14 | Scheduler & resource manager | §14 | 🟡 Partial (budgets + profile) | — |
-| 15 | Explainability & observability | §16 | 🟡 Partial (`explain` + run trace) | — |
+| 15 | Explainability & observability | §16 | 🟡 Partial (`explain` + run trace + policy audit) | — |
+| 16 | Execution history feedback | §6 | ✅ **Complete** | history tests |
 | 16 | Runtime executor + cache | — | ⬜ Not started | — |
 | 17 | SDK (`ctx.excel()` …) | §1 | ⬜ Not started | — |
 | 18 | CLI — `aar explain plan` | §16 | ⬜ Blocked on the planner | — |
@@ -234,7 +235,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**373 tests: 368 passing, 5 skipped, 0 failing.** 54 s. Every skip states the
+**412 tests: 407 passing, 5 skipped, 0 failing.** 66 s. Every skip states the
 missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |
@@ -246,8 +247,10 @@ missing dependency rather than passing vacuously.
 | `test_failures.py` | 20 | Full matrix coverage, error hierarchy, ledger semantics |
 | `test_ir.py` | 20 | Expressions incl. SQL-injection safety, node metadata, DAG ordering, cycle detection |
 | `test_planner.py` | 24 | Segment DP, transitions charged once, feasibility, explain output |
-| `test_cli.py` | 30 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `version`, exit codes |
+| `test_cli.py` | 37 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `policy`, exit codes |
 | `test_runtime.py` | 125 | **Cross-engine agreement, interchange, connectors, executor, end to end** |
+| `test_governance.py` | 37 | Egress, sensitivity, RLS, CLS, masks, enforcement in a real run |
+
 
 Tests are behavioural, not coverage-chasing. Examples of what they pin down:
 
@@ -332,6 +335,11 @@ Testing found real defects, not just typos. The notable ones:
 | NULL join keys matched each other | Fabricated join rows no engine agrees on | SQL semantics: `NULL` never equals `NULL` |
 | `pc.invert(mask)` passed to `take()` | `take` wants positional indices; a boolean array is not one | `Table.filter` takes the mask directly |
 | `agg_functions` holds a tuple of `Agg`, engines expected one | Every group-by raised "expected an aggregate, got tuple" | Normalised in the executor, with a clear error for the unsupported multi-aggregate case |
+| `sensitivity_of` lost its `return` | Every classification evaluated to `None`, so no policy could ever match a column | Restored |
+| RLS literal compared as a string | A rule like `amount = 3.0` against a float column filtered out *every* row and looked like it worked | Literal is typed from the column's declared type |
+| `Lit` imported from `aar.interchange` in the policy engine | That module exports only the `Table`; every RLS evaluation raised `ImportError` | Imported from `aar.ir`, where it lives |
+| Unknown key in a policy file silently ignored | A misspelled `mask_threshold` leaves a policy that looks configured and protects nothing | `policy_from_dict` rejects unknown keys by name |
+| Column UDF received only the first column | A UDF could quietly operate on the wrong data and return a plausible wrong answer | Column mode receives a dict of every column |
 | BOM from PowerShell redirection | Hard syntax error in every written file | `check_syntax.py` normaliser |
 
 
@@ -398,17 +406,41 @@ Verified end to end by `tools/smoke_run.py`, which generates data, runs a
 pipeline, and checks the written files' arithmetic against an independent
 Python calculation.
 
-### 7.5 ~~Observability~~ — **PARTIAL**
+### 7.5 ~~Governance, policy engine, execution history~~ — **DONE**
 
-`aar explain` and the run trace cover plan explanation and per-node
-attribution. Structured decision logging, execution history persisted across
-runs, and streaming progress are not yet built.
+Delivered in this session:
 
-### 7.6 Governance, lineage, UI — **NEXT**
+- **`aar/governance/policy.py`** — the four obligations from §13: egress,
+  classification, row-level security and column-level security. Defaults are
+  deny; absent rules refuse rather than permit.
+- **Masks** — `full`, `hash`, `partial`, `redact` and `email`, chosen so a
+  masked column stays *usable*. A numeric column masked to text breaks the
+  next aggregate, and a broken pipeline is how masks get removed.
+- **Enforcement in the executor** — applied before the write, never after.
+  The table returned is the one written, so a caller cannot print a
+  "successful" result containing the values the policy just removed.
+- **`aar policy`** — `show`, `check` and `--write-example`. An unknown key is
+  a hard error, because a silently dropped rule is the one failure this file
+  must not have.
+- **Execution history** — the executor records every node's observed rows,
+  bytes and duration into the cost model's `ExecutionHistory`, failures
+  flagged. The next run plans from measurement on this machine rather than
+  from a prior.
 
-Policy engine with deny-egress and RBAC/ABAC/RLS/CLS; column-level lineage
-propagation end to end; the Analyst Workbench. SQL and MongoDB connectors sit
-between here and 7.5, since they need a live server to validate against.
+37 governance tests, adversarial by construction: each one tries to get
+confidential data out by a route the implementation might have left open.
+
+### 7.6 Observability — **PARTIAL**
+
+`aar explain`, the per-node run trace and the policy audit cover plan
+explanation, engine attribution and rule enforcement. Structured decision
+logging and streaming progress are not yet built.
+
+### 7.7 Lineage propagation, SQL/MongoDB, UI — **NEXT**
+
+Column-level lineage through every operation rather than only across the
+interchange boundary; the SQL and MongoDB connectors, which need live servers
+to validate against; and the Analyst Workbench.
 
 
 ---
@@ -485,13 +517,14 @@ cd d:\AAR
 
 ## 11. Summary
 
-**AAR now runs pipelines.** Nine of nineteen specified layers are complete,
-tested and verified against real data on real files. The chain is end to end:
-the canonical type system, the internal IR, the hardware profiler with live
-microbenchmark calibration, the never-silently-fail failure registry, the
-capability registry, the cost model, the adaptive planner, the Arrow
-interchange layer, the execution engines, the Excel and file connectors, and
-the topological executor behind `aar run`.
+**AAR now runs pipelines and enforces policy on them.** Twelve of nineteen
+specified layers are complete, tested and verified against real data on real
+files. The chain is end to end: the canonical type system, the internal IR,
+the hardware profiler with live microbenchmark calibration, the
+never-silently-fail failure registry, the capability registry, the cost model,
+the adaptive planner, the Arrow interchange layer, the execution engines, the
+Excel and file connectors, the topological executor behind `aar run`, and the
+policy engine behind `aar policy`.
 
 ```
   ScanExcel    excel                  0 ->       240 rows    1467.0 ms
@@ -542,9 +575,13 @@ total, and picks the CPU.
   representation for a column that is simultaneously a sum and a count, so the
   executor refuses it with a clear message rather than silently keeping the
   first.
+- **Column-level lineage is carried, not yet propagated.** A `CONFIDENTIAL`
+  tag survives every engine boundary today, but an aggregate over a PII
+  column does not automatically inherit the tag. This is the sharpest
+  remaining privacy gap: a policy trusting classification alone would miss it.
 
-Next is the **governance, lineage and observability** layer — policy engine
-with deny-egress and RLS/CLS, column-level lineage end to end, and persisted
-execution history — followed by the SQL/MongoDB connectors and the Analyst
-Workbench.
+Next is **column-level lineage propagation** — so an aggregate over a
+classified column inherits its classification — followed by the SQL and
+MongoDB connectors, the Analyst Workbench, and structured decision logging.
+
 

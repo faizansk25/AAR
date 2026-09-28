@@ -78,6 +78,22 @@ def build_parser() -> argparse.ArgumentParser:
                        help="print only the result summary")
     p_run.add_argument("--head", type=int, default=10,
                        help="rows to preview in the output (0 for none)")
+    p_run.add_argument("--policy", default=None, metavar="PATH",
+                       help="JSON policy file to enforce (see `aar policy` "
+                            "for the format)")
+    p_run.add_argument("--role", default=None,
+                       help="role the run acts as, for row/column rules")
+    p_run.add_argument("--as", dest="actor", default="cli",
+                       help="subject name recorded in the policy audit")
+
+    p_policy = sub.add_parser(
+        "policy", help="inspect, validate or write a policy file")
+    p_policy.add_argument("action", choices=("show", "check"),
+                          help="show: print a policy; check: validate one")
+    p_policy.add_argument("path", nargs="?", default=None,
+                          help="policy JSON file")
+    p_policy.add_argument("--write-example", default=None, metavar="PATH",
+                          help="write a documented example policy and exit")
 
     sub.add_parser("version", help="version and optional-dependency status")
     return parser
@@ -161,6 +177,28 @@ def _plan_for(path: str):
         raise SystemExit(_EXIT_USER_ERROR) from exc
 
 
+def _load_policy(path: str | None):
+    """Load a policy from JSON, or return None.
+
+    Absent rules deny, so a policy that fails to load must not quietly
+    become an empty one - that would turn a typo in a file path into a
+    silently unprotected run. Failure here is a hard error.
+    """
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        print(f"aar: no such policy file: {path}", file=sys.stderr)
+        raise SystemExit(_EXIT_USER_ERROR)
+    from .governance import load_policy
+
+    try:
+        return load_policy(path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"aar: could not load policy {path}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        raise SystemExit(_EXIT_USER_ERROR) from exc
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     """Plan and execute a pipeline, reporting what actually happened."""
     import json
@@ -173,7 +211,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(plan.render())
         print()
 
-    with Executor() as executor:
+    policy = _load_policy(getattr(args, "policy", None))
+    subject = None
+    if policy is not None:
+        from .governance import Subject
+        roles = frozenset({args.role}) if getattr(args, "role", None) \
+            else frozenset()
+        subject = Subject(name=getattr(args, "actor", "cli") or "cli",
+                          roles=roles)
+
+    with Executor(policy=policy, subject=subject) as executor:
         try:
             result = executor.execute(plan)
         except Exception as exc:  # noqa: BLE001
@@ -216,6 +263,42 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print("\nCompleted with unresolved degradations; see above.",
               file=sys.stderr)
         return 1
+    return _EXIT_OK
+
+
+def _cmd_policy(args: argparse.Namespace) -> int:
+    """Inspect, validate, or write out a policy file."""
+    import json
+
+    from .governance import EXAMPLE_POLICY, load_policy, policy_from_dict
+
+    if args.write_example:
+        with open(args.write_example, "w", encoding="utf-8") as fh:
+            json.dump(EXAMPLE_POLICY, fh, indent=2)
+            fh.write("\n")
+        print(f"wrote {args.write_example}")
+        return _EXIT_OK
+
+    if not args.path:
+        print("aar: policy needs a path, or --write-example PATH",
+              file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    if not os.path.isfile(args.path):
+        print(f"aar: no such policy file: {args.path}", file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    try:
+        policy = load_policy(args.path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"aar: invalid policy {args.path}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    if args.action == "check":
+        print(f"OK: {args.path} is a valid policy")
+        return _EXIT_OK
+    print(policy.render())
     return _EXIT_OK
 
 
@@ -275,6 +358,7 @@ _COMMANDS = {
     "calibrate": _cmd_calibrate,
     "explain": _cmd_explain,
     "run": _cmd_run,
+    "policy": _cmd_policy,
     "version": _cmd_version,
 }
 

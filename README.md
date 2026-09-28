@@ -98,11 +98,14 @@ Every subcommand does real work; there are no placeholder commands.
 aar doctor         # this machine's hardware profile, with budgets
 aar engines        # the engine catalogue and what is actually installed
 aar calibrate      # measure this machine and write a cost profile
+aar explain P.py   # plan only, no data touched
+aar run P.py       # plan, execute, and report what actually ran
+aar policy show P  # print a policy in readable form
 aar version        # version and optional-dependency status
 ```
 
-`doctor` and `engines` also accept `--json`. Run `aar --help` for the full
-list.
+`doctor`, `engines`, `explain` and `run` also accept `--json`. Run `aar --help`
+for the full list.
 
 ```console
 $ aar engines
@@ -115,6 +118,50 @@ $ aar engines
 ```
 
 `python -m aar` works identically if the console script is not on your PATH.
+
+---
+
+## Governance
+
+A classification tag is only worth carrying if something acts on it. AAR
+enforces four obligations, and the defaults are **deny** — forgetting to
+write a policy is the safe mistake.
+
+```powershell
+aar policy check --write-example example-policy.json
+aar run pipeline.py --policy example-policy.json --role analyst --as dana
+```
+
+```console
+$ aar policy show example-policy.json
+Policy 'example-strict'
+  egress: deny except ['postgres']
+  max sensitivity at a network sink: INTERNAL
+  RLS emea: WHERE region = EU
+  CLS junior: drop ['ssn', 'national_id']
+  CLS analyst: mask email->email
+  CLS junior: mask email->email, amount->redact
+```
+
+| Obligation | What it does | Default |
+|---|---|---|
+| Egress | Blocks writes to a network sink | **deny** all |
+| Classification | Blocks data above a sensitivity at a network sink | at most `INTERNAL` |
+| Row-level | Injects `WHERE` for a role, so restricted rows are not returned | no filter |
+| Column-level | Drops or masks a column by role or by sensitivity | mask at `CONFIDENTIAL` |
+
+Three properties worth knowing:
+
+- **Enforcement happens before the bytes move.** A write that lands and is
+  then noticed is a breach that already happened.
+- **An unknown key in a policy file is an error, not a no-op.** A misspelled
+  `mask_threshold` that were silently ignored would leave a policy that looks
+  configured and protects nothing.
+- **Masks preserve type.** A masked numeric column stays numeric, so masking
+  does not break the next aggregate — which is how masks get removed.
+
+A run with no `--policy` is unrestricted, and says so rather than pretending
+otherwise.
 
 ---
 
