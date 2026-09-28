@@ -413,16 +413,29 @@ def _to_sql_where(expr: Any) -> str | None:
     if not isinstance(expr, BinOp):
         return None
     op = expr.op
-    if op not in ("=", "<>", ">", ">=", "<", "<=", "AND", "OR", "IS NOT"):
+    if op not in ("=", "<>", ">", ">=", "<", "<=", "AND", "OR", "IS",
+                  "IS NOT"):
         return None
     left = _to_sql_where(expr.left)
     right = _to_sql_where(expr.right)
     if left is None or right is None:
         return None
+
+    # A null test must stay a null test. SQL's three-valued logic makes any
+    # comparison involving NULL evaluate to UNKNOWN, not TRUE, so rewriting
+    # `x IS NOT NULL` as `x <> NULL` matches *zero rows* rather than every
+    # non-null one - a silently wrong answer, on the fastest engine, with no
+    # error anywhere. The same reasoning applies to `x IS NULL`.
+    if op in ("IS", "IS NOT"):
+        if not (isinstance(expr.right, Lit) and expr.right.value is None):
+            return None
+        return f"{left} IS{' NOT' if op == 'IS NOT' else ''} NULL"
+
     if op == "IS NOT":
         # `col IS NOT 'literal'` is not valid SQL; express it as <>.
         return f"({left} <> {right})"
     return f"({left} {op} {right})"
+
 
 
 def _agg_sql(agg: Any) -> str | None:

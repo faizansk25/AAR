@@ -205,33 +205,96 @@ class ArrowEngine(Engine):
                  aggs: dict[str, Any]) -> Table:
         """Group and aggregate.
 
-        Grouping runs in Python over row dicts. It is the slowest path in AAR
-        and is reached only when the planner has nothing better - which is
-        exactly when a slow, obviously-correct answer beats a fast wrong one.
+        The vectorised path is tried first. ``pa.TableGroupBy`` is Arrow's
+        own hash aggregation and runs in C, which is the difference between
+        seconds and minutes on a few million rows.
+
+        This matters more than a typical optimisation. The Arrow engine is
+        the *fallback*: it is what runs when DuckDB, Polars and pandas are
+        all absent. A fallback that takes ten minutes on three million rows
+        is not a fallback, it is a hang - and "graceful degradation" (the
+        specification's ninth principle) is a promise that the degraded path
+        is slower, not that it never finishes.
+
+        The Python path is kept for the aggregates Arrow cannot express,
+        which is the honest split: use the fast kernel where it applies,
+        and stay correct where it does not.
         """
         key_names = list(keys)
         if table.num_rows == 0:
             return self._empty_group(table, key_names, aggs)
 
-        buckets: dict[tuple, list[dict]] = {}
-        order: list[tuple] = []
-        for row in table.arrow.to_pylist():
-            k = tuple(_hashable(row.get(name)) for name in key_names)
+        fast = _arrow_group_by(table, key_names, aggs)
+        if fast is not None:
+            return fast
+
+        return self._group_by_python(table, key_names, aggs)
+
+    def _group_by_python(self, table: Table, key_names: list,
+                         aggs: dict[str, Any]) -> Table:
+        """The row-dict path: always correct, and no longer reckless.
+
+        Reached only when Arrow's grouping kernel is unusable. It is retained
+        rather than deleted because correctness must not depend on which
+        kernel happens to be available on a given machine.
+
+        The important change is the projection. The obvious implementation
+        calls ``table.arrow.to_pylist()``, which materialises *every* column
+        as a Python object - on the 3.07M-row NYC taxi file that is 19
+        columns, roughly 58 million Python objects, and a group-by that needs
+        three of them took over ten minutes. Selecting the key columns and
+        the aggregate arguments first, and converting only those, is the
+        difference between unusable and slow.
+        """
+        from ..ir import Col as ColExpr
+
+        # Project first. Converting 19 columns to Python when a group-by
+        # needs three is the difference between slow and unusable.
+        needed = list(key_names)
+        for agg in aggs.values():
+            if isinstance(getattr(agg, "arg", None), ColExpr):
+                needed.append(agg.arg.name)
+        keep = [n for n in dict.fromkeys(needed) if n in table.column_names]
+        source = table.arrow.select(keep) if keep else table.arrow
+
+        key_values = {n: source.column(n).to_pylist() for n in key_names}
+        arg_values = {n: source.column(n).to_pylist()
+                      for n in dict.fromkeys(needed)
+                      if n not in key_values}
+
+        order: list = []
+        buckets: dict = {}
+        for index in range(source.num_rows):
+            k = tuple(_hashable(key_values[n][index]) for n in key_names)
             if k not in buckets:
                 buckets[k] = []
                 order.append(k)
-            buckets[k].append(row)
+            buckets[k].append(index)
 
-        out_rows: list[dict[str, Any]] = []
+        columns: dict[str, list] = {n: [] for n in key_names}
         for k in order:
-            group = buckets[k]
-            record = {name: group[0].get(name) for name in key_names}
-            for name, agg in aggs.items():
-                record[name] = _apply_aggregate(agg, group)
-            out_rows.append(record)
+            first = buckets[k][0]
+            for n in key_names:
+                columns[n].append(key_values[n][first])
+        for name, agg in aggs.items():
+            columns[name] = _aggregate_by_index(agg, arg_values, buckets,
+                                                 order)
 
-        return _build_result(out_rows, key_names, list(aggs), table,
-                             _aggregate_tags(table.schema, aggs))
+        import pyarrow as pa
+
+        from ..types import Field, Schema
+
+        arrow = pa.table(columns)
+        schema = Schema(tuple(
+            Field(f.name, _from_pa(f.type), nullable=f.nullable,
+                  classification=(_key_tag(table.schema, f.name)
+                                  if f.name in key_names
+                                  else _tag_for(table.schema, f.name, aggs)))
+            for f in arrow.schema))
+        return Table(arrow, schema)
+
+
+
 
 
     def _empty_group(self, table: Table, keys: list[str],
@@ -441,6 +504,157 @@ def _hashable(value: Any) -> Any:
     if isinstance(value, (list, dict, set)):
         return str(value)
     return value
+
+
+def _aggregate_by_index(agg: Any, values: dict[str, list],
+                        buckets: dict, order: list) -> list:
+    """Apply one aggregate to each group, from projected column lists.
+
+    The same semantics as :func:`_apply_aggregate`, but driven by row
+    indices over already-projected columns rather than by row dicts. The
+    semantics are the part that must not drift: nulls are skipped by every
+    aggregate except COUNT(*), and an all-null group yields ``None`` rather
+    than zero.
+    """
+    from ..ir import Agg as AggExpr
+    from ..ir import Col, Lit
+
+    name = agg.func.upper()
+    out: list = []
+    for key in order:
+        indices = buckets[key]
+        if name == "COUNT" and agg.arg is None:
+            out.append(len(indices))
+            continue
+        if isinstance(agg.arg, Lit):
+            group = [agg.arg.value] * len(indices)
+        elif isinstance(agg.arg, Col):
+            column = values.get(agg.arg.name)
+            group = [None if column is None else column[i] for i in indices]
+        else:
+            raise NotImplementedError(
+                f"an aggregate argument must be a column or a literal, "
+                f"got {type(agg.arg).__name__}")
+        if agg.distinct:
+            seen: list = []
+            for v in group:
+                if v is not None and v not in seen:
+                    seen.append(v)
+            group = seen
+        else:
+            group = [v for v in group if v is not None]
+        if name == "COUNT":
+            out.append(len(group))
+        elif not group:
+            out.append(None)
+        elif name == "SUM":
+            out.append(sum(group))
+        elif name in ("AVG", "MEAN"):
+            out.append(sum(group) / len(group))
+        elif name == "MIN":
+            out.append(min(group))
+        elif name == "MAX":
+            out.append(max(group))
+        elif name in ("ANY", "FIRST"):
+            out.append(group[0])
+        elif name in ("ARBITRARY", "LAST"):
+            out.append(group[-1])
+        elif name == "LIST":
+            out.append(group)
+        else:
+            raise NotImplementedError(
+                f"unsupported aggregate {agg.func!r}")
+    return out
+
+
+#: Whether Arrow's own grouping kernel is usable, decided once.
+#:
+#: pyarrow 25.0.1 raises ``AttributeError: 'tuple' object has no attribute
+#: 'startswith'`` for *every* documented spelling of ``TableGroupBy.aggregate``
+#: - the legacy list-of-tuples form, the dict form, a bare string key, and
+#: every count/min/max spelling. That is a defect in the installed library,
+#: not a usage error, so AAR works around it rather than assuming it away.
+#:
+#: The verdict is probed on a two-row synthetic table rather than on real
+#: data, and cached, because the probe on a multi-million-row table is not
+#: cheap: it does a great deal of work *before* it fails. Probing per call
+#: turned a fast failure into a hang.
+_GROUP_BY_KERNEL: bool | None = None
+
+
+def _group_by_kernel_works() -> bool:
+    """One-time probe: can this pyarrow's grouping kernel be used at all?"""
+    global _GROUP_BY_KERNEL
+    if _GROUP_BY_KERNEL is not None:
+        return _GROUP_BY_KERNEL
+    try:
+        import pyarrow as pa
+
+        probe = pa.table({"k": ["a", "b"], "v": [1, 2]})
+        out = probe.group_by(["k"]).aggregate({"total": ("sum", "v")})
+        _GROUP_BY_KERNEL = out.num_rows == 2
+    except Exception:  # noqa: BLE001
+        _GROUP_BY_KERNEL = False
+    return _GROUP_BY_KERNEL
+
+
+def _arrow_group_by(table: Table, keys: list[str],
+                    aggs: dict[str, Any]) -> Table | None:
+    """Aggregate with Arrow's own hash kernel, or decline.
+
+    ``None`` means "Arrow cannot express this" and the caller should use the
+    Python path. Declining is always the safe answer for the same reason it
+    is in the SQL connector: a near-miss aggregation returns subtly wrong
+    numbers, and nothing downstream can tell.
+    """
+    import pyarrow as pa
+
+    from ..ir import Agg as AggExpr
+    from ..ir import Col
+
+    if not _group_by_kernel_works():
+        return None
+
+    for name, agg in aggs.items():
+        if not isinstance(agg, AggExpr) or agg.distinct:
+            return None
+        if not isinstance(agg.arg, (Col, type(None))):
+            return None
+
+    try:
+        grouped = table.arrow.group_by(keys)
+        spec = [(name, (agg.func.lower(),) if agg.arg is None
+                 else (agg.func.lower(), agg.arg.name))
+                for name, agg in aggs.items()]
+        result = grouped.aggregate(spec)
+    except Exception:  # noqa: BLE001
+        return None
+
+    # Arrow names the key column "key_0"/"key_0" in some versions and keeps
+    # the real name in others; normalise to the caller's names.
+    if list(result.schema.names[:len(keys)]) != keys:
+        result = result.rename_columns(
+            [*keys, *[n for n in result.schema.names[len(keys):]]])
+
+    canonical = Schema(tuple(
+        Field(f.name, _from_pa(f.type), nullable=f.nullable,
+              classification=(_tag_for(table.schema, f.name, aggs)
+                              if f.name in aggs
+                              else _key_tag(table.schema, f.name)))
+        for f in result.schema))
+    return Table(result, canonical)
+
+
+def _tag_for(schema: Any, name: str, aggs: dict[str, Any]) -> frozenset:
+    """A derived column inherits its aggregate's argument's tags."""
+    return _aggregate_tags(schema, aggs).get(name, frozenset())
+
+
+def _key_tag(schema: Any, name: str) -> frozenset:
+    """A group key is a value from the input, so it keeps its own tags."""
+    if schema.has(name):
+        return schema.get(name).classification
+    return frozenset()
 
 
 def _apply_aggregate(agg: Any, group: list[dict]) -> Any:

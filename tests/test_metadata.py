@@ -271,4 +271,53 @@ class TestDerivedMetadata:
                 assert type(row["total"]) is int, engine_id
 
 
+class TestNullSemanticsAgreeAcrossEngines:
+    """Null handling must be identical everywhere, or it is wrong somewhere.
+
+    The bug this pins: DuckDB rewrote `x IS NOT NULL` as `x <> NULL`. SQL's
+    three-valued logic makes any comparison with NULL *unknown*, and unknown
+    is not true, so that filter matched **zero rows** instead of every
+    non-null one. It was found by the large-data audit, not by a unit test,
+    because no small fixture had a null in it - and a filter that returns
+    nothing raises no error anywhere.
+    """
+
+    def _with_nulls(self):
+        import pyarrow as pa
+
+        from aar.interchange import Table
+        from aar.types import Field, INT64, Schema, UTF8
+
+        schema = Schema((Field("region", UTF8), Field("n", INT64)))
+        return Table(pa.table({"region": ["a", "b", "c", "d"],
+                                "n": [1, None, 3, None]}), schema)
+
+    def test_is_not_null_keeps_the_non_null_rows(self):
+        for engine_id in available_engines():
+            out = engine_of(engine_id).filter(
+                self._with_nulls(), BinOp(Col("n"), "IS NOT", Lit(None)))
+            assert out.num_rows == 2, (
+                f"{engine_id} kept {out.num_rows} of 2 non-null rows")
+
+    def test_is_null_keeps_the_null_rows(self):
+        for engine_id in available_engines():
+            out = engine_of(engine_id).filter(
+                self._with_nulls(), BinOp(Col("n"), "IS", Lit(None)))
+            assert out.num_rows == 2, (
+                f"{engine_id} kept {out.num_rows} of 2 null rows")
+
+    def test_a_comparison_never_matches_a_null(self):
+        """`n > 0` must skip nulls on every engine, not include or drop them.
+
+        The row count is the assertion; the point is that it is the same
+        everywhere, because a null handling difference between engines is
+        invisible until two reports disagree.
+        """
+        for engine_id in available_engines():
+            out = engine_of(engine_id).filter(
+                self._with_nulls(), BinOp(Col("n"), ">", Lit(0)))
+            assert out.num_rows == 2, f"{engine_id} kept {out.num_rows} rows"
+
+
+
 

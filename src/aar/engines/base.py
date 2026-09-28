@@ -133,6 +133,28 @@ class Engine(abc.ABC):
         raise NotImplementedError(f"{self.id} cannot run a Python UDF")
 
 
+def _is_null(value: Any) -> bool:
+    """Whether a value is SQL NULL, counting NaN as null.
+
+    AAR reaches values by three different routes - Arrow, a Polars frame and
+    a pandas DataFrame - and they do not agree on what a missing value looks
+    like. Arrow gives ``None``; pandas widens an integer column with nulls to
+    float and gives ``NaN``, which is *not* equal to ``None`` under ``!=``.
+    Treating them as the same thing is what makes a filter mean the same
+    thing on every engine.
+    """
+    if value is None:
+        return True
+    return isinstance(value, float) and value != value
+
+
+def _is_null_literal(expr: Any) -> bool:
+    """Whether an expression is the literal ``NULL``."""
+    from ..ir import Lit
+
+    return isinstance(expr, Lit) and expr.value is None
+
+
 class PredicateCompiler:
     """Turns an IR predicate into a callable over an Arrow row.
 
@@ -173,16 +195,31 @@ class PredicateCompiler:
             return (PredicateCompiler.evaluate(expr.left, row)
                     or PredicateCompiler.evaluate(expr.right, row))
 
+        # A null test must be a null test on every engine. Previously `IS NOT`
+        # was `a != b`, which is right for a value and wrong for NULL: in
+        # pandas an integer column with nulls arrives as float, so a null is
+        # NaN, and `NaN != None` is True - the filter kept every null row.
+        # `IS` was not handled at all and matched nothing. Both were silent.
+        if op in ("IS", "IS NOT"):
+            if _is_null_literal(expr.left):
+                target = expr.right
+            elif _is_null_literal(expr.right):
+                target = expr.left
+            else:
+                raise NotImplementedError(
+                    f"{op} is only defined against NULL, not against a value")
+            value = PredicateCompiler._scalar(target, row)
+            return ((not _is_null(value)) if op == "IS NOT"
+                    else _is_null(value))
+
         a = PredicateCompiler._scalar(expr.left, row)
         b = PredicateCompiler._scalar(expr.right, row)
 
-        if op == "IS NOT":
-            return a != b
         if op in ("=", "<>", "!="):
-            if a is None or b is None:
+            if _is_null(a) or _is_null(b):
                 return False
             return a == b if op == "=" else a != b
-        if a is None or b is None:
+        if _is_null(a) or _is_null(b):
             # SQL: a comparison with NULL is unknown, and unknown is not true.
             return False
         if op in (">", ">=", "<", "<="):
@@ -195,6 +232,7 @@ class PredicateCompiler:
                 return {">": x > y, ">=": x >= y, "<": x < y, "<=": x <= y}[op]
         raise NotImplementedError(f"unsupported operator {op!r}")
 
+
     @staticmethod
     def _scalar(expr: Any, row: dict[str, Any]) -> Any:
         from ..ir import BinOp, Col, Lit
@@ -204,7 +242,7 @@ class PredicateCompiler:
         if isinstance(expr, Lit):
             return expr.value
         if isinstance(expr, BinOp) and expr.op in (
-                "+", "-", "*", "/", "AND", "OR", "IS NOT"):
+                "+", "-", "*", "/", "AND", "OR", "IS", "IS NOT"):
             return PredicateCompiler.evaluate(expr, row)
         return PredicateCompiler.evaluate(expr, row)
 
@@ -213,11 +251,11 @@ class PredicateCompiler:
         name = expr.name.lower()
         args = [PredicateCompiler._scalar(a, row) for a in expr.args]
         if name in ("isnull", "is_null"):
-            return args[0] is None
+            return _is_null(args[0])
         if name in ("isnotnull", "is_not_null"):
-            return args[0] is not None
+            return not _is_null(args[0])
         if name == "coalesce":
-            return any(a is not None for a in args)
+            return any(not _is_null(a) for a in args)
         return bool(args[0]) if args else True
 
     @classmethod

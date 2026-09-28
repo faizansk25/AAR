@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, and enforces it · 509 tests
+**Status:** AAR runs pipelines, propagates privacy, and enforces it · 512 tests
 **Last updated:** 2026-09-28
 
 ---
@@ -685,7 +685,100 @@ of groups is the contract; the order is not. Making it deterministic is a
 real change with a real cost, so it is pinned by a test that says so rather
 than quietly assumed either way.
 
-### 3.12 Build-time source guards — `tests/test_connectors.py::TestSourceParses`
+### 3.14 What the large-data audit found (3,066,766 real rows)
+
+`tools/fetch_data.py` downloads the NYC TLC yellow-taxi Parquet files
+(3.07M and 3.63M rows, 47.7 MB and 55.7 MB) and records their SHA-256 and
+fetch time in `data/MANIFEST.json`. `tools/audit.py` then runs four
+independent sweeps: every engine on every real row, cross-engine agreement,
+every CLI command as a subprocess, and the specification's principles. It
+writes `data/audit/audit.{txt,json}` and exits non-zero on any failure.
+
+Running against data that is real, large and full of nulls found four more
+defects that small fixtures never would have.
+
+**1. `ArrowEngine.group_by` did not finish on 3.07M rows.** It called
+`table.arrow.to_pylist()`, materialising all 19 columns as Python objects —
+roughly 58 million of them — for a group-by that needs three. Measured: a
+group-by over 3.07M rows was still running after **ten minutes**, and had to
+be killed. Filter (0.4 s) and sort (2.5 s) on the same data were fine, which
+is what makes it look like a hang rather than a slow path.
+
+This matters more than an ordinary performance bug. The Arrow engine is the
+*fallback* — it is what runs when DuckDB, Polars and pandas are all absent —
+and a fallback that never finishes is not graceful degradation, it is a hang.
+
+Fixed by projecting to the key and aggregate columns before converting to
+Python, and by trying Arrow's own `TableGroupBy` kernel first. The test suite
+went from about 13 minutes to **55.8 seconds** as a direct consequence.
+
+**2. pyarrow 25.0.1's `TableGroupBy` is broken.** Every documented spelling
+fails: the legacy list-of-tuples form (`AttributeError: 'tuple' object has
+no attribute 'startswith'`), the dict form (`ValueError: too many values to
+unpack`), a bare string key, and every `count`/`min`/`max` spelling. AAR
+probes the kernel once on a two-row synthetic table and caches the verdict,
+rather than discovering it per call — the probe on a multi-million-row table
+does a great deal of work *before* it fails, so probing per call turned a
+fast failure into a hang.
+
+**3. DuckDB turned `x IS NOT NULL` into `x <> NULL`, which matches zero
+rows.** SQL's three-valued logic makes any comparison with NULL *unknown*,
+and unknown is not true. The audit measured **0 rows** against Arrow's
+correct non-null count — on the fastest engine, with no error raised
+anywhere. A filter that silently returns nothing is the worst failure AAR
+can have.
+
+**4. The other engines disagreed with each other on the same predicate.**
+pandas kept *every* row for `IS NOT NULL`, because `IS NOT` was evaluated as
+`a != b` and an integer column with nulls arrives from pandas as float, so
+a null is `NaN` and `NaN != None` is `True`. Arrow's `IS NULL` matched
+*nothing*, because `IS` was not handled at all. Three engines, three
+different answers, one predicate.
+
+The root cause is the same in both cases: a null test was implemented in
+three places — the SQL connector, the DuckDB engine, and the shared Python
+predicate evaluator — and only one of them was right. Fixed by making
+`PredicateCompiler` the single owner of null semantics (with `_is_null`
+treating `NaN` and `None` as the same thing, because that is what the three
+frame types mean by "missing"), and by having DuckDB emit real `IS NULL` /
+`IS NOT NULL`. `tests/test_metadata.py::TestNullSemanticsAgreeAcrossEngines`
+pins all three cases across all four engines.
+
+The two null bugs are the clearest argument for this kind of audit: no unit
+test caught them because **no small fixture had a null in it**, and a filter
+that returns zero rows raises no error anywhere.
+
+### Measured performance, 500,000 rows, 19 columns
+
+| Operation | arrow | duckdb | polars_cpu | pandas |
+|---|---|---|---|---|
+| filter | 15.7 s | **0.1 s** | 16.2 s | 20.8 s |
+| sort | 0.5 s | 0.3 s | **0.1 s** | 0.3 s |
+| group-by | 2.3 s¹ | **0.0 s** | **0.0 s** | 4.9 s |
+
+¹ 300,000 rows, the Arrow engine's Python fallback.
+
+`polars_cpu.filter` being as slow as `arrow` is worth noting: the null
+predicate is not expressible in Polars' expression builder, so it takes the
+documented Arrow fallback. That is correct behaviour and it is recorded, but
+it means a common filter loses 160x. Worth a real fix, not yet done.
+
+### Honest limitations of this audit
+
+- The full CLI and spec sweeps **had not completed** when this section was
+  written. The engine and agreement sweeps are complete; the CLI sweep
+  (16 commands on a 3M-row pipeline) and the specification sweep are
+  recorded as not yet run rather than as passing.
+- The agreement sweep reported a **discrepancy in `group_by` totals** between
+  Arrow and DuckDB/Polars on identical input — `total=6741.86` on Arrow for
+  the first group. The most likely cause is floating-point summation order,
+  which differs between a Python loop and a vectorised kernel, but that is
+  a hypothesis, not a diagnosis. It is **unresolved** and is the next thing
+  to investigate: either it is benign last-bit drift and should be
+  documented as such, or it is a null-handling difference and is a real bug.
+- `data/` is not committed. The 100 MB of Parquet is fetched on demand, and
+  the manifest records exactly which bytes were measured.
+
 
 Two structural checks now live *inside* the test suite rather than in a
 separate script, because pytest must not be able to report a green run for
