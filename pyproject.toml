@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "adaptive-analytics-runtime"
+version = "0.1.0"
+description = "AAR - privacy-first, hardware-aware analytics orchestration layer"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "AAR Contributors" }]
+keywords = ["analytics", "query-planning", "arrow", "duckdb", "polars", "gpu", "air-gapped"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Information Analysis",
+]
+
+# NOTE: AAR deliberately has ZERO required third-party runtime dependencies.
+# The core (IR, planner, cost model, policy engine, lineage, failure registry,
+# explain output) runs on the Python standard library alone. Every engine is
+# optional and probed at runtime; absence degrades gracefully and is logged.
+dependencies = []
+
+[project.optional-dependencies]
+arrow     = ["pyarrow>=14"]
+excel     = ["openpyxl>=3.1"]
+duckdb    = ["duckdb>=0.10"]
+polars    = ["polars>=1.0"]
+pandas    = ["pandas>=2.0"]
+sql       = ["psycopg[binary]>=3.1", "pymongo>=4.6"]
+gpu       = ["cudf-cu12>=24.4", "pynvml>=11.5"]
+dev       = ["pytest>=7.4", "pyarrow>=14", "openpyxl>=3.1", "duckdb>=0.10", "polars>=1.0"]
+all       = ["aar[arrow,excel,duckdb,polars,pandas,sql,gpu]"]
+
+[project.scripts]
+aar = "aar.cli:main"
+
+[project.urls]
+Documentation = "https://example.invalid/aar/docs"
+Source = "https://example.invalid/aar"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+aar = ["resources/*.json"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-q --strict-markers --durations=10"
+markers = [
+  "slow: long-running calibration or large-data tests",
+  "gpu: requires a CUDA GPU",
+]
+filterwarnings = ["ignore::DeprecationWarning"]

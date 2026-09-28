@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+
+# Tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# AAR runtime state
+.pytest-aar-home/
+*.aar-cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local scratch
+*.log
+*.out
+*.tmp
+.*.txt
+!requirements*.txt
+
+# Never commit a virtualenv or a built distribution
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+build/
+dist/
