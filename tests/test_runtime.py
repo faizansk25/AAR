@@ -526,9 +526,12 @@ class TestFactory:
         from aar.failures import DegradationLedger
 
         ledger = DegradationLedger()
-        # No GPU on this machine, so the factory must fall back and say so.
-        with create_engine("polars_gpu", ledger=ledger) as eng:
-            assert eng.device.value != "gpu"
+        # "trino" is declared in the capability registry but has no
+        # implementation, so this is the honest degradation case. (cudf and
+        # polars_gpu used to be used here, and stopped working the moment
+        # they were implemented - which is the point of the next test.)
+        with create_engine("trino", ledger=ledger) as eng:
+            assert eng.id in ("arrow", "duckdb", "polars_cpu", "pandas")
         assert len(ledger) == 1
         assert ledger.entries[0].to_engine is not None
 
@@ -536,31 +539,36 @@ class TestFactory:
 class TestSubstitutionsAreNeverSilent:
     """The defect that motivated all of this.
 
-    `create_engine("cudf")` on a host without cuDF used to return an Arrow
+    `create_engine("trino")` on a host without trino used to return an Arrow
     engine and record nothing. A verification script trusted the return
     value and wrote Arrow's timings to a file headed "cudf". These tests
     exist so that cannot come back.
     """
 
+    #: Declared in the capability registry, deliberately not implemented, so
+    #: requesting it always degrades. trino is the stable choice: cudf and
+    #: polars_gpu stopped qualifying the moment they were implemented.
+    ABSENT = "trino"
+
     def test_no_ledger_still_leaves_a_record(self):
         from aar.failures import process_ledger
 
         before = len(process_ledger())
-        with create_engine("cudf") as eng:
+        with create_engine(self.ABSENT) as eng:
             assert eng is not None
         entries = process_ledger().entries[before:]
         assert len(entries) == 1
-        assert entries[0].from_engine == "cudf"
+        assert entries[0].from_engine == self.ABSENT
         assert entries[0].to_engine is not None
 
     def test_no_ledger_also_warns(self):
         """A record nobody reads is indistinguishable from silence."""
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with create_engine("cudf"):
+            with create_engine(self.ABSENT):
                 pass
         assert any(issubclass(w.category, RuntimeWarning) for w in caught)
-        assert any("cudf" in str(w.message) for w in caught)
+        assert any(self.ABSENT in str(w.message) for w in caught)
 
     def test_a_ledger_suppresses_the_warning(self):
         """The caller supplied somewhere to put it, so they are listening."""
@@ -569,7 +577,7 @@ class TestSubstitutionsAreNeverSilent:
         ledger = DegradationLedger()
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            with create_engine("cudf", ledger=ledger):
+            with create_engine(self.ABSENT, ledger=ledger):
                 pass
         assert not [w for w in caught
                     if issubclass(w.category, RuntimeWarning)]
@@ -589,8 +597,8 @@ class TestSubstitutionsAreNeverSilent:
         from aar.failures import CapabilityError
 
         with pytest.raises(CapabilityError) as excinfo:
-            create_engine("cudf", allow_degradation=False)
-        assert "cudf" in str(excinfo.value)
+            create_engine(self.ABSENT, allow_degradation=False)
+        assert self.ABSENT in str(excinfo.value)
         assert "allow_degradation=True" in str(excinfo.value)
 
     def test_refusal_records_nothing(self):
@@ -599,27 +607,46 @@ class TestSubstitutionsAreNeverSilent:
 
         before = len(process_ledger())
         with pytest.raises(Exception):
-            create_engine("cudf", allow_degradation=False)
+            create_engine(self.ABSENT, allow_degradation=False)
         assert len(process_ledger()) == before
+
+    def test_an_implemented_but_unusable_engine_still_degrades(self):
+        """cudf now has a class but no GPU here. That is *not* an
+        implementation failure, and must not be reported as one.
+
+        `create_engine` tries the class, the class declines, and the
+        substitution is recorded exactly as before - the caller still ends
+        up with a CPU engine and still gets told.
+        """
+        from aar.failures import DegradationLedger
+
+        ledger = DegradationLedger()
+        with create_engine("cudf", ledger=ledger) as engine:
+            assert engine.id != "cudf"
+        assert len(ledger) == 1
+        assert ledger.entries[0].from_engine == "cudf"
 
 
 class TestDeclaredIsNotImplemented:
     """The gap the GPU exercise exposed, kept visible rather than implied.
 
     The capability registry *declares* sixteen engines across six tiers.
-    Only six have an implementation behind them. A declaration is a
+    Not all of them have an implementation behind them. A declaration is a
     contract about what the planner may choose; an implementation is a
     class that can actually run. ``create_engine`` can only ever hand back
-    a fallback for the other ten, so any test, benchmark or plan that
+    a fallback for an unimplemented id, so any test, benchmark or plan that
     treats a declared engine as a usable one is measuring the fallback.
 
-    This is a tracked, deliberate gap, not a passing condition. When a
-    real CudfEngine lands, this list is what must shrink.
+    This is a tracked, deliberate gap, not a passing condition. When a real
+    ``CudfEngine`` or ``RayEngine`` lands, this list is what must shrink.
     """
 
     #: Declared in the capability registry, deliberately not implemented.
+    #: `cudf` and `polars_gpu` are NOT here: both were implemented after
+    #: this gap was found, and the point of the test is that removing them
+    #: had to be a deliberate act.
     NOT_IMPLEMENTED = frozenset({
-        "cudf", "polars_gpu", "ray", "dask", "spark_rapids",
+        "ray", "dask", "spark_rapids",
         "postgresql", "mysql", "sqlite", "mongodb", "trino",
     })
 
@@ -647,6 +674,24 @@ class TestDeclaredIsNotImplemented:
         for engine_id in sorted(self.NOT_IMPLEMENTED):
             with pytest.raises(CapabilityError):
                 create_engine(engine_id, allow_degradation=False)
+
+    def test_the_gpu_engines_are_actually_implemented_now(self):
+        """The gap that started this. Kept as a test so it cannot reopen."""
+        from aar.engines.cudf_engine import CudfEngine
+        from aar.engines.factory import ENGINE_FACTORIES
+        from aar.engines.polars_gpu_engine import PolarsGPUEngine
+
+        assert {"cudf", "polars_gpu"} <= set(ENGINE_FACTORIES)
+        # Constructed directly, not through `create_engine`: on a CPU-only
+        # host `create_engine` correctly falls back, and asserting on the
+        # fallback here would test the fallback instead of the class.
+        for cls in (CudfEngine, PolarsGPUEngine):
+            with cls() as engine:
+                assert engine.device.value == "gpu"
+                # Declining is the honest CPU-host answer, and it must carry
+                # a reason rather than being a bare absence of capability.
+                assert not engine.supports("execute")
+                assert engine.capabilities.reason("execute")
 
 
 

@@ -18,21 +18,19 @@ device. Establishes:
   with no GPU at all.
 
 It is deliberately *not* evidence about GPU performance. The `cudf` and
-`polars_gpu` entries in its `benchmark` block are marked `skipped` with the
-engine that actually ran instead - there was none. `cudf` and `polars_gpu`
-are declared in the capability registry but have no implementation class, so
-`create_engine` can only hand back a CPU fallback. See `report.md` 8.2.
+`polars_gpu` rows are marked `skipped`, because both engines are now
+implemented but *decline to execute* on a host with no CUDA device - which
+is the honest answer, and a different one from "no engine exists".
 
 ## What a GPU run would and would not prove
 
-**A GPU run today would prove almost nothing about cudf.** It would confirm
-that AAR's *detection*, *cost model* and *degradation* logic behave
-correctly on real hardware - genuinely worth having - but it will not
-produce a cudf benchmark until a `CudfEngine` exists.
-
-Run `tools/gpu_verification.py` (or `notebooks/aar_gpu_verification.ipynb`
-on Colab with a T4) and save the result here as `t4.json`.
+A GPU run now exercises real code: `aar/engines/cudf_engine.py` and
+`aar/engines/polars_gpu_engine.py` exist, and `tools/gpu_verification.py`
+constructs them with `allow_degradation=False` so that a row filed under
+"cudf" must have been produced by cudf.
 
 Be careful about what a T4 establishes even then. It is compute capability
 7.5: **no bfloat16**, and FP64 at 1/64 of FP32. A workload that wins on a
-T4 can lose on an A100.
+T4 can lose on an A100. A successful run demonstrates that the path *works*
+and that the planner chooses sensibly; it does not make the numbers portable
+to other hardware, and it does not calibrate the cost model.

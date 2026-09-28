@@ -552,25 +552,37 @@ streaming progress are not yet built.
    outright. `tools/gpu_verification.py` now uses that third form, and six
    tests in `TestSubstitutionsAreNeverSilent` lock it in.
 
-   *Second, and the real one*: **there is no cudf engine to run.** No
-   `CudfEngine` or `PolarsGPUEngine` class exists anywhere in the
-   codebase. The capability registry *declares* sixteen engines across six
-   tiers, and `ENGINE_FACTORIES` implements six. For the other ten -
-   `cudf`, `polars_gpu`, `ray`, `dask`, `spark_rapids`, `postgresql`,
-   `mysql`, `sqlite`, `mongodb`, `trino` - `create_engine` can only ever
-   return a fallback.
+   *Second, and the real one — **now fixed**.* There was no cudf engine to
+   run. No `CudfEngine` or `PolarsGPUEngine` class existed anywhere, while
+   the capability registry declared sixteen engines and `ENGINE_FACTORIES`
+   implemented six. For the other ten, `create_engine` could only ever
+   return a fallback. The gap was invisible precisely because the silent
+   fallback made "cudf" look as though it constructed fine.
 
-   This means a GPU verification run today would test detection, the cost
-   model and the degradation path, and would produce **no cudf benchmark at
-   all**. The gap is now tracked explicitly by
-   `TestDeclaredIsNotImplemented`, which fails the moment that set changes -
-   so implementing `CudfEngine` is a deliberate act that shrinks a list
-   rather than an accident nobody notices.
+   Both GPU engines now exist: `aar/engines/cudf_engine.py` (device-resident
+   relational execution) and `aar/engines/polars_gpu_engine.py` (Polars' lazy
+   pushdown with RAPIDS as the collect engine). `TestDeclaredIsNotImplemented`
+   tracks what remains unimplemented — Ray, Dask, Spark, and the five remote
+   connectors — and fails the moment that set changes, so implementing an
+   engine is a deliberate act that shrinks a list.
 
-   *The consequence for the Colab plan*: the notebook is still worth
-   running, but its purpose is narrower than it looked. It validates that
-   AAR degrades correctly on a real GPU-equipped machine, not that cudf is
-   fast. Getting the latter needs the engine written first.
+   Building them surfaced three further defects, all of which would have
+   been silent on a GPU host:
+
+   * `create_engine` returned an engine that had *constructed but declined
+     to execute*. A caller got a `CudfEngine` on a GPU-less machine, and
+     every operation failed one layer up with no record of the
+     substitution. A decline at construction now means "absent".
+   * The named-aggregation form `{"total": ("amount", "sum")}` was removed
+     in **pandas 3.0**, and cuDF tracks pandas. The engine now uses
+     `NamedAgg` and `.agg(**spec)`, which both accept.
+   * `COUNT(*)` has no column to point at in a named aggregation. It is now
+     a sum over a synthesised all-ones column; the alternative,
+     pandas' `size`, counts nulls and would overstate `COUNT(x)`.
+
+   `TestDeclaredIsNotImplemented` also gained a regression test: an engine
+   that is *implemented but unusable* (cudf here, with no GPU) must still
+   degrade with a recorded reason, not be reported as a missing class.
 
    **A T4 would not prove everything.** It is compute capability 7.5: no
    bfloat16, FP64 at 1/64 of FP32. A workload that wins on a T4 may lose on

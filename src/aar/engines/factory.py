@@ -51,7 +51,22 @@ def _excel_engine(**options: Any) -> Engine:
     return ExcelEngine(**options)
 
 
+def _cudf_engine(**options: Any) -> Engine:
+    from .cudf_engine import CudfEngine
+    return CudfEngine(**options)
+
+
+def _polars_gpu_engine(**options: Any) -> Engine:
+    from .polars_gpu_engine import PolarsGPUEngine
+    return PolarsGPUEngine(**options)
+
+
 #: id -> constructor. Only engines with a real implementation appear here.
+#: An id here is a promise that the class exists, not merely that the
+#: package can be installed: `create_engine` falls back for anything absent,
+#: so listing an engine that has no class behind it is how a GPU result
+#: gets filed under a CPU engine's name. `TestDeclaredIsNotImplemented`
+#: keeps this dictionary honest against the capability registry.
 ENGINE_FACTORIES: dict[str, Callable[..., Engine]] = {
     "arrow": _arrow_engine,
     "duckdb": _duckdb_engine,
@@ -59,6 +74,8 @@ ENGINE_FACTORIES: dict[str, Callable[..., Engine]] = {
     "pandas": _pandas_engine,
     "python_worker": _python_engine,
     "excel": _excel_engine,
+    "cudf": _cudf_engine,
+    "polars_gpu": _polars_gpu_engine,
 }
 
 #: Tried in order when a requested engine is unavailable. The Arrow engine is
@@ -103,9 +120,21 @@ def create_engine(
     factory = ENGINE_FACTORIES.get(engine_id)
     if factory is not None:
         try:
-            return factory(**options)
+            engine = factory(**options)
         except Exception as exc:  # noqa: BLE001 - includes "not installed"
             reason = f"{engine_id} unavailable ({exc})"
+        else:
+            # An engine can construct and still be unable to do the job: the
+            # cudf engine builds happily on a machine with no GPU and then
+            # declines to execute anything. Returning it would hand the
+            # caller a landmine - every operation would fail one layer up,
+            # with no record of the substitution here. Declining at
+            # construction means "absent", and absent is what this function
+            # knows how to handle.
+            if engine.supports("execute"):
+                return engine
+            reason = (f"{engine_id} cannot execute on this machine "
+                      f"({engine.capabilities.reason('execute')})")
     else:
         reason = f"{engine_id} has no implementation in this build"
 

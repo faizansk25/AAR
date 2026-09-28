@@ -1,8 +1,8 @@
 {
   "python": "3.14.7",
   "platform": "Windows-10-10.0.19045-SP0",
-  "timestamp": "2026-09-28T19:20:24",
-  "rows": 2000000,
+  "timestamp": "2026-09-28T20:46:37",
+  "rows": 200000,
   "cuda": {
     "available": false,
     "vendor": null,
@@ -58,12 +58,12 @@
     },
     "polars_gpu": {
       "available": false,
-      "reason": "[GPU_OP_UNSUPPORTED] engine 'polars_gpu' was required but is not available: polars_gpu has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_cpu, pandas, arro",
+      "reason": "[GPU_OP_UNSUPPORTED] engine 'polars_gpu' was required but is not available: polars_gpu cannot execute on this machine (polars GPU needs cudf; install cudf-cu12). Pass allow_degradation=True to fall ba",
       "version": null
     },
     "cudf": {
       "available": false,
-      "reason": "[GPU_OP_UNSUPPORTED] engine 'cudf' was required but is not available: cudf has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_cpu, pandas, arrow instead. (",
+      "reason": "[GPU_OP_UNSUPPORTED] engine 'cudf' was required but is not available: cudf cannot execute on this machine (cudf is not installed). Pass allow_degradation=True to fall back to duckdb, polars_cpu, panda",
       "version": null
     },
     "ray": {
@@ -100,43 +100,43 @@
   "benchmark": {
     "arrow": {
       "engine_class": "ArrowEngine",
-      "group_by_ms": 11897.4,
-      "filter_ms": 15.9,
+      "group_by_ms": 1668.0,
+      "filter_ms": 2.5,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "duckdb": {
       "engine_class": "DuckDBEngine",
-      "group_by_ms": 418.6,
-      "filter_ms": 24.3,
+      "group_by_ms": 233.2,
+      "filter_ms": 8.5,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "polars_cpu": {
       "engine_class": "PolarsEngine",
-      "group_by_ms": 167.9,
-      "filter_ms": 10.6,
+      "group_by_ms": 21.6,
+      "filter_ms": 3.0,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "pandas": {
       "engine_class": "PandasEngine",
-      "group_by_ms": 15765.9,
-      "filter_ms": 83393.8,
+      "group_by_ms": 1706.0,
+      "filter_ms": 9858.1,
       "groups": 512,
       "checksum": 31968000.0,
       "agrees": true
     },
     "cudf": {
       "skipped": "engine unavailable",
-      "reason": "CapabilityError: [GPU_OP_UNSUPPORTED] engine 'cudf' was required but is not available: cudf has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_cpu, pandas,"
+      "reason": "CapabilityError: [GPU_OP_UNSUPPORTED] engine 'cudf' was required but is not available: cudf cannot execute on this machine (cudf is not installed). Pass allow_degradation=True to fall back to duckdb, "
     },
     "polars_gpu": {
       "skipped": "engine unavailable",
-      "reason": "CapabilityError: [GPU_OP_UNSUPPORTED] engine 'polars_gpu' was required but is not available: polars_gpu has no implementation in this build. Pass allow_degradation=True to fall back to duckdb, polars_"
+      "reason": "CapabilityError: [GPU_OP_UNSUPPORTED] engine 'polars_gpu' was required but is not available: polars_gpu cannot execute on this machine (polars GPU needs cudf; install cudf-cu12). Pass allow_degradatio"
     }
   },
   "decisions": [],
