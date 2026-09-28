@@ -32,50 +32,12 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from ..failures import PolicyDenied, PrivacyViolation
+from ..types import Sensitivity, sensitivity_of
 
 __all__ = [
     "Sensitivity", "sensitivity_of", "Action", "Decision", "Obligation",
     "Subject", "Sink", "Policy", "PolicyEngine", "mask_value",
 ]
-
-
-class Sensitivity(enum.IntEnum):
-    """Ordered so comparisons are meaningful: ``>=`` means "at least this"."""
-
-    PUBLIC = 0
-    INTERNAL = 1
-    CONFIDENTIAL = 2
-    RESTRICTED = 3
-
-    @classmethod
-    def parse(cls, tag: str) -> "Sensitivity":
-        return _SENSITIVITY_BY_TAG.get(tag.strip().upper(), cls.INTERNAL)
-
-
-_SENSITIVITY_BY_TAG: dict[str, Sensitivity] = {
-    "PUBLIC": Sensitivity.PUBLIC,
-    "INTERNAL": Sensitivity.INTERNAL,
-    "PII": Sensitivity.CONFIDENTIAL,
-    "PHI": Sensitivity.RESTRICTED,
-    "FINANCIAL": Sensitivity.CONFIDENTIAL,
-    "CONFIDENTIAL": Sensitivity.CONFIDENTIAL,
-    "RESTRICTED": Sensitivity.RESTRICTED,
-    "SECRET": Sensitivity.RESTRICTED,
-}
-
-
-def sensitivity_of(classification: frozenset[str] | set[str]) -> Sensitivity:
-    """The highest sensitivity claimed by a set of classification tags.
-
-    Unknown tags are treated as ``INTERNAL``, not ``PUBLIC``. An
-    unrecognised label is a new policy someone has not taught AAR about, and
-    defaulting it low would quietly strip a protection the analyst thought
-    they had applied.
-    """
-    level = Sensitivity.PUBLIC
-    for tag in classification or ():
-        level = max(level, Sensitivity.parse(tag))
-    return level
 
 
 class Action(str, enum.Enum):

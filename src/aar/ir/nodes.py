@@ -57,6 +57,7 @@ class NodeType(str, enum.Enum):
 
     PYTHON_UDF = "PythonUDF"
     QUALITY_CHECK = "QualityCheck"
+    TAG = "Tag"
 
     WRITE = "Write"
     CACHE = "Cache"
@@ -492,6 +493,10 @@ class Node:
     window_functions: dict[str, Expr] = field(default_factory=dict)
     dedup_keys: tuple[str, ...] = ()
     dedup_strategy: str = "first"
+    #: Classification tags applied by a TAG node, and the free-text
+    #: descriptions that go with them.
+    tag_values: tuple[str, ...] = ()
+    descriptions: dict[str, str] = field(default_factory=dict)
     casts: dict[str, DataType] = field(default_factory=dict)
     null_strategy: str = "fill"
     fill_value: Any = None

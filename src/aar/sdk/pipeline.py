@@ -32,7 +32,7 @@ __all__ = [
     "sum_", "count", "mean", "min_", "max_",
     "parquet", "csv", "excel", "sql", "mongo",
     "filter_", "project", "join", "group_by", "aggregate", "sort", "limit",
-    "write_parquet", "write_csv", "write_excel", "udf",
+    "write_parquet", "write_csv", "write_excel", "udf", "classify",
 ]
 
 
@@ -110,6 +110,41 @@ def max_(name: str) -> Agg:
 
 
 # ------------------------------------------------------------------ sources
+def classify(input_node: Node, *columns: str, tags: Sequence[str] = (),
+             descriptions: Mapping[str, str] | None = None) -> Node:
+    """Mark columns as sensitive, so propagation has something to carry.
+
+    Formats do not carry AAR's classification - Parquet has no place for it,
+    and an Excel header is just a string. This node is where an analyst says
+    what a column *is*, and everything downstream inherits it: an aggregate
+    over a classified column is classified, a join takes the union of both
+    sides, and a UDF inherits whatever it could see.
+
+    ```python
+    orders = classify(excel("FY26-orders.xlsx"),
+                      "customer", "ssn", tags=["PII"],
+                      descriptions={"ssn": "National insurance number"})
+    ```
+
+    Tag names are free text; the sensitivity ladder recognises ``PUBLIC``,
+    ``INTERNAL``, ``PII``, ``PHI``, ``FINANCIAL``, ``CONFIDENTIAL`` and
+    ``RESTRICTED``. An unrecognised tag is treated as ``INTERNAL`` rather than
+    ignored, so a new label is conservative by default.
+    """
+    if not columns:
+        raise ValueError("classify() needs at least one column name")
+    normalised = [t.strip().upper() for t in tags if t and t.strip()]
+    if not normalised:
+        raise ValueError(
+            f"classify({', '.join(columns)}) was given no tags; a column "
+            f"marked without a tag protects nothing")
+    n = Node(NodeType.TAG, inputs=[input_node],
+             columns=tuple(columns), tag_values=tuple(normalised))
+    n.descriptions = dict(descriptions or {})
+    n.estimated_bytes = input_node.estimated_bytes
+    return _inherit(input_node, n)
+
+
 def _source(node_type: NodeType, spec: ScanSpec, schema: Schema | None,
             estimated_bytes: int) -> Node:
     node = Node(node_type, scan=spec)

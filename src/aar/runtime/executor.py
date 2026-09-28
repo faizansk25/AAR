@@ -288,7 +288,25 @@ class Executor:
             return engine.udf(_one(inputs), node.udf, node.udf_mode)
         if t is NodeType.WRITE:
             return self._write(node, engine, _one(inputs))
-
+        if t in (NodeType.MATERIALIZE, NodeType.CACHE):
+            return _one(inputs)
+        if t is NodeType.UNION:
+            return _union(inputs)
+        if t is NodeType.CAST:
+            return self._cast(_one(inputs), node)
+        if t is NodeType.NULL_HANDLE:
+            return self._null_handle(_one(inputs), node)
+        if t is NodeType.DEDUPLICATE:
+            return self._dedup(_one(inputs), node)
+        if t is NodeType.QUALITY_CHECK:
+            return self._quality(_one(inputs), node)
+        if t is NodeType.TAG:
+            return self._tag(_one(inputs), node)
+        if t is NodeType.WINDOW:
+            return self._window(_one(inputs), node)
+        raise NotImplementedError(
+            f"the executor has no implementation for {t.value}; this is a "
+            f"gap in AAR, not a problem with the pipeline")
 
     def _write(self, node: Node, engine: Any, table: Table) -> Table:
         """Write, after the policy has had its say.
@@ -316,24 +334,48 @@ class Executor:
         engine.write(payload, node)
         return payload
 
+    @staticmethod
+    def _tag(table: Table, node: Node) -> Table:
+        """Apply classification tags to named columns.
 
-        if t in (NodeType.MATERIALIZE, NodeType.CACHE):
-            return _one(inputs)
-        if t is NodeType.UNION:
-            return _union(inputs)
-        if t is NodeType.CAST:
-            return self._cast(_one(inputs), node)
-        if t is NodeType.NULL_HANDLE:
-            return self._null_handle(_one(inputs), node)
-        if t is NodeType.DEDUPLICATE:
-            return self._dedup(_one(inputs), node)
-        if t is NodeType.QUALITY_CHECK:
-            return self._quality(_one(inputs), node)
-        if t is NodeType.WINDOW:
-            return self._window(_one(inputs), node)
-        raise NotImplementedError(
-            f"the executor has no implementation for {t.value}; this is a "
-            f"gap in AAR, not a problem with the pipeline")
+        This is where an analyst says what a column *is*, and the only place
+        the tags are set by hand. Everything downstream - aggregates, joins,
+        UDFs - inherits from here, so a mistake made at the source is
+        corrected once rather than patched at every exit.
+
+        A column named in a TAG node that the input does not have is an
+        error. Silently tagging nothing would leave the pipeline looking
+        annotated and behaving exactly as if it were not, which is the
+        failure this whole layer exists to prevent.
+        """
+        from ..types import Field, Schema
+
+        columns = tuple(node.columns or ())
+        if not columns:
+            raise ValueError("TAG node has no columns to classify")
+        missing = [c for c in columns if not table.schema.has(c)]
+        if missing:
+            raise KeyError(
+                f"cannot classify {', '.join(missing)}: "
+                f"no such column (have: {', '.join(table.column_names)})")
+        tags = tuple(node.tag_values or ())
+        if not tags:
+            raise ValueError("TAG node has no tags; a column marked without "
+                             "a tag protects nothing")
+        descriptions = dict(node.descriptions or {})
+
+        fields = []
+        for field in table.schema.fields:
+            if field.name in columns:
+                new = field.with_classification(*tags)
+                note = descriptions.get(field.name)
+                if note:
+                    new = Field(new.name, new.type, new.nullable,
+                                new.classification, note, new.lineage)
+                fields.append(new)
+            else:
+                fields.append(field)
+        return table.with_schema(Schema(tuple(fields)))
 
 
     # ---------------------------------------------------- simple operations

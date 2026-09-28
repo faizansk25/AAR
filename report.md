@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR executes pipelines and enforces policy on them · 412 tests passing
+**Status:** AAR runs pipelines, propagates privacy, and enforces it · 440 tests
 **Last updated:** 2026-09-28
 
 ---
@@ -36,7 +36,7 @@ not GPU utilisation.
 | 11 | Connectors — Excel + Parquet/CSV/JSON | §10 | ✅ **Complete** | 9 tests + live |
 | 11b | Connectors — SQL, MongoDB | §10 | ⬜ Not started | — |
 | 11c | Topological executor + `aar run` | §7, §16 | ✅ **Complete** | end-to-end + smoke |
-| 12 | Metadata & lineage | §12 | 🟡 Partial (types + tables carry tags) | — |
+| 12 | Metadata & lineage | §12 | ✅ **Complete** | 28 tests + live |
 | 13 | Privacy, security & governance | §13 | ✅ **Complete** | 37 tests + live |
 | 14 | Scheduler & resource manager | §14 | 🟡 Partial (budgets + profile) | — |
 | 15 | Explainability & observability | §16 | 🟡 Partial (`explain` + run trace + policy audit) | — |
@@ -235,7 +235,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**412 tests: 407 passing, 5 skipped, 0 failing.** 66 s. Every skip states the
+**440 tests: 435 passing, 5 skipped, 0 failing.** 47 s. Every skip states the
 missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |
@@ -250,6 +250,8 @@ missing dependency rather than passing vacuously.
 | `test_cli.py` | 37 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `policy`, exit codes |
 | `test_runtime.py` | 125 | **Cross-engine agreement, interchange, connectors, executor, end to end** |
 | `test_governance.py` | 37 | Egress, sensitivity, RLS, CLS, masks, enforcement in a real run |
+| `test_lineage.py` | 28 | **Propagation into derived columns, source→aggregate→policy** |
+
 
 
 Tests are behavioural, not coverage-chasing. Examples of what they pin down:
@@ -436,11 +438,42 @@ confidential data out by a route the implementation might have left open.
 explanation, engine attribution and rule enforcement. Structured decision
 logging and streaming progress are not yet built.
 
-### 7.7 Lineage propagation, SQL/MongoDB, UI — **NEXT**
+### 7.7 ~~Column-level lineage propagation~~ — **DONE**
 
-Column-level lineage through every operation rather than only across the
-interchange boundary; the SQL and MongoDB connectors, which need live servers
-to validate against; and the Analyst Workbench.
+- **`aar/lineage/taint.py`** — the rule is one sentence: *a derived column is
+  at least as sensitive as everything it was derived from*. The edges are
+  where the care went:
+
+| Operation | Inherits | Why |
+|---|---|---|
+| `SUM(x)`, `AVG(x)`, `MIN(x)` | `x`'s tags | the result is a function of `x` |
+| `COUNT(x)` | `x`'s tags | conservative; a non-null count is a property of `x` |
+| `COUNT(*)` | nothing | a row count is a property of the table |
+| Group key | its own tags | **the key is the value** |
+| UDF output | every column's tags | a function is opaque |
+| Join | both sides | either input can contribute |
+
+- **`classify()` in the SDK** and a `Tag` node type. Formats cannot carry
+  AAR's tags — Parquet has nowhere to put them and an Excel header is a
+  string — so this is where an analyst says what a column *is*, and
+  everything downstream inherits it.
+- **`declassify()`** removes a tag with a written justification stored on the
+  column. Without that escape hatch, analysts delete the source tags, which
+  is strictly worse.
+
+Verified end to end: a pipeline that tags `salary` as CONFIDENTIAL, sums it
+by region, and writes under a masking policy now writes zeros. Before this
+change the same pipeline wrote 500, 200 and 300.
+
+The sensitivity ladder moved from `aar/governance` to `aar/types`, because it
+describes the tag rather than the rule, and a metadata module importing from
+a policy module to ask how sensitive a column is has its layering backwards.
+
+### 7.8 SQL/MongoDB connectors, UI — **NEXT**
+
+Both SQL connectors need a live server to validate against. Then the Analyst
+Workbench and structured decision logging.
+
 
 
 ---
@@ -575,13 +608,14 @@ total, and picks the CPU.
   representation for a column that is simultaneously a sum and a count, so the
   executor refuses it with a clear message rather than silently keeping the
   first.
-- **Column-level lineage is carried, not yet propagated.** A `CONFIDENTIAL`
-  tag survives every engine boundary today, but an aggregate over a PII
-  column does not automatically inherit the tag. This is the sharpest
-  remaining privacy gap: a policy trusting classification alone would miss it.
+- **Column-level lineage now propagates.** An aggregate, UDF or join output is
+  at least as sensitive as its inputs, so `SUM(salary)` over a CONFIDENTIAL
+  column is itself CONFIDENTIAL and a policy can act on it. Two residual gaps
+  remain, both stated rather than assumed away: a `declassify()` call is the
+  only way to shed a tag, and it requires a written justification that is
+  *stored* but not yet surfaced in the run trace.
 
-Next is **column-level lineage propagation** — so an aggregate over a
-classified column inherits its classification — followed by the SQL and
-MongoDB connectors, the Analyst Workbench, and structured decision logging.
+Next is the **SQL and MongoDB connectors**, which need a live server to
+validate against, then structured decision logging and the Analyst Workbench.
 
 

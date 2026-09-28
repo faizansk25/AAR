@@ -18,6 +18,7 @@ from ..capability import Device
 from ..failures import SourceUnavailable
 from ..interchange import Table, require_arrow
 from ..ir import Agg, Col, Expr, JoinType, Lit, Node, NodeType
+from ..lineage import taint as _lineage
 from .base import Engine, PredicateCompiler
 
 __all__ = ["ArrowEngine"]
@@ -197,7 +198,9 @@ class ArrowEngine(Engine):
                 record[name] = _apply_aggregate(agg, group)
             out_rows.append(record)
 
-        return _build_result(out_rows, key_names, list(aggs), table)
+        return _build_result(out_rows, key_names, list(aggs), table,
+                             _aggregate_tags(table.schema, aggs))
+
 
     def _empty_group(self, table: Table, keys: list[str],
                      aggs: dict[str, Any]) -> Table:
@@ -340,7 +343,12 @@ class ArrowEngine(Engine):
         else:
             raise ValueError(
                 f"unknown UDF mode {mode!r}; use 'row', 'column' or 'auto'")
-        return _build_result(rows, list(table.column_names), [out_name], table)
+        # A UDF is opaque: the only sound assumption is that it read every
+        # column it was handed, so the result inherits all of them.
+        return _build_result(rows, list(table.column_names), [out_name],
+                             table, {out_name: _lineage.inherit_all(
+                                 table.schema)})
+
 
     # ---------------------------------------------------------------- write
     def write(self, table: Table, node: Node) -> int:
@@ -491,6 +499,18 @@ def _field(name: str, arrow_type: Any) -> Any:
 
 
 
+def _aggregate_tags(schema: Any,
+                   aggs: dict[str, Any]) -> dict[str, frozenset[str]]:
+    """What each aggregate output column inherits from its argument.
+
+    Without this, ``SUM(salary)`` is born unlabelled and a policy that
+    trusts classification has nothing to act on - a derived column leaking
+    straight past a privacy layer that looks like it is working.
+    """
+    return {name: _lineage.for_aggregate(schema, agg)
+            for name, agg in aggs.items()}
+
+
 def _udf_output_name(fn: Any) -> str:
     """The column a UDF writes to: its own name, or ``result`` if anonymous."""
     name = getattr(fn, "__name__", "") or ""
@@ -531,18 +551,25 @@ def _build_result(
     key_names: list[str],
     value_names: list[str],
     table: Table,
+    value_tags: dict[str, frozenset[str]] | None = None,
 ) -> Table:
     """Build a result table, keeping the input's key column types.
 
     Key types come from the input rather than being inferred from Python
     values, so an Int64 key does not silently become Float64 because one
     group happened to contain a null.
+
+    ``value_tags`` carries the classification each *derived* column inherits.
+    Without it a ``SUM(salary)`` would arrive unlabelled and a policy
+    trusting classification would have nothing to act on - which is exactly
+    how a derived column leaks past a working privacy layer.
     """
     import pyarrow as pa
 
     from ..interchange import canonical_to_arrow
     from ..types import Field, Schema
 
+    tags = value_tags or {}
     names = list(key_names) + [v for v in value_names if v not in key_names]
     fields = []
     for name in names:
@@ -554,10 +581,20 @@ def _build_result(
             fields.append(pa.field(name, _infer_arrow_type(
                 [r.get(name) for r in rows])))
     arrow_schema = pa.schema(fields)
+
+    def classification_for(name: str) -> frozenset[str]:
+        """A group key is the value itself; a derived column is a function of
+        its inputs. Both keep their sensitivity, for different reasons."""
+        if name in key_names and table.schema.has(name):
+            return table.schema.get(name).classification
+        return tags.get(name, frozenset())
+
     return Table(pa.Table.from_pylist(rows, schema=arrow_schema),
-                 Schema(tuple(Field(f.name, _from_pa(f.type),
-                                    nullable=f.nullable)
-                              for f in arrow_schema)))
+                 Schema(tuple(
+                     Field(f.name, _from_pa(f.type), nullable=f.nullable,
+                           classification=classification_for(f.name))
+                     for f in arrow_schema)))
+
 
 
 def _build_joined(out: list[dict], left: Table, right: Table,
@@ -566,14 +603,17 @@ def _build_joined(out: list[dict], left: Table, right: Table,
 
     The key columns keep the *left* input's type (a join key should be one
     type, not two), and every other column takes the type of the side it came
-    from, so a right-hand Int64 does not become Float64 just because the
-    left-hand column was text.
+    from. Classification is the union of both sides: either input can
+    contribute to a joined row, so a right-hand ``CONFIDENTIAL`` column is as
+    sensitive as if it had arrived alone.
     """
     import pyarrow as pa
 
     from ..interchange import canonical_to_arrow
+    from ..lineage import taint as _lineage
     from ..types import Field, Schema
 
+    both = _lineage.merge_schemas(left.schema, right.schema)
     names: list[str] = []
     for name in left.column_names:
         if name not in names:
@@ -600,7 +640,9 @@ def _build_joined(out: list[dict], left: Table, right: Table,
             fields.append(pa.field(name, pa.string()))
     arrow_schema = pa.schema(fields)
     return Table(pa.Table.from_pylist(out, schema=arrow_schema),
-                 Schema(tuple(Field(f.name, _from_pa(f.type),
-                                    nullable=f.nullable)
-                              for f in arrow_schema)))
+                 Schema(tuple(
+                     Field(f.name, _from_pa(f.type), nullable=f.nullable,
+                           classification=both)
+                     for f in arrow_schema)))
+
 

@@ -25,6 +25,7 @@ from typing import Any, Iterable, Mapping
 __all__ = [
     "TypeKind", "DataType", "Schema", "Field", "LineageRef",
     "TypeConversion", "UnmappableType", "NormalizationPolicy",
+    "Sensitivity", "sensitivity_of",
     "NULL", "BOOLEAN",
     "INT8", "INT16", "INT32", "INT64",
     "UINT8", "UINT16", "UINT32", "UINT64",
@@ -37,6 +38,55 @@ __all__ = [
 
 class UnmappableType(ValueError):
     """Raised when a source type has no faithful canonical representation."""
+
+
+
+# ------------------------------------------------------------- sensitivity
+class Sensitivity(enum.IntEnum):
+    """How sensitive a classification is, ordered so ``>=`` means "at least".
+
+    This lives beside :class:`Field` rather than in the policy engine
+    because it describes the *tag*, not the rule. Both the lineage layer
+    (which propagates tags into derived columns) and the policy engine
+    (which acts on them) need it, and a metadata module that has to import
+    from a policy module to ask how sensitive a column is has its layering
+    backwards.
+    """
+
+    PUBLIC = 0
+    INTERNAL = 1
+    CONFIDENTIAL = 2
+    RESTRICTED = 3
+
+    @classmethod
+    def parse(cls, tag: str) -> "Sensitivity":
+        return _SENSITIVITY_BY_TAG.get(str(tag).strip().upper(), cls.INTERNAL)
+
+
+_SENSITIVITY_BY_TAG: dict[str, Sensitivity] = {
+    "PUBLIC": Sensitivity.PUBLIC,
+    "INTERNAL": Sensitivity.INTERNAL,
+    "PII": Sensitivity.CONFIDENTIAL,
+    "PHI": Sensitivity.RESTRICTED,
+    "FINANCIAL": Sensitivity.CONFIDENTIAL,
+    "CONFIDENTIAL": Sensitivity.CONFIDENTIAL,
+    "RESTRICTED": Sensitivity.RESTRICTED,
+    "SECRET": Sensitivity.RESTRICTED,
+}
+
+
+def sensitivity_of(classification: frozenset[str] | set[str] | None) -> Sensitivity:
+    """The highest sensitivity claimed by a set of classification tags.
+
+    An unrecognised tag is treated as ``INTERNAL``, not ``PUBLIC``. A label
+    AAR has never seen is a policy someone has not taught it about, and
+    defaulting it low would quietly strip a protection the analyst believed
+    they had applied.
+    """
+    level = Sensitivity.PUBLIC
+    for tag in classification or ():
+        level = max(level, Sensitivity.parse(tag))
+    return level
 
 
 class TypeKind(str, enum.Enum):

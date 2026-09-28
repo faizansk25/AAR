@@ -127,6 +127,17 @@ A classification tag is only worth carrying if something acts on it. AAR
 enforces four obligations, and the defaults are **deny** — forgetting to
 write a policy is the safe mistake.
 
+```python
+from aar.sdk import classify, excel, filter_, group_by, sum_
+
+# Formats cannot carry AAR's tags — Parquet has nowhere to put them and an
+# Excel header is just a string. `classify` is where you say what a column is.
+orders = classify(excel("FY26-orders.xlsx"),
+                  "customer", "ssn", tags=["PII"])
+by_region = group_by(orders, "region", aggs={"total": sum_("amount")})
+# `total` is now CONFIDENTIAL too, because it was computed from classified data.
+```
+
 ```powershell
 aar policy check --write-example example-policy.json
 aar run pipeline.py --policy example-policy.json --role analyst --as dana
@@ -150,7 +161,26 @@ Policy 'example-strict'
 | Row-level | Injects `WHERE` for a role, so restricted rows are not returned | no filter |
 | Column-level | Drops or masks a column by role or by sensitivity | mask at `CONFIDENTIAL` |
 
-Three properties worth knowing:
+### Propagation
+
+A derived column is **at least as sensitive as everything it came from**. This
+is the part that stops `SUM(salary)` slipping through a policy that trusts
+classification:
+
+| Operation | Inherits | Why |
+|---|---|---|
+| `SUM(x)`, `AVG(x)`, `MIN(x)` | `x`'s tags | the result is a function of `x` |
+| `COUNT(x)` | `x`'s tags | conservative; a non-null count is a property of `x` |
+| `COUNT(*)` | nothing | a row count is a property of the table, not of a value |
+| Group key | its own tags | **the key is the value** — bucketing by a quasi-identifier discloses it |
+| UDF output | every column's tags | a function is opaque; assume it read everything |
+| Join | both sides | either input can contribute to a joined row |
+
+`declassify()` removes a tag with a written justification, which is stored on
+the column. Without that escape hatch, analysts delete the source tags
+instead — which is strictly worse.
+
+Four properties worth knowing:
 
 - **Enforcement happens before the bytes move.** A write that lands and is
   then noticed is a breach that already happened.
@@ -159,9 +189,13 @@ Three properties worth knowing:
   configured and protects nothing.
 - **Masks preserve type.** A masked numeric column stays numeric, so masking
   does not break the next aggregate — which is how masks get removed.
+- **Propagation is specific, not blanket.** An aggregate over an unclassified
+  column stays unclassified, or the policy would mask everything and get
+  switched off.
 
 A run with no `--policy` is unrestricted, and says so rather than pretending
 otherwise.
+
 
 ---
 

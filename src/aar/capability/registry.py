@@ -171,7 +171,7 @@ _COLUMNAR_OPS = frozenset({
     NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT, NodeType.WINDOW,
     NodeType.DEDUPLICATE, NodeType.CAST, NodeType.NULL_HANDLE,
     NodeType.LIMIT, NodeType.UNION, NodeType.CACHE, NodeType.MATERIALIZE,
-    NodeType.WRITE, NodeType.QUALITY_CHECK,
+    NodeType.WRITE, NodeType.QUALITY_CHECK, NodeType.TAG,
 })
 
 
