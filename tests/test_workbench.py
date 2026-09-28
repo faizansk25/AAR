@@ -213,3 +213,77 @@ class TestAccessibilityClaims:
     def test_the_static_assets_are_all_present(self):
         for name in ("index.html", "app.js", "app.css"):
             assert os.path.isfile(os.path.join(STATIC, name)), name
+
+    def test_a_rows_request_for_nothing_is_a_clean_error(self, server):
+        """A stale token must say so, not raise."""
+        payload = json.dumps({"token": "r-nope", "offset": 0,
+                              "limit": 10}).encode()
+        request = urllib.request.Request(
+            server.url + "api/rows", data=payload,
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=10) as response:
+            body = json.loads(response.read())
+        assert body["ok"] is False
+        assert body["error"]
+
+
+class TestRowsEndpoint:
+    """A grid that only shows a row count is not a grid.
+
+    Paging and sorting are done in the engine, not in the browser: shipping
+    3M rows to a tab for JavaScript to reorder makes the workbench the
+    slowest part of a fast pipeline.
+    """
+
+    @pytest.fixture(scope="class")
+    def table(self):
+        import pyarrow as pa
+
+        from aar.interchange import Table
+        from aar.types import Field, INT64, Schema, UTF8
+
+        schema = Schema((Field("region", UTF8), Field("n", INT64)))
+        return Table(pa.table({"region": [f"r{i % 4}" for i in range(200)],
+                               "n": list(range(200))}), schema)
+
+    def test_an_unknown_token_is_refused(self):
+        from aar.workbench import api_rows
+        result = api_rows("nope")
+        assert result["ok"] is False
+        assert "re-run" in result["error"]
+
+    def test_it_pages(self, table):
+        from aar.workbench import api_rows
+        from aar.workbench.server import _remember
+
+        token = _remember(table)
+        page = api_rows(token, offset=0, limit=10)
+        assert page["ok"] and page["total"] == 200
+        assert len(page["rows"]) == 10
+        second = api_rows(token, offset=10, limit=10)
+        assert second["rows"][0]["n"] != page["rows"][0]["n"]
+
+    def test_it_sorts_in_the_engine(self, table):
+        from aar.workbench import api_rows
+        from aar.workbench.server import _remember
+
+        token = _remember(table)
+        ascending = api_rows(token, 0, 5, sort="n")["rows"]
+        descending = api_rows(token, 0, 5, sort="n", descending=True)["rows"]
+        assert [r["n"] for r in ascending] == [0, 1, 2, 3, 4]
+        assert [r["n"] for r in descending] == [199, 198, 197, 196, 195]
+
+    def test_the_cache_is_bounded(self, table):
+        """A workbench left open all day must not become a memory leak."""
+        from aar.workbench.server import (
+            _ORDER, _RESULTS, MAX_CACHED, _remember,
+        )
+
+        tokens = [_remember(table) for _ in range(MAX_CACHED + 4)]
+        assert len(_ORDER) <= MAX_CACHED
+        assert len(_RESULTS) == len(_ORDER)
+        # Distinct tokens, or eviction pops names it has already dropped and
+        # the cache quietly holds fewer results than MAX_CACHED promises.
+        assert len(set(tokens)) == len(tokens)
+        assert len(_RESULTS) == MAX_CACHED
+

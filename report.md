@@ -469,12 +469,52 @@ The sensitivity ladder moved from `aar/governance` to `aar/types`, because it
 describes the tag rather than the rule, and a metadata module importing from
 a policy module to ask how sensitive a column is has its layering backwards.
 
-### 7.8 SQL/MongoDB connectors, UI — **NEXT**
+### 7.8 ~~Analyst Workbench~~ — **DONE** (`aar/workbench/`)
 
-Both SQL connectors need a live server to validate against. Then the Analyst
-Workbench and structured decision logging.
+A local UI over the real system, built on the standard library only — no CDN,
+no frontend build chain, binding to loopback by default.
 
+- **Live probe, not declarations.** Engine availability comes from
+  `registry.probe()`, and the UI shows the *reason* verbatim, so an analyst
+  who sees "duckdb is not installed" can act on it.
+- **Runtime i18n** across all declared languages, RTL layout, light/dark
+  themes, density settings, and keyboard shortcuts.
+- **A real data grid.** Paging and sorting are executed *in the engine*, not
+  in the browser. Shipping 3M rows to a tab for JavaScript to reorder makes
+  the workbench the slowest part of a fast pipeline.
+- **Privacy stays visible.** Columns carrying confidential or restricted
+  classification are marked in the grid, so the analyst sees what the policy
+  engine sees.
 
+### 7.9 ~~PyPI packaging~~ — **DONE**
+
+`adaptive-analytics-runtime` builds to a clean wheel and sdist.
+
+Two defects were fixed, both of which only appear *after* publishing:
+
+- The Workbench's `static/` assets were not packaged. The wheel installed
+  perfectly and then `aar workbench` 404'd on every asset.
+- The `all` extra self-referenced `aar[...]`, but the distribution is named
+  `adaptive-analytics-runtime`, so it could never resolve.
+
+Also: the `all` extra no longer pulls `cudf`, because installing RAPIDS on a
+CPU-only host *fails at install time* rather than degrading, which would
+break `pip install aar[all]` for most users. GPU is explicitly opt-in.
+
+**A missing `LICENSE` was found and added.** The package declared Apache-2.0
+but shipped no licence text.
+
+### 7.10 GPU verification — **IN PROGRESS**
+
+No GPU measurement exists. The attempt, and its limits, are documented in
+§8.2. `tools/gpu_verification.py` and
+`notebooks/aar_gpu_verification.ipynb` are ready and have been run on a
+CPU-only host, where they complete and report honestly.
+
+### 7.11 SQL/MongoDB live tests, decision logs — **BLOCKED**
+
+Both SQL connectors need a live server. Structured decision logging and
+streaming progress are not yet built.
 
 ---
 
@@ -484,10 +524,34 @@ Workbench and structured decision logging.
    frozen, and it has no vocabulary for Excel ranges, Python UDFs, privacy
    classifications or cache boundaries. Adapters will translate in both
    directions; the core IR will not depend on Substrait's shape.
-2. **No GPU was available on the build machine.** The GPU code paths
-   (detection, transfer-cost model, `ENGINE_ABSENT` degradation) are written
-   and exercised, but the GPU *calibration curves* are untested against real
-   hardware. This is stated rather than assumed away.
+2. **No GPU was available on the build machine, and no GPU measurement
+   exists.** This is stated rather than assumed away.
+
+   A verification attempt is now in place: `tools/gpu_verification.py` and
+   `notebooks/aar_gpu_verification.ipynb` (Colab T4). **I cannot execute
+   the notebook** — the user runs it, and the JSON result is committed under
+   `data/gpu/` so the finding is evidence rather than a claim.
+
+   What is *already* established on this CPU-only host, from
+   `data/gpu/cpu_baseline.json` (2,000,000 rows): Arrow, DuckDB and Polars
+   produce **identical** group-by checksums, so cross-engine correctness
+   does not depend on a GPU; AAR completes without a GPU and reports why
+   each engine was chosen; and the cost model correctly prefers CPU in all
+   nine sampled size/parallelism combinations on a machine with no GPU.
+
+   **A defect this exercise found:** `create_engine("cudf")` on a host
+   without cuDF returns an Arrow engine instead of raising, and records
+   nothing unless the caller passes a `ledger`. A verification script
+   trusting the return value would file Arrow's timings under the label
+   "cudf". The script now passes a ledger and marks degraded engines
+   `skipped` with `ran_as`. Generalising that into `create_engine` itself,
+   so the substitution is impossible to miss, is still open.
+
+   **A T4 would not prove everything.** It is compute capability 7.5: no
+   bfloat16, FP64 at 1/64 of FP32. A workload that wins on a T4 may lose on
+   an A100. One run establishes that the path *works* and that the planner
+   chooses sensibly; calibration needs several machines, which is a
+   separate and larger task.
 3. **Disk I/O numbers on Windows are warm-cache.** The page cache cannot be
    dropped without elevation, so `sequential_read` understates cold I/O. The
    caveat is stored in the profile and displayed rather than hidden.
@@ -533,11 +597,21 @@ cd d:\AAR
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
 
 # Verify everything
-.\.venv\Scripts\python.exe -m pytest -q                 # 373 tests
+.\.venv\Scripts\python.exe -m pytest -q                 # 547 tests
 .\.venv\Scripts\python.exe tools\check_syntax.py        # parse every module
 .\.venv\Scripts\python.exe tools\check_assets.py        # validate logo.svg
 .\.venv\Scripts\python.exe tools\smoke_run.py           # plan + run + verify the numbers
-.\.venv\Scripts\python.exe tools\debug_calib.py         # per-benchmark timings
+.\.venv\Scripts\python.exe tools\manual_test.py         # guided manual acceptance
+.\.venv\Scripts\python.exe tools\audit.py               # large real-data audit
+.\.venv\Scripts\python.exe tools\fetch_data.py          # NYC taxi Parquet, provenance in MANIFEST
+
+# GPU: run on a host that actually has a CUDA device.
+# tools\gpu_verification.py is also packaged as notebooks/aar_gpu_verification.ipynb.
+.\.venv\Scripts\python.exe tools\gpu_verification.py    # writes aar_gpu_result.json
+
+# Package
+.\.venv\Scripts\python.exe -m build
+.\.venv\Scripts\python.exe -m twine check dist\*
 
 # Run the example pipeline for real
 .\.venv\Scripts\python.exe tools\make_sample_data.py    # writes FY26-orders.xlsx

@@ -1,0 +1,378 @@
+{
+  "total": 53,
+  "passed": 44,
+  "failed": 9,
+  "results": [
+    {
+      "group": "engines",
+      "name": "available",
+      "ok": true,
+      "detail": "arrow, duckdb, polars_cpu, pandas",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "arrow.filter",
+      "ok": true,
+      "detail": "500,000/500,000 non-null rows in 25.3s",
+      "seconds": 25.3
+    },
+    {
+      "group": "engines",
+      "name": "arrow.project",
+      "ok": true,
+      "detail": "('VendorID', 'tpep_pickup_datetime', 'tpep_dropoff_datetime')",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "arrow.limit",
+      "ok": true,
+      "detail": "10 rows",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "arrow.sort",
+      "ok": true,
+      "detail": "500,000 rows in 0.5s",
+      "seconds": 0.52
+    },
+    {
+      "group": "engines",
+      "name": "arrow.group_by",
+      "ok": true,
+      "detail": "241 groups from 300,000 rows in 4.0s (fallback path, bounded slice)",
+      "seconds": 4.0
+    },
+    {
+      "group": "engines",
+      "name": "duckdb.filter",
+      "ok": true,
+      "detail": "500,000/500,000 non-null rows in 0.1s",
+      "seconds": 0.13
+    },
+    {
+      "group": "engines",
+      "name": "duckdb.project",
+      "ok": true,
+      "detail": "('VendorID', 'tpep_pickup_datetime', 'tpep_dropoff_datetime')",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "duckdb.limit",
+      "ok": true,
+      "detail": "10 rows",
+      "seconds": 0.01
+    },
+    {
+      "group": "engines",
+      "name": "duckdb.sort",
+      "ok": true,
+      "detail": "500,000 rows in 0.3s",
+      "seconds": 0.36
+    },
+    {
+      "group": "engines",
+      "name": "duckdb.group_by",
+      "ok": true,
+      "detail": "248 groups from 500,000 rows in 0.1s",
+      "seconds": 0.07
+    },
+    {
+      "group": "engines",
+      "name": "polars_cpu.filter",
+      "ok": true,
+      "detail": "500,000/500,000 non-null rows in 26.9s",
+      "seconds": 26.94
+    },
+    {
+      "group": "engines",
+      "name": "polars_cpu.project",
+      "ok": true,
+      "detail": "('VendorID', 'tpep_pickup_datetime', 'tpep_dropoff_datetime')",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "polars_cpu.limit",
+      "ok": true,
+      "detail": "10 rows",
+      "seconds": 0.12
+    },
+    {
+      "group": "engines",
+      "name": "polars_cpu.sort",
+      "ok": true,
+      "detail": "500,000 rows in 0.2s",
+      "seconds": 0.18
+    },
+    {
+      "group": "engines",
+      "name": "polars_cpu.group_by",
+      "ok": true,
+      "detail": "248 groups from 500,000 rows in 0.1s",
+      "seconds": 0.08
+    },
+    {
+      "group": "engines",
+      "name": "pandas.filter",
+      "ok": true,
+      "detail": "500,000/500,000 non-null rows in 20.1s",
+      "seconds": 20.06
+    },
+    {
+      "group": "engines",
+      "name": "pandas.project",
+      "ok": true,
+      "detail": "('VendorID', 'tpep_pickup_datetime', 'tpep_dropoff_datetime')",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "pandas.limit",
+      "ok": true,
+      "detail": "10 rows",
+      "seconds": 0.0
+    },
+    {
+      "group": "engines",
+      "name": "pandas.sort",
+      "ok": true,
+      "detail": "500,000 rows in 0.5s",
+      "seconds": 0.54
+    },
+    {
+      "group": "engines",
+      "name": "pandas.group_by",
+      "ok": true,
+      "detail": "248 groups from 500,000 rows in 4.4s",
+      "seconds": 4.44
+    },
+    {
+      "group": "agreement",
+      "name": "at_least_two_engines",
+      "ok": true,
+      "detail": "arrow, duckdb, polars_cpu, pandas",
+      "seconds": 0.0
+    },
+    {
+      "group": "agreement",
+      "name": "duckdb.group_by == arrow",
+      "ok": true,
+      "detail": "248 groups agree within 1e-09",
+      "seconds": 0.04
+    },
+    {
+      "group": "agreement",
+      "name": "polars_cpu.group_by == arrow",
+      "ok": true,
+      "detail": "248 groups agree within 1e-09",
+      "seconds": 0.06
+    },
+    {
+      "group": "agreement",
+      "name": "pandas.group_by == arrow",
+      "ok": true,
+      "detail": "248 groups agree within 1e-09",
+      "seconds": 1.13
+    },
+    {
+      "group": "agreement",
+      "name": "duckdb.filter == arrow",
+      "ok": true,
+      "detail": "324,121 rows",
+      "seconds": 0.11
+    },
+    {
+      "group": "agreement",
+      "name": "polars_cpu.filter == arrow",
+      "ok": true,
+      "detail": "324,121 rows",
+      "seconds": 0.06
+    },
+    {
+      "group": "agreement",
+      "name": "pandas.filter == arrow",
+      "ok": true,
+      "detail": "324,121 rows",
+      "seconds": 18.96
+    },
+    {
+      "group": "cli",
+      "name": "version",
+      "ok": true,
+      "detail": "exit=0 109B out",
+      "seconds": 0.34
+    },
+    {
+      "group": "cli",
+      "name": "doctor",
+      "ok": true,
+      "detail": "exit=0 535B out",
+      "seconds": 2.25
+    },
+    {
+      "group": "cli",
+      "name": "doctor --json",
+      "ok": true,
+      "detail": "exit=0 486B out",
+      "seconds": 3.5
+    },
+    {
+      "group": "cli",
+      "name": "engines",
+      "ok": true,
+      "detail": "exit=0 1913B out",
+      "seconds": 0.59
+    },
+    {
+      "group": "cli",
+      "name": "engines --json",
+      "ok": true,
+      "detail": "exit=0 2224B out",
+      "seconds": 0.55
+    },
+    {
+      "group": "cli",
+      "name": "--version",
+      "ok": true,
+      "detail": "exit=0 10B out",
+      "seconds": 0.2
+    },
+    {
+      "group": "cli",
+      "name": "explain D:\\AAR\\data\\audit\\pipeline_audit.py ",
+      "ok": false,
+      "detail": "exit=1 0B out, ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: Val",
+      "seconds": 0.43
+    },
+    {
+      "group": "cli",
+      "name": "run D:\\AAR\\data\\audit\\pipeline_audit.py ",
+      "ok": false,
+      "detail": "exit=1 0B out, ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: Val",
+      "seconds": 0.57
+    },
+    {
+      "group": "cli",
+      "name": "run D:\\AAR\\data\\audit\\pipeline_audit.py --explain",
+      "ok": false,
+      "detail": "exit=1 0B out, ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: Val",
+      "seconds": 0.41
+    },
+    {
+      "group": "cli",
+      "name": "run D:\\AAR\\data\\audit\\pipeline_audit.py --head",
+      "ok": false,
+      "detail": "exit=1 0B out, ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: Val",
+      "seconds": 0.41
+    },
+    {
+      "group": "cli",
+      "name": "run D:\\AAR\\data\\audit\\pipeline_audit.py --quiet",
+      "ok": false,
+      "detail": "exit=1 0B out, ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: Val",
+      "seconds": 0.41
+    },
+    {
+      "group": "cli",
+      "name": "run D:\\AAR\\data\\audit\\pipeline_audit.py --json",
+      "ok": false,
+      "detail": "exit=1 0B out, ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: Val",
+      "seconds": 0.41
+    },
+    {
+      "group": "cli",
+      "name": "policy --write-example",
+      "ok": true,
+      "detail": "written and validated, 573B",
+      "seconds": 0.56
+    },
+    {
+      "group": "cli",
+      "name": "policy show",
+      "ok": true,
+      "detail": "exit=0 Policy 'example-strict'\n  egress: deny except",
+      "seconds": 0.28
+    },
+    {
+      "group": "cli",
+      "name": "policy check",
+      "ok": true,
+      "detail": "exit=0 OK: D:\\AAR\\data\\audit\\policy.json is a valid ",
+      "seconds": 0.28
+    },
+    {
+      "group": "cli",
+      "name": "run --policy",
+      "ok": false,
+      "detail": "exit=1 , ERR aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py",
+      "seconds": 0.46
+    },
+    {
+      "group": "cli",
+      "name": "run on a missing file fails loudly",
+      "ok": true,
+      "detail": "exit=1 (non-zero is correct)",
+      "seconds": 0.91
+    },
+    {
+      "group": "spec",
+      "name": "P2 deny-outbound is stated in the spec",
+      "ok": true,
+      "detail": "found in system.md",
+      "seconds": 0.0
+    },
+    {
+      "group": "spec",
+      "name": "P2 core imports with sockets blocked",
+      "ok": true,
+      "detail": "39 modules imported with sockets blocked",
+      "seconds": 0.1
+    },
+    {
+      "group": "spec",
+      "name": "P5 explain names every segment decision",
+      "ok": false,
+      "detail": "exit=1, 0 chars, segments named=False",
+      "seconds": 0.42
+    },
+    {
+      "group": "spec",
+      "name": "P9 absent engines carry a reason",
+      "ok": true,
+      "detail": "8 absent engine(s), all with a reason",
+      "seconds": 0.06
+    },
+    {
+      "group": "spec",
+      "name": "derived columns inherit sensitivity",
+      "ok": true,
+      "detail": "every engine keeps SUM(confidential) confidential",
+      "seconds": 0.09
+    },
+    {
+      "group": "spec",
+      "name": "unknown sinks fail closed",
+      "ok": true,
+      "detail": "ftp, smb and unknown names all denied",
+      "seconds": 0.0
+    },
+    {
+      "group": "spec",
+      "name": "IR traversal is deterministic",
+      "ok": true,
+      "detail": "same graph, same order",
+      "seconds": 0.0
+    },
+    {
+      "group": "spec",
+      "name": "a repeated run is byte-identical",
+      "ok": false,
+      "detail": "exit=1 aar: could not load D:\\AAR\\data\\audit\\pipeline_audit.py: ValueError: c",
+      "seconds": 0.41
+    }
+  ]
+}

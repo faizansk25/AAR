@@ -12,6 +12,7 @@ is worse than no workbench - it is a workbench that lies.
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import threading
@@ -25,7 +26,7 @@ from .i18n import LANGUAGES, STRINGS
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
 __all__ = ["WorkbenchServer", "serve", "api_state", "api_explain",
-           "api_run", "api_i18n", "main"]
+           "api_run", "api_rows", "api_i18n", "main"]
 
 
 def api_state() -> dict:
@@ -50,6 +51,61 @@ def api_state() -> dict:
                           "blocked_by": cap.blocked_by}
                     for eid, cap in caps.items()},
     }
+
+
+def api_rows(token: str, offset: int = 0, limit: int = 100,
+             sort: str = "", descending: bool = False) -> dict:
+    """Page and sort a previous run's rows.
+
+    Sorting happens in the engine, not in the browser. Shipping 3M rows to
+    a tab for JavaScript to reorder is how a workbench becomes the slowest
+    part of a fast pipeline, and it is the difference between a grid that
+    works on real data and one that only demos well.
+    """
+    cached = _RESULTS.get(token)
+    if cached is None:
+        return {"ok": False, "error": "that result is no longer held; re-run"}
+    order = cached
+    if sort and order.schema.has(sort):
+        # Through a real engine, not a direct Arrow call: the point is that
+        # the grid agrees with whatever the engine would have done, and
+        # `Table` deliberately has no sort of its own.
+        from ..engines.factory import create_engine
+
+        order = create_engine("arrow").sort(order, [(sort, not descending)])
+    window = order.slice(int(offset), int(limit))
+    columns = [{"name": f.name,
+                "classification": sorted(f.classification)}
+               for f in cached.schema.fields
+               if f.name in window.column_names]
+    return {"ok": True, "total": cached.num_rows, "offset": int(offset),
+            "rows": window.arrow.to_pylist(), "columns": columns}
+
+
+#: Recent results, so the grid can page without re-running the pipeline.
+#: Bounded, because a workbench left open all day should not become a
+#: memory leak with a friendly icon.
+_RESULTS: dict = {}
+_ORDER: list = []
+_SEQ = itertools.count(1)
+MAX_CACHED = 8
+
+
+def _remember(table: Any) -> str:
+    """Cache a result and return the token that addresses it.
+
+    The token comes from a monotonic counter, *not* from the length of
+    ``_ORDER``. Deriving it from the length reuses names once the cache is
+    full - the ninth and tenth inserts both get "r9" - which silently
+    evicts the wrong entries and leaves far fewer distinct results
+    resident than MAX_CACHED promises.
+    """
+    token = f"r{next(_SEQ)}"
+    _RESULTS[token] = table
+    _ORDER.append(token)
+    while len(_ORDER) > MAX_CACHED:
+        _RESULTS.pop(_ORDER.pop(0), None)
+    return token
 
 
 def _failure(exc: BaseException) -> dict:
@@ -88,8 +144,10 @@ def api_run(path: str, role: str | None = None,
         return _failure(exc)
     table = getattr(result, "table", None)
     fields = table.schema.fields if table is not None else ()
+    token = _remember(table) if table is not None else ""
     return {
         "ok": True,
+        "token": token,
         "rows": table.num_rows if table is not None else 0,
         "columns": list(table.column_names) if table is not None else [],
         "schema": [{"name": f.name, "type": f.type.render(),
@@ -180,6 +238,13 @@ class _Handler(BaseHTTPRequestHandler):
             return self._send_json(200, api_run(payload.get("path", ""),
                                                 payload.get("role"),
                                                 payload.get("policy")))
+        if route == "/api/rows":
+            return self._send_json(200, api_rows(
+                payload.get("token", ""),
+                int(payload.get("offset") or 0),
+                int(payload.get("limit") or 100),
+                payload.get("sort", ""),
+                bool(payload.get("descending"))))
         self._send_json(404, {"error": f"no such route: {route}"})
 
     def _serve_file(self, name: str) -> None:

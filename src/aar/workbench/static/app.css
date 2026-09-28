@@ -92,6 +92,21 @@ pre { margin: 0; padding: var(--gap); white-space: pre-wrap;
 .bar > i { display: block; height: 100%; background: var(--accent); }
 .meter { display: grid; grid-template-columns: 3.4em 1fr auto; gap: 8px;
          align-items: center; padding: 3px var(--gap); }
+#grid-bar { display: flex; align-items: center; gap: 8px;
+            padding: 6px var(--gap); border-bottom: 1px solid var(--line);
+            flex-wrap: wrap; }
+#pager { color: var(--muted); font-variant-numeric: tabular-nums; }
+/* Sortable headers are buttons, not styled <th>s, so they are reachable by
+   keyboard and announce themselves as controls to a screen reader. */
+th button { background: none; border: 0; color: inherit; font: inherit;
+            font-weight: 600; cursor: pointer; padding: 2px 4px;
+            border-radius: 4px; display: inline-flex; gap: 4px;
+            align-items: center; }
+th button:hover { background: var(--chip); }
+#history li { display: flex; gap: 8px; align-items: center;
+              padding: 3px var(--gap); font-size: .88em; }
+#history .ok { color: var(--ok); }
+#history .err { color: var(--bad); }
 .empty { padding: 18px var(--gap); color: var(--muted); }
 [hidden] { display: none !important; }
 

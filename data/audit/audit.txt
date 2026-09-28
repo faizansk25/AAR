@@ -1,0 +1,18 @@
+AAR AUDIT
+==============================================================
+
+engines       21/21  pass
+agreement      7/7   pass
+cli           10/17  pass   <-- 7 FAILED
+    FAIL explain D:\AAR\data\audit\pipeline_audit.py : exit=1 0B out, ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py: Val
+    FAIL run D:\AAR\data\audit\pipeline_audit.py : exit=1 0B out, ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py: Val
+    FAIL run D:\AAR\data\audit\pipeline_audit.py --explain: exit=1 0B out, ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py: Val
+    FAIL run D:\AAR\data\audit\pipeline_audit.py --head: exit=1 0B out, ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py: Val
+    FAIL run D:\AAR\data\audit\pipeline_audit.py --quiet: exit=1 0B out, ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py: Val
+    FAIL run D:\AAR\data\audit\pipeline_audit.py --json: exit=1 0B out, ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py: Val
+    FAIL run --policy: exit=1 , ERR aar: could not load D:\AAR\data\audit\pipeline_audit.py
+spec           6/8   pass   <-- 2 FAILED
+    FAIL P5 explain names every segment decision: exit=1, 0 chars, segments named=False
+    FAIL a repeated run is byte-identical: exit=1 aar: could not load D:\AAR\data\audit\pipeline_audit.py: ValueError: c
+
+TOTAL 44/53 pass, 9 failed

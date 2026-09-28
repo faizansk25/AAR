@@ -1,0 +1,16 @@
+{
+  "nyc_taxi_2023_01.parquet": {
+    "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2023-01.parquet",
+    "kind": "parquet",
+    "bytes": 47673370,
+    "fetched": "2026-09-28T17:06:55",
+    "sha256": "32df6f67578fa86c484a6b5ef23a5281992ff085521082340b0f9e5889e9a572"
+  },
+  "nyc_taxi_2022_03.parquet": {
+    "url": "https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2022-03.parquet",
+    "kind": "parquet",
+    "bytes": 55682369,
+    "fetched": "2026-09-28T17:07:12",
+    "sha256": "b8b63566178c65da758cc292338ebc308534eb57607085fc67b2c939ae6035e3"
+  }
+}

@@ -126,6 +126,78 @@ function tableHTML(headers, rows) {
 }
 
 const CACHE = {};
+/* Grid state. Paging and sorting are *requests to the engine*, not browser
+   reordering, so a 3M-row result pages as cheaply as a 10-row one. */
+const GRID = { token: "", offset: 0, limit: 100, sort: "", desc: false,
+               total: 0 };
+
+const RUNS = [];
+
+function noteRun(ok, text) {
+  RUNS.unshift({ ok, text, when: new Date().toLocaleTimeString() });
+  while (RUNS.length > 12) RUNS.pop();
+  const list = $("history");
+  list.textContent = "";
+  for (const r of RUNS) {
+    const li = document.createElement("li");
+    const mark = document.createElement("span");
+    mark.className = r.ok ? "ok" : "err";
+    mark.textContent = r.ok ? "ok" : "error";
+    const when = document.createElement("span");
+    when.className = "chip";
+    when.textContent = r.when;
+    const what = document.createElement("span");
+    what.textContent = r.text;
+    li.append(mark, when, what);
+    list.append(li);
+  }
+}
+
+async function loadRows() {
+  if (!GRID.token) return;
+  const res = await postJSON("/api/rows", {
+    token: GRID.token, offset: GRID.offset, limit: GRID.limit,
+    sort: GRID.sort, descending: GRID.desc,
+  });
+  if (!res.ok) {
+    CACHE.preview = `<p class="empty">${esc(res.error || t("status.error"))}</p>`;
+    setPanel("preview");
+    return;
+  }
+  GRID.total = res.total;
+  $("grid-bar").hidden = false;
+  $("pager").textContent =
+    `${res.total.toLocaleString()} rows · ${GRID.offset + 1}–` +
+    `${Math.min(GRID.offset + GRID.limit, res.total)}`;
+  $("prev").disabled = GRID.offset <= 0;
+  $("next").disabled = GRID.offset + GRID.limit >= res.total;
+  CACHE.preview = gridHTML(res);
+  setPanel("preview");
+}
+
+function gridHTML(res) {
+  if (!res.rows.length) {
+    return `<p class="empty">${esc(t("empty.result"))}</p>`;
+  }
+  const hot = new Set();
+  for (const c of res.columns) {
+    if ((c.classification || []).some((k) => /confidential|restricted/i
+        .test(k))) hot.add(c.name);
+  }
+  const head = res.columns.map((c) => {
+    const arrow = GRID.sort === c.name ? (GRID.desc ? " ▾" : " ▴") : "";
+    return `<th scope="col"><button type="button" data-sort="${esc(c.name)}"` +
+      ` aria-label="${esc(c.name)}">${esc(c.name)}${arrow}</button></th>`;
+  }).join("");
+  const body = res.rows.map((row) => "<tr>" + res.columns.map((c) => {
+    const value = row[c.name];
+    const text = value === null || value === undefined ? "" : String(value);
+    return `<td>${hot.has(c.name)
+      ? `<span class="chip hot">${esc(text)}</span>` : esc(text)}</td>`;
+  }).join("") + "</tr>").join("");
+  return `<table><thead><tr>${head}</tr></thead>` +
+         `<tbody>${body}</tbody></table>`;
+}
 
 function setPanel(name) {
   for (const b of $("bottom-tabs").children) {
@@ -169,16 +241,19 @@ async function doRun() {
     role: $("role").value.trim() || null,
   });
   if (!res.ok) {
+    noteRun(false, res.error || "run failed");
     CACHE.preview = `<p class="empty">${esc(t("status.error"))}: ` +
                     `${esc(res.error)}</p>`;
     setPanel("preview");
     return;
   }
+  noteRun(true, `${res.rows} rows, ${(res.columns || []).length} columns`);
   const cols = res.columns || [];
   const schema = res.schema || [];
-  CACHE.preview = cols.length
-    ? tableHTML(cols, [[`${res.rows} rows`]])
-    : `<p class="empty">${esc(t("empty.result"))}</p>`;
+  GRID.token = res.token || "";
+  GRID.offset = 0;
+  GRID.sort = "";
+  GRID.desc = false;
   CACHE.schema = tableHTML(
     ["Column", "Type", "Classification"],
     schema.map((f) => [f.name, f.type,
@@ -190,7 +265,14 @@ async function doRun() {
   CACHE.log = `<pre>${esc(JSON.stringify(
     { rows: res.rows, columns: cols,
       degradations: res.degradations || [] }, null, 2))}</pre>`;
-  setPanel("preview");
+  if (GRID.token) await loadRows();
+  else {
+    $("grid-bar").hidden = true;
+    CACHE.preview = cols.length
+      ? tableHTML(cols, [[`${res.rows} rows`]])
+      : `<p class="empty">${esc(t("empty.result"))}</p>`;
+    setPanel("preview");
+  }
 }
 
 function wire() {
@@ -204,6 +286,30 @@ function wire() {
   for (const b of $("bottom-tabs").children) {
     b.addEventListener("click", () => setPanel(b.dataset.panel));
   }
+  $("prev").addEventListener("click", () => {
+    GRID.offset = Math.max(0, GRID.offset - GRID.limit);
+    loadRows();
+  });
+  $("next").addEventListener("click", () => {
+    GRID.offset += GRID.limit;
+    loadRows();
+  });
+  $("pagesize").addEventListener("change", (ev) => {
+    GRID.limit = Number(ev.target.value) || 100;
+    GRID.offset = 0;
+    loadRows();
+  });
+  /* Sort by header click, delegated: the grid is re-rendered on every page
+     so a per-header listener would be lost each time. */
+  $("panel-body").addEventListener("click", (ev) => {
+    const button = ev.target.closest("[data-sort]");
+    if (!button) return;
+    const name = button.dataset.sort;
+    GRID.desc = GRID.sort === name ? !GRID.desc : false;
+    GRID.sort = name;
+    GRID.offset = 0;
+    loadRows();
+  });
   document.addEventListener("keydown", (ev) => {
     if (!(ev.ctrlKey || ev.metaKey)) {
       if (ev.key === "?") setPanel("help");

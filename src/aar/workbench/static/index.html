@@ -75,6 +75,8 @@
   <section class="panel" id="inspector" aria-labelledby="ins-h">
     <h2 id="ins-h" data-i18n="panel.inspector">Plan inspector</h2>
     <div id="meters"></div>
+    <h2 id="hist-h" data-i18n="tab.runs">Runs</h2>
+    <ul id="history" role="list"></ul>
   </section>
   <section class="panel" id="bottom" aria-labelledby="bot-h">
     <h2 id="bot-h" data-i18n="panel.preview">Data preview</h2>
@@ -86,6 +88,14 @@
       <button role="tab" data-panel="explain" data-i18n="panel.explain">Why</button>
       <button role="tab" data-panel="help" data-i18n="tab.help">Help</button>
     </nav>
+    <div id="grid-bar" hidden>
+      <label class="sr" for="pagesize" data-i18n="label.rows">Rows per page</label>
+      <select id="pagesize"><option>50</option><option selected>100</option>
+        <option>250</option><option>1000</option></select>
+      <button class="act" id="prev" type="button" aria-label="Previous page">&larr;</button>
+      <span id="pager" role="status" aria-live="polite"></span>
+      <button class="act" id="next" type="button" aria-label="Next page">&rarr;</button>
+    </div>
     <div id="panel-body"><p class="empty" data-i18n="empty.result">Run a pipeline.</p></div>
   </section>
 </main>

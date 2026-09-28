@@ -43,7 +43,7 @@ EN: dict[str, str] = {
     "action.explain": "Explain plan", "action.run": "Run",
     "action.refresh": "Refresh",
     "label.language": "Language", "label.theme": "Theme",
-    "label.density": "Density",
+    "label.density": "Density", "label.rows": "Rows per page",
     "theme.dark": "Dark", "theme.light": "Light", "theme.system": "System",
     "density.compact": "Compact", "density.comfortable": "Comfortable",
     "density.spacious": "Spacious",
