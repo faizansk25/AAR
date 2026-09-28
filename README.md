@@ -29,7 +29,7 @@ proudly say "CPU selected" or "PostgreSQL selected" when that is optimal.
 | Empirical, not hardcoded | Cost curves are measured live on the machine, not read from a spec sheet. |
 | Never silently fails | `DegradationLedger.assert_clean()` raises on unresolved blocking degradations. |
 | Explainable by default | Engine choice, reason, estimate and fallback are fields on the plan node. |
-| Orchestration, not replacement | Zero required dependencies. Every engine is optional and probed. |
+| Orchestration, not replacement | No *required* dependencies. Every engine is optional and probed — but executing a query needs one, and pyarrow is the minimum. |
 | Privacy-first by architecture | A `CONFIDENTIAL` tag in PostgreSQL is still there in the Excel output. |
 
 ---

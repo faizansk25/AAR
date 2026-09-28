@@ -241,7 +241,13 @@ verified from what is not.
 
 **Genuinely true, safe to claim:**
 
-- Zero required runtime dependencies.
+- No *required* dependencies — the wheel installs and imports on a bare
+  interpreter. **Executing a pipeline does need an engine, and pyarrow is
+  the minimum.** That distinction is stated everywhere the claim appears,
+  because "zero dependencies" unqualified is the sentence that makes an
+  air-gapped deployment fail at 2am. `tools/verify_release.py` verifies
+  both halves: a bare install refuses to execute *cleanly and with a named
+  reason*, and a bare-plus-pyarrow install runs for real.
 - Cross-engine agreement on identical data, checked against independent
   Python ground truth.
 - Privacy classification and policy enforcement are fail-closed, covered

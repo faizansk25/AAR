@@ -237,9 +237,20 @@ ENGINES: tuple[EngineSpec, ...] = (
     EngineSpec(
         id="arrow", label="Arrow (in-process)", device=Device.CPU,
         tier=Tier.LOCAL_EMBEDDED, probe="pyarrow", distribution="pyarrow",
-        ops=frozenset(op for op in _COLUMNAR_OPS
-                      if op is not NodeType.WRITE),
-        notes="zero-copy within process; always paired with another engine",
+        # WRITE is included, and used to be excluded here. That was a
+        # declaration bug, not a limitation: ArrowEngine.write handles
+        # CSV, JSON and Parquet, and the executor's own tests write CSVs
+        # through it. It was invisible because every developer has DuckDB or
+        # Polars installed, so the planner had another engine to pick for the
+        # write node - and it only surfaced when `verify_release.py` installed
+        # the wheel with *pyarrow alone*, which is exactly the air-gapped
+        # configuration this project exists to serve. That install could
+        # read a file, compute on it, and then not save the result.
+        #
+        # Excel targets are still the Excel engine's job; ArrowEngine.write
+        # declines them explicitly rather than half-doing them.
+        ops=frozenset(_COLUMNAR_OPS),
+        notes="zero-copy within process; writes CSV/JSON/Parquet, not Excel",
     ),
 
     # --- tier 3: GPU acceleration

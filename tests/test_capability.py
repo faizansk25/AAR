@@ -82,8 +82,41 @@ class TestDeclaredCapability:
         for engine in ("ray", "dask", "spark_rapids"):
             assert CapabilityRegistry().spec(engine).remote, engine
 
-    def test_arrow_cannot_write(self):
-        assert not CapabilityRegistry().spec("arrow").supports(NodeType.WRITE)
+    def test_arrow_can_write_the_formats_it_implements(self):
+        """This test used to assert the opposite, and the opposite was wrong.
+
+        ``ArrowEngine.write`` handles CSV, JSON and Parquet, and the
+        executor's own tests write CSVs through it. Excluding WRITE from the
+        declaration was a declaration bug, invisible on any development
+        machine because DuckDB and Polars were installed and the planner
+        picked one of them for the write node.
+
+        It surfaced only when ``tools/verify_release.py`` installed the wheel
+        with pyarrow alone - the air-gapped configuration this project exists
+        to serve - where AAR could read a file, compute on it, and then not
+        save the result.
+
+        A test that encodes a false belief is worse than no test, because it
+        makes the bug look intentional.
+        """
+        spec = CapabilityRegistry().spec("arrow")
+        assert spec.supports(NodeType.WRITE)
+        for op in (NodeType.SCAN_CSV, NodeType.FILTER, NodeType.GROUPBY,
+                   NodeType.SORT, NodeType.LIMIT):
+            assert spec.supports(op), op
+
+    def test_a_minimal_arrow_install_can_complete_a_pipeline(self):
+        """The end-to-end shape of the bug above, at declaration level.
+
+        Every operation a bare CSV-to-CSV pipeline needs must be claimed by
+        some engine, or the planner has an infeasible plan for a reason no
+        user wrote down.
+        """
+        needed = (NodeType.SCAN_CSV, NodeType.GROUPBY, NodeType.WRITE)
+        specs = [CapabilityRegistry().spec(s.id) for s in ENGINES]
+        for op in needed:
+            assert any(spec.supports(op) for spec in specs), (
+                f"no declared engine claims {op.value}")
 
 
 class TestAvailabilityProbe:

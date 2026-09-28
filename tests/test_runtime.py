@@ -676,7 +676,6 @@ class TestDeclaredIsNotImplemented:
                 create_engine(engine_id, allow_degradation=False)
 
     def test_the_gpu_engines_are_actually_implemented_now(self):
-        """The gap that started this. Kept as a test so it cannot reopen."""
         from aar.engines.cudf_engine import CudfEngine
         from aar.engines.factory import ENGINE_FACTORIES
         from aar.engines.polars_gpu_engine import PolarsGPUEngine
@@ -692,6 +691,85 @@ class TestDeclaredIsNotImplemented:
                 # a reason rather than being a bare absence of capability.
                 assert not engine.supports("execute")
                 assert engine.capabilities.reason("execute")
+
+
+class TestDeclaredOperationsMatchTheImplementation:
+    """A capability that under-declares is a silent infeasibility.
+
+    The Arrow engine used to exclude WRITE from its declared operations even
+    though it implements ``write``. Nothing failed on a development machine,
+    because DuckDB and Polars are installed there and the planner picked one
+    of them for the write node. A `pip install aar[arrow]` install could read
+    a file, compute on it, and then not save the result.
+
+    This is the general hazard: a declaration is a promise about what the
+    planner may choose, and an under-declaration is a plan that is
+    infeasible for a reason nobody wrote down.
+    """
+
+    def test_arrow_declares_write(self):
+        from aar.capability import ENGINES
+        from aar.ir import NodeType
+
+        spec = next(s for s in ENGINES if s.id == "arrow")
+        assert NodeType.WRITE in spec.ops, (
+            "ArrowEngine.write exists, so arrow must declare WRITE; an "
+            "exclusion makes a minimal [arrow] install unable to save output")
+
+    def test_no_declared_op_is_missing_from_its_engine(self):
+        """Every declared op must be a method the engine actually has.
+
+        Catches the reverse error too - declaring an op with no
+        implementation - which produces a plan that fails mid-run rather
+        than at planning time.
+        """
+        from aar.capability import ENGINES
+        from aar.engines.factory import ENGINE_FACTORIES
+        from aar.ir import NodeType
+
+        mapping = dict(_METHOD_FOR_OP)
+        missing: list[str] = []
+        for engine_id, factory in ENGINE_FACTORIES.items():
+            spec = next((s for s in ENGINES if s.id == engine_id), None)
+            if spec is None:
+                continue
+            try:
+                engine = factory()
+            except Exception:  # noqa: BLE001 - not installed on this host
+                continue
+            try:
+                for op in spec.ops:
+                    name = mapping.get(op)
+                    if name is None:
+                        continue
+                    if not hasattr(engine, name):
+                        missing.append(
+                            f"{engine_id} declares {op.value} but has no "
+                            f"{name}()")
+            finally:
+                engine.close()
+        assert not missing, "; ".join(missing)
+        assert NodeType.WRITE in mapping, "the mapping must cover WRITE"
+
+
+#: NodeType -> the Engine method that implements it. Ops with no single
+#: method (a UDF node, a cache boundary) are handled inside another method
+#: and are intentionally absent.
+_METHOD_FOR_OP = {
+    NodeType.SCAN_PARQUET: "read_scan",
+    NodeType.SCAN_CSV: "read_scan",
+    NodeType.SCAN_JSON: "read_scan",
+    NodeType.SCAN_EXCEL: "read_scan",
+    NodeType.SCAN_SQL: "read_scan",
+    NodeType.SCAN_MONGO: "read_scan",
+    NodeType.FILTER: "filter",
+    NodeType.PROJECT: "project",
+    NodeType.GROUPBY: "group_by",
+    NodeType.SORT: "sort",
+    NodeType.LIMIT: "limit",
+    NodeType.JOIN: "join",
+    NodeType.WRITE: "write",
+}
 
 
 

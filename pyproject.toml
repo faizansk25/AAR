@@ -29,11 +29,18 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Information Analysis",
 ]
 
-# NOTE: AAR deliberately has ZERO required third-party runtime dependencies.
-# The core (IR, planner, cost model, policy engine, lineage, failure registry,
-# explain output, and the whole Workbench UI) runs on the Python standard
-# library alone. Every engine is optional and probed at runtime; absence
-# degrades gracefully and is logged rather than raising.
+# NOTE: AAR has ZERO *required* third-party runtime dependencies. The core
+# (IR, planner, cost model, policy engine, lineage, failure registry, explain
+# output, and the whole Workbench UI) runs on the Python standard library
+# alone, and every engine is optional and probed; absence degrades gracefully
+# and is logged rather than raising.
+#
+# One honest caveat, verified by tools/verify_release.py: EXECUTING a
+# pipeline requires at least one engine, and the minimum is pyarrow. A bare
+# install imports, explains, plans and serves the Workbench, and refuses to
+# execute with NO_FEASIBLE_PLAN naming the segment. "Zero dependencies"
+# without that qualification would be false, and false in the one direction
+# that breaks an air-gapped deployment.
 dependencies = []
 
 [project.optional-dependencies]

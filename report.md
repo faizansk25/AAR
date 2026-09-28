@@ -627,7 +627,7 @@ Not aspirations — each is a test:
 | Empirical, not hardcoded | All cost curves measured live on this machine |
 | Never silently fails | `DegradationLedger` + `assert_clean()`; every error tagged with a failure mode |
 | Explainable by default | Engine choice, reason, estimate, saving and fallback are `Node` fields |
-| Orchestration, not replacement | Zero required dependencies; every engine optional and probed |
+| Orchestration, not replacement | No *required* dependencies; every engine optional and probed. Executing needs one — pyarrow is the minimum. |
 | Types travel with data | Classification and lineage survive cast/rename/select |
 | Data movement is minimised | Pushdown capability modelled per source; cost model makes transfer explicit |
 
