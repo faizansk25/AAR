@@ -238,33 +238,44 @@ def decisions(result: dict) -> None:
             return
         row = {
             "bytes": nbytes,
-            "cpu_ms": round(cpu.total_ms, 1),
-            "gpu_ms": round(gpu.total_ms, 1),
-            "cpu_kernel_ms": round(cpu.kernel_ms, 1),
-            "gpu_kernel_ms": round(gpu.kernel_ms, 1),
-            "cpu_transfer_ms": round(cpu.transfer_ms, 1),
-            "gpu_transfer_ms": round(gpu.transfer_ms, 1),
+            # CostBreakdown is in SECONDS and names its terms compute_s /
+            # transfer_s. The first T4 run assumed `total_ms` and produced no
+            # rows at all; the second assumed `kernel_ms` / `transfer_ms`,
+            # which do not exist. Converted to ms here so the report is
+            # comparable with section 5, and the names used are the real ones.
+            "cpu_ms": round(cpu.total_s * 1000, 1),
+            "gpu_ms": round(gpu.total_s * 1000, 1),
+            "cpu_kernel_ms": round(cpu.kernel_s * 1000, 1),
+            "gpu_kernel_ms": round(gpu.kernel_s * 1000, 1),
+            "cpu_transfer_ms": round(cpu.movement_s * 1000, 1),
+            "gpu_transfer_ms": round(gpu.movement_s * 1000, 1),
+            "cpu_overhead_fraction": round(cpu.overhead_fraction, 3),
+            "gpu_overhead_fraction": round(gpu.overhead_fraction, 3),
             "cpu_source": cpu_src,
             "gpu_source": gpu_src,
             # A device-resident feed removes the inbound transfer, which is
             # the whole point of keeping data on the GPU across segments.
             "gpu_resident_ms": round(
                 model.node_cost(node, "cudf", nbytes,
-                                residency=Device.GPU)[0].total_ms, 1),
-            "picked": "gpu" if gpu.total_ms < cpu.total_ms else "cpu",
+                                residency=Device.GPU)[0].total_s * 1000, 1),
+            "picked": "gpu" if gpu.total_s < cpu.total_s else "cpu",
         }
         result["decisions"].append(row)
         print(f"  {nbytes:>13,}B  cpu={row['cpu_ms']:>9.1f}ms "
-              f"(kern {row['cpu_kernel_ms']:>8.1f} + xfer "
-              f"{row['cpu_transfer_ms']:>8.1f})  "
+              f"(kern {row['cpu_kernel_ms']:>8.1f} + move "
+              f"{row['cpu_transfer_ms']:>8.1f}, "
+              f"{row['cpu_overhead_fraction']:.0%} overhead)  "
               f"gpu={row['gpu_ms']:>9.1f}ms "
-              f"(kern {row['gpu_kernel_ms']:>8.1f} + xfer "
-              f"{row['gpu_transfer_ms']:>8.1f})  "
+              f"(kern {row['gpu_kernel_ms']:>8.1f} + move "
+              f"{row['gpu_transfer_ms']:>8.1f}, "
+              f"{row['gpu_overhead_fraction']:.0%} overhead)  "
               f"gpu-resident={row['gpu_resident_ms']:>9.1f}ms  "
               f"-> {row['picked']}", flush=True)
-    print("\n  Note: these are estimates from the cost model on THIS host, "
-          "not measurements.\n  The measured numbers are in section 5.",
+    print("\n  Note: these are ESTIMATES from the cost model on this host, "
+          "not\n  measurements. The measured numbers are in section 5.",
           flush=True)
+    print("  Section 5 numbers on a shared Colab VM vary run to run - see "
+          "data/gpu/README.md.", flush=True)
 
 
 def main() -> int:

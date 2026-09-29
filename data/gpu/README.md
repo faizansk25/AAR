@@ -29,8 +29,26 @@ A GPU run now exercises real code: `aar/engines/cudf_engine.py` and
 constructs them with `allow_degradation=False` so that a row filed under
 "cudf" must have been produced by cudf.
 
-Be careful about what a T4 establishes even then. It is compute capability
-7.5: **no bfloat16**, and FP64 at 1/64 of FP32. A workload that wins on a
-T4 can lose on an A100. A successful run demonstrates that the path *works*
-and that the planner chooses sensibly; it does not make the numbers portable
-to other hardware, and it does not calibrate the cost model.
+**cuDF is verified end to end.** `t4_run3.json` records a real group-by
+(613.8 ms) and a real filter (80.1 ms) on the device, both agreeing with
+every CPU engine on the same data. `polars_gpu` does not: Polars' own GPU
+backend rejects the grouped plan, so that engine declines with a recorded
+reason and the executor falls back.
+
+**The GPU lost, twice.** cuDF took 364 ms and 613.8 ms against DuckDB's
+53.7 ms and 293.6 ms on 2M rows / 512 groups. This is the specification's
+counter-example measured rather than asserted: 2M x 2 columns is about
+32 MB, and PCIe transfer dominates a group-by that small. A GPU wins only
+when the compute is large enough to hide the move.
+
+**Read section 5 of any run with care.** A Colab T4 is a shared VM, and
+the run-to-run spread is large - DuckDB's group-by was 53.7 ms in one run
+and 293.6 ms in the next, a 5.5x swing on identical code and data. One
+measurement is an anecdote. The *direction* is stable across runs (the GPU
+loses by 2-7x on this workload); the individual numbers are not. Do not
+quote a figure from a single run as if it were a benchmark.
+
+**What a T4 cannot settle.** Compute capability 7.5: no bfloat16, FP64 at
+1/64 of FP32. A workload that wins on a T4 can lose on an A100. And one
+GPU is one data point - the cost model is not calibrated, and calibration
+needs several machines.

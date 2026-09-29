@@ -1,0 +1,3 @@
+bd0ec5d T4 run 2: cuDF executes on the GPU, and LOSES to DuckDB
+To https://github.com/faizansk25/AAR.git
+   ba18c96..bd0ec5d  main -> main

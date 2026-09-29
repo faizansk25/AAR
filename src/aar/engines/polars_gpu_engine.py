@@ -68,6 +68,15 @@ class PolarsGPUEngine(Engine):
 
         The single crossing point: everything before it is host-side lazy
         planning, everything after is a device-resident result.
+
+        A backend that rejects the plan is reported as a decline, not as a
+        crash. The third T4 run hit ``DuplicateError: column with name 'v'
+        has more than one occurrence`` from Polars' own GPU backend during
+        plan resolution - a backend limitation, not a bug in this engine and
+        not something guessable from the source. Raising ``NotImplementedError``
+        turns it into a recorded degradation and a fallback, which is the
+        honest outcome: cuDF is the working GPU path on this stack, and
+        pretending otherwise would file CPU timings under a GPU name.
         """
         api = self.collect_api or _find_collect(self._pl)
         if api is None:
@@ -75,7 +84,17 @@ class PolarsGPUEngine(Engine):
                 f"{self.id}: this Polars build accepts no known GPU collect "
                 f"API, so the data cannot reach the device")
         self.device_collects += 1
-        return _apply_collect(api, frame)
+        try:
+            return _apply_collect(api, frame)
+        except NotImplementedError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise NotImplementedError(
+                f"{self.id}: the Polars GPU backend "
+                f"({getattr(self._pl, '__version__', '?')}, collect via "
+                f"{api}) rejected this operation: "
+                f"{type(exc).__name__}: {str(exc)[:200]}. Use cudf for GPU "
+                f"execution, or let the executor fall back.") from exc
 
     def _to_table(self, collected: Any, source: Table | None = None) -> Table:
         out = Table(collected.to_arrow())
