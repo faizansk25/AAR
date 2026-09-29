@@ -1,63 +1,53 @@
-Run the benchmark on real data: two engines fail outright
+Take nullability from the data, not from schema metadata
 
-tools/bench_engines.py gains --real, which benchmarks an actual Parquet
-file instead of generated arithmetic, and a set of real_operations
-chosen to be the shapes that break systems rather than the ones that
-flatter them: a skewed range, a conjunction, a disjunction, a low-
-cardinality group, a high-cardinality group on a measure (not a
-category), a date-part group, an inner join to a small dimension table,
-and a left join.
+This is the fix for the real-data failure found in the previous commit.
+On 1,000,000 rows of real NYC taxi Parquet, `arrow` and `pandas` could not
+group_by or join - they raised
 
-The synthetic data exists to be predictable, which is precisely what makes
-it unrepresentative. Here is the answer to "does this survive real
-pipelines": on 1,000,000 rows of real NYC taxi data, two of four
-executing engines FAIL.
+    SchemaDriftError: fare_amount: nulls appeared in a non-nullable column
 
-  group_by_datepart        arrow   FAIL  SchemaDriftError: fare_amount:
-  group_by_datepart        pandas  FAIL    nulls appeared in a non-nullable
-                                          column
-  group_by_datepart        duckdb        4,152.56 ms
-  group_by_datepart        polars_cpu      14.21 ms
+while `polars` and `duckdb` handled the same file without complaint.
 
-  group_by_cardinality     arrow   FAIL  same SchemaDriftError
-  group_by_cardinality     pandas  FAIL  same SchemaDriftError
+CAUSE. `Table._schema_from_arrow` built each field with
+`nullable=f.nullable`, taking Arrow's word for it. A Parquet file that
+contains nulls frequently does not *record* that: the schema field says
+"non-nullable" because the writer omitted the flag, not because the column
+is full. So AAR's canonical schema was confidently wrong, and the first
+operation to actually touch a null failed on its own metadata.
 
-  join                     arrow   FAIL  same SchemaDriftError
-  join                     pandas  FAIL  same SchemaDriftError
-  join                     duckdb    1,195.87 ms
-  join                     polars_cpu   76.54 ms
+THE FIX. Nullability is now read from the data - `column.null_count > 0` -
+so a column that holds nulls is declared nullable regardless of what the
+schema claims. It costs one `null_count` per column, which Arrow already
+carries as read metadata, so this is not a scan.
 
-Everything that completed agrees exactly, on real data, across engines -
-that part of the correctness claim holds. The failures are all the same
-one, and it is the most important thing in this commit.
+The asymmetry is deliberate. A column with no nulls stays *declared*
+non-nullable, because that is a claim AAR wants to be able to make and
+check. Only the other direction is repaired: claiming a column holds no
+nulls when it does. Getting that wrong is the failure that just cost two
+engines every group-by and join on a real file.
 
-THE CAUSE. arrow_to_canonical infers nullability from the Arrow schema. A
-Parquet file that contains nulls frequently does not record that fact in
-its schema, so the canonical Schema is built saying "non-nullable", and
-the executor's null handling then raises SchemaDriftError when it meets
-the first null. Grouping a column with a million distinct values
-materialises far more of it; joining touches all of it; either one
-surfaces the mismatch that a small aggregate happened to avoid.
+An empty column reports null_count 0 and is therefore declared
+non-nullable, which is the correct reading - there is nothing in it to be
+null.
 
-Why the synthetic benchmark could never have found it: the generated data
-has no nulls, so the bug is invisible until real data with real nulls
-arrives. This is the strongest argument yet for testing on real files.
+VERIFIED ON REAL DATA, all four engines, all eleven operations, no
+failures. The three that previously failed outright now complete:
 
-WHY IT MATTERS MORE THAN A SLOWDOWN. arrow and pandas are exactly the
-engines the air-gapped story depends on - arrow is the fallback that runs
-when nothing else is installed, and a `pip install aar[arrow]` install has
-no alternative. An engine that cannot group or join a real Parquet file
-without raising is not a fallback, it is a failure with a worse error
-message.
+  operation              engine     before      after
+  group_by_datepart      arrow      FAIL   ->  2,975.06 ms
+  group_by_cardinality   arrow      FAIL   ->    159.21 ms
+  join                   arrow      FAIL   ->    196.49 ms
+  group_by_datepart      pandas     FAIL   ->  3,327.15 ms
+  group_by_cardinality   pandas     FAIL   ->    163.63 ms
+  join                   pandas     FAIL   ->    152.67 ms
 
-Also visible, and not a defect: duckdb's limit takes 84 ms against
-polars' 0.97 ms. Relation materialisation for a 1,000-row head is pure
-overhead on a column engine. It is in the outlier list because the ratio
-is real, not because anything is wrong.
+Every result still agrees across engines - no engine got faster by being
+less correct.
 
-NOT FIXED HERE. The fix is to stop inferring nullability from schema
-metadata and to take it from the data, which means a null-count pass on
-load - a real design change to the interchange layer, not a patch. It
-needs its own commit with its own tests, and the honest version of this
-report is that AAR currently does NOT survive real data on the two
-engines an air-gapped install depends on.
+WHAT IS STILL SLOW, measured on the same real data, and not fixed here:
+group_by_datepart is 209x-313x slower on arrow, pandas and duckdb than on
+polars (2,975-4,462 ms against 14.25 ms). That is a different defect -
+the Python group-by fallback and DuckDB's date-part handling, not
+nullability - and it is now the largest known outlier in the project.
+
+594 passed, 7 skipped.

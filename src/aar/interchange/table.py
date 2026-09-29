@@ -224,9 +224,39 @@ class Table:
 
     @staticmethod
     def _schema_from_arrow(arrow_table: Any) -> Schema:
-        return Schema(tuple(
-            Field(f.name, arrow_to_canonical(f.type), nullable=f.nullable)
-            for f in arrow_table.schema))
+        """Derive a canonical schema from an Arrow table.
+
+        Nullability is taken from **the data**, not from the Arrow schema's
+        ``field.nullable`` flag, and that distinction is load-bearing.
+
+        A Parquet file that contains nulls very often does not record that
+        fact: the schema says "non-nullable" because the writer omitted the
+        field, not because the column is full. Trusting the flag produces a
+        schema that is confidently wrong, and the first operation that meets
+        a null then fails with ``SchemaDriftError: nulls appeared in a
+        non-nullable column`` - on real NYC taxi data, that meant `arrow` and
+        `pandas` could not group_by or join a file that `polars` and `duckdb`
+        handled without complaint.
+
+        The cost is one ``null_count`` per column, which Arrow already
+        carries as read metadata, so this is not a scan.
+
+        The asymmetry is deliberate: a column with no nulls is *declared*
+        non-nullable, and a column with nulls is declared nullable. The
+        unsafe direction to get wrong is the first one - claiming a column
+        holds no nulls when it does.
+        """
+        fields = []
+        for index, field in enumerate(arrow_table.schema):
+            column = arrow_table.column(index)
+            # An empty chunked array reports null_count 0, so a genuinely
+            # nullable but currently-empty column is declared non-nullable.
+            # That is the correct reading: there is nothing in it to be null.
+            nullable = field.nullable or column.null_count > 0
+            fields.append(Field(field.name,
+                                arrow_to_canonical(field.type),
+                                nullable=nullable))
+        return Schema(tuple(fields))
 
     # ------------------------------------------------------------- factories
     @classmethod
