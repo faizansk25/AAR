@@ -63,7 +63,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_explain = sub.add_parser(
         "explain", help="plan a pipeline file and print the decision trace")
-    p_explain.add_argument("pipeline", help="path to a Python pipeline file")
+    # The specification writes this as `aar explain plan pipeline.py`; the
+    # printed hint has always said `aar explain pipeline.py`. Both have to
+    # work. Two `nargs="?"` positionals do not do this - argparse fills them
+    # left to right, so `plan` becomes the path and the path lands on the
+    # second slot, which then rejects it. One positional plus a prefix strip
+    # is the shape that actually accepts both.
+    p_explain.add_argument(
+        "target", nargs="?", default=None, metavar="[plan] PIPELINE",
+        help="path to a Python pipeline file, optionally preceded by the "
+             "word 'plan' (aar explain plan pipeline.py)")
+    # The leftover words. `aar explain plan x.py` puts "plan" in `target` and
+    # "x.py" here; `aar explain x.py` leaves this empty. Collected rather than
+    # declared as a second single positional with `choices`, because argparse
+    # fills positionals left to right and that is what broke the documented
+    # spelling in the first place.
+    p_explain.add_argument("rest", nargs="*", default=[], metavar="",
+                           help=argparse.SUPPRESS)
     p_explain.add_argument("--json", action="store_true",
                            help="emit JSON instead of text")
 
@@ -333,7 +349,21 @@ def _cmd_explain(args: argparse.Namespace) -> int:
     """Plan a pipeline file and print why each engine was chosen."""
     import json
 
-    _root, plan = _plan_for(args.pipeline)
+    path = args.target
+    if path == "plan":
+        # The specification's spelling is `aar explain plan pipeline.py`.
+        # argparse delivers the words positionally, so the leading `plan`
+        # and the path arrive separately and `rest` holds the path.
+        path = args.rest[0] if args.rest else None
+    elif path is None and args.rest:
+        path = args.rest[0]
+    if path is None:
+        print("aar explain: needs a pipeline file.\n"
+              "  aar explain plan pipeline.py   # as the specification writes it\n"
+              "  aar explain pipeline.py        # the same thing",
+              file=sys.stderr)
+        return _EXIT_USER_ERROR
+    _root, plan = _plan_for(path)
 
     if args.json:
         print(json.dumps({

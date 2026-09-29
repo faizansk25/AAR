@@ -224,9 +224,30 @@ class SegmentPlan:
                 f"{e}={t * 1e3:.1f}ms" for e, t in self.candidates[:4])
         inbound = (f" | inbound {self.inbound_s * 1e3:.1f}ms"
                    if self.inbound_s > 0 else "")
-        return (f"{self.segment.describe()}\n"
+        # The device shown is the one the chosen engine actually runs on,
+        # not the segment's affinity. Printing the affinity produced lines
+        # like `segment 1 [gpu] GroupBy -> arrow`, where `arrow` is a CPU
+        # engine: an analyst reading that concludes a GPU decision was made
+        # and then not made. The specification is explicit that the system
+        # should "proudly say CPU selected when that is optimal", so the
+        # outcome is the thing to print.
+        #
+        # When the outcome contradicts the preference, say so. "we wanted
+        # the GPU and took the CPU" is a real, useful decision, and the
+        # reason line already explains it - but only if the mismatch is
+        # visible in the first place.
+        preferred = self.segment.device
+        note = ""
+        if preferred is not self.device:
+            note = (f"  (preferred {preferred}, "
+                    f"chose {self.device} on cost)")
+        return (f"{self.segment.describe()}{note}\n"
                 f"    -> {self.engine}  {self.cost.render()}{inbound}{arrows}\n"
                 f"       {self.reason}")
+
+    def describe_ops(self) -> str:
+        """The operator names, for the trace and the explain panel."""
+        return " -> ".join(self.segment.op_types)
 
 
 @dataclass(slots=True)

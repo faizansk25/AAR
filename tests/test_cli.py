@@ -57,6 +57,29 @@ class TestParser:
         assert main([]) == 2
         assert "usage" in capsys.readouterr().out.lower()
 
+    def test_explain_accepts_the_specifications_spelling(self, tmp_path):
+        """`aar explain plan pipeline.py` is how the specification writes it.
+
+        The CLI only ever accepted `aar explain pipeline.py`, so the command
+        in the specification failed with a confusing "no such file: plan" -
+        a documented command that does not run is worse than an undocumented
+        one. Two `nargs="?"` positionals do not fix it either: argparse fills
+        them left to right, so `plan` becomes the path and the real path
+        lands in a slot that rejects it. Both spellings must work.
+        """
+        target = tmp_path / "hello.py"
+        assert main(["examples", "--write", "hello", str(target)]) == 0
+        assert main(["explain", "plan", str(target)]) == 0, (
+            "aar explain plan <file> is the documented spelling")
+        assert main(["explain", str(target)]) == 0, (
+            "aar explain <file> is the spelling the printed hint uses")
+
+    def test_explain_with_no_file_says_both_spellings(self, capsys):
+        assert main(["explain"]) != 0
+        err = capsys.readouterr().err
+        assert "explain plan" in err, err
+        assert "explain pipeline.py" in err, err
+
     def test_every_subcommand_has_a_real_handler(self):
         """No command may exist without something real behind it."""
         from aar.cli import _COMMANDS
