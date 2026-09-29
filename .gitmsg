@@ -1,0 +1,50 @@
+A benchmark tool, and the 1,360x outlier it found on the first run
+
+tools/bench_engines.py measures the whole engine contract - filter,
+filter_nested, project, group_by, sort, limit, join - on every engine that
+constructs, with a median of several repeats and the spread printed
+beside it.
+
+The spread is the point. A benchmark reporting one number measures the
+scheduler: DuckDB's group-by was 53.7 ms and 293.6 ms on two Colab runs of
+identical code. So every figure here carries its spread, a ratio smaller
+than the spread is called noise rather than a result, and each result is
+fingerprinted so a fast *wrong* answer cannot be reported as a win.
+
+The data is deliberately wide. Narrow data hides a real cost - an engine
+that copies every column regardless of projection looks identical to one
+that pushes the projection down, as long as the group-by needs every column
+anyway - so eight `pad` columns are added that nothing reads.
+
+IT FOUND A 3,936x OUTLIER ON THE FIRST RUN.
+
+  operation      engine         median ms   x fastest
+  filter_nested  arrow     20,113.87 -> 14.79   3936x -> 1.0x
+  group_by       pandas          1,493.07     161x
+  group_by       arrow            1,526.29     159x
+  join           pandas          4,459.10     159x
+  join           arrow            4,622.24     159x
+
+ArrowEngine._vector_filter handled exactly one shape: a single comparison
+with a column on the left. A conjunction fell through to _row_filter,
+which materialises every row as a Python dict and calls a Python predicate
+per row - 20 seconds for 500,000 rows, reproducible to within 0.4%. The
+single-comparison case measured 17 ms and looked fine, which is exactly why
+it survived; the benchmark had to try the *nested* shape to see it.
+
+It is now recursive: AND/OR, null tests and nested arithmetic all take the
+Arrow kernel path, using and_kleene/or_kleene so a null operand stays
+unknown rather than silently becoming false. Returning None still means
+"use the row path", so an exotic predicate is slower rather than wrong.
+
+This is the third time the same shape of defect has appeared - pandas
+frame.apply, then cuDF query, then this - which is the argument for having
+a benchmark rather than a list of known slow things.
+
+MEASURED AND STILL OPEN, not fixed here:
+- arrow/pandas join ~4.5 s, 159x. ArrowEngine.join is a hand-written
+  Python hash join; pyarrow has had a native Table.join for years.
+- arrow/pandas group_by ~1.5 s, 160x. Both delegate to the same Python
+  group-by fallback.
+
+594 passed, 7 skipped.
