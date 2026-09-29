@@ -21,6 +21,39 @@ proudly say "CPU selected" or "PostgreSQL selected" when that is optimal.
 
 ---
 
+## Implemented ≠ installed
+
+This distinction has caused a capable external reviewer to conclude that two of
+AAR's headline capabilities do not exist, so it is stated explicitly rather
+than left for a reader to infer from `aar engines` output.
+
+| Engine | Class written? | On this machine? |
+|---|---|---|
+| Arrow | ✅ | ✅ |
+| DuckDB | ✅ | ✅ |
+| Polars (CPU) | ✅ | ✅ |
+| pandas | ✅ | ✅ |
+| Python UDF worker | ✅ | ✅ |
+| Excel (read + write) | ✅ | ✅ |
+| **cuDF (GPU)** | ✅ `engines/cudf_engine.py` | ❌ cudf not installed |
+| **Polars GPU** | ✅ `engines/polars_gpu_engine.py` | ❌ cudf not installed |
+
+`aar engines` printing `[no] cudf  cudf is not installed` means **this
+laptop has no GPU stack**, not that AAR cannot execute on one. Both GPU
+engines are registered in `ENGINE_FACTORIES`, are constructed and exercised by
+`tests/test_gpu_engines.py`, and have been verified end-to-end on a T4
+(`data/gpu/`). A plan may therefore legitimately *choose* a GPU engine; on a
+machine without cuDF it degrades to CPU and records that it did.
+
+Declared in the capability catalogue but **not** implemented — so the planner
+refuses to name them rather than quietly substituting: Ray, Dask,
+Spark RAPIDS, Trino, MongoDB engine, and the MySQL/PostgreSQL *engines*
+(the SQL **connectors** for SQLite are real and tested against a real
+database).
+
+
+---
+
 ## Principles this codebase actually enforces
 
 | Principle | How it is enforced |
@@ -51,7 +84,7 @@ library alone. Engines are opt-in extras:
 ## Verify
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q             # 540 tests
+.\.venv\Scripts\python.exe -m pytest -q             # 622 tests
 .\.venv\Scripts\python.exe tools\check_syntax.py    # parse every module
 .\.venv\Scripts\python.exe tools\smoke_run.py       # build a plan, run it, check the numbers
 .\.venv\Scripts\python.exe tools\manual_test.py     # guided tour, by hand
@@ -71,11 +104,32 @@ python tools\audit.py          # writes data/audit/audit.txt
 
 ```powershell
 # `explain` plans only. It never opens your data, so it works with no file present.
+# Both spellings work; the specification writes it with `plan`.
 aar explain pipelines\example_orders.py
+aar explain plan pipelines\example_orders.py
 
 # `run` needs real data. Generate the sample workbook, then execute.
 python tools\make_sample_data.py
 aar run pipelines\example_orders.py
+
+# `examples` is the fastest way in: list the bundled pipelines, print one,
+# or write a copy you can edit. The examples are embedded in the package,
+# so this works on an air-gapped machine.
+aar examples
+aar examples --show hello
+aar examples --write hello my_pipeline.py
+
+# `workbench` opens the local Analyst Workbench. Standard library only.
+aar workbench --open
+
+# `doctor` profiles this machine, `engines` lists what is installed,
+# `calibrate` measures real operation costs, `policy` inspects a policy
+# file, and `version` reports the optional-dependency status.
+aar doctor
+aar engines
+aar calibrate --quick
+aar policy show policy.json
+aar version
 ```
 
 ```

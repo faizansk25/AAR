@@ -57,6 +57,59 @@ class TestParser:
         assert main([]) == 2
         assert "usage" in capsys.readouterr().out.lower()
 
+    def test_the_readme_test_count_is_the_real_one(self, capsys):
+        """A wrong number in the README is how an external reviewer goes wrong.
+
+        The README said "540 tests" for a long time after the suite passed
+        600+. Nobody noticed, and the number is the first thing a reader
+        checks - it is the cheapest possible credibility test to run. So it
+        is asserted rather than trusted.
+        """
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8")
+        import os
+        import re
+        import subprocess
+        import sys
+
+        claimed = re.search(r"pytest -q\s+#\s*([\d,]+) tests", readme)
+        assert claimed, "README no longer states a test count"
+        total = int(claimed.group(1).replace(",", ""))
+
+        # `sys.executable -m pytest`, not a bare "pytest": on Windows the
+        # console script is not on PATH for a subprocess launched this way,
+        # and a FileNotFoundError here would be a confusing failure rather
+        # than the honest "the count is wrong".
+        # Count the collected node ids rather than parsing a summary line.
+        # pyproject's addopts already passes `-q`; adding another makes it
+        # `-qq`, which suppresses "N tests collected" entirely - so a test
+        # that parses the summary silently stops guarding anything. Node ids
+        # are printed at every verbosity, so this cannot go quiet.
+        proc = subprocess.run(
+            [sys.executable, "-m", "pytest", "--collect-only",
+             "-p", "no:cacheprovider"],
+            capture_output=True, text=True, timeout=900,
+            env={**os.environ, "PYTEST_ADDOPTS": ""},
+            cwd=str(Path(__file__).resolve().parents[1]))
+        node = re.compile(r"^tests[/\\].*::[^\s]+$", re.MULTILINE)
+        collected = len(node.findall(proc.stdout))
+        if not collected:
+            pytest.skip(f"could not count collected tests: {proc.stdout[-300:]}")
+        assert total == collected, (
+            f"README claims {total} tests; pytest collected {collected}. "
+            "Fix the README - a stale count is the cheapest way to lose a "
+            "reader's trust.")
+
+    def test_the_readme_lists_every_subcommand(self):
+        """A command that exists but is undocumented is a command nobody finds."""
+        from aar.cli import _COMMANDS
+
+        readme = (Path(__file__).resolve().parents[1] / "README.md").read_text(
+            encoding="utf-8")
+        for name in _COMMANDS:
+            assert f"aar {name}" in readme, (
+                f"`aar {name}` exists but the README never mentions it")
+
     def test_explain_accepts_the_specifications_spelling(self, tmp_path):
         """`aar explain plan pipeline.py` is how the specification writes it.
 
