@@ -313,36 +313,69 @@ def write_excel(table: Table, path: str, sheet: str | None = None,
     if parent:
         os.makedirs(parent, exist_ok=True)
 
+    # A workbook we just created is empty by construction. Probing it is not
+    # free: `ws.cell(row=1, column=1)` *materialises* that cell, which
+    # advances openpyxl's append cursor and pushes the header to row 2,
+    # leaving a blank line above it. Readers then take the first non-empty
+    # row as the header and mis-infer every type after it.
     if mode == "append" and os.path.exists(path):
         wb = openpyxl.load_workbook(path)
         ws = wb[sheet] if sheet and sheet in wb.sheetnames else wb.active
+        has_content = _sheet_has_content(ws)
+        created = False
     else:
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = sheet or "Sheet1"
+        has_content = False
+        created = True
 
-    if _sheet_has_content(ws):
-        # The sheet already holds a block: put the new one below it.
-        start = ws.max_row + 2
+    # Column-major, not row-major. `to_pylist()` builds one dict per row -
+    # 1,000,000 dicts of 19 entries, roughly 19 million objects - while
+    # `to_pydict()` builds one list per column. Same values, a fraction of
+    # the allocation, and it is the shape `zip` wants.
+    columns = table.arrow.to_pydict()
+    names = list(table.column_names)
+    rows: Any = zip(*(columns.get(n, []) for n in names))
+
+    if created or not has_content:
+        # The fast path: one call per row, not one per cell. `ws.cell()` is
+        # openpyxl's general-purpose accessor and is orders of magnitude
+        # slower than `append`, the single-purpose "write this row" call.
+        # Only taken when this code owns the sheet and has written nothing
+        # to it, so `append`'s implicit cursor is known to start at row 1.
+        ws.append(list(table.column_names))
+        for row in rows:
+            ws.append([_excel_value(v) for v in row])
     else:
+        # Appending below an existing block. `append` would land on
+        # max_row + 1 and close the blank line the format calls for, and
+        # the loaded sheet's cursor position is not public API, so the
+        # cursor is kept explicitly. This is the rarer path, the blocks are
+        # usually small, and correctness of the layout is worth more here
+        # than the row API.
+        start = ws.max_row + 2
         for c, name in enumerate(table.column_names, start=1):
-            ws.cell(row=1, column=c, value=name)
-        # Data starts *below* the header. Starting at 1 here writes the
-        # header and then immediately overwrites it with the first record,
-        # producing a file whose first row is data with no column names.
-        start = 2
-
-    row_cursor = start
-
-    for record in table.arrow.to_pylist():
-        for c, name in enumerate(table.column_names, start=1):
-            value = record.get(name)
-            if isinstance(value, (dict, list)):
-                value = str(value)
-            ws.cell(row=row_cursor, column=c, value=value)
-        row_cursor += 1
+            ws.cell(row=start, column=c, value=name)
+        cursor = start + 1
+        for row in rows:
+            for c, value in enumerate(row, start=1):
+                ws.cell(row=cursor, column=c, value=_excel_value(value))
+            cursor += 1
 
     wb.save(path)
     return table.num_rows
 
-    return openpyxl
+
+def _excel_value(value: Any) -> Any:
+    """Coerce a Python value into something a cell can hold.
+
+    openpyxl refuses a dict or a list, and the alternative is to let the
+    save fail several thousand rows in with a truncated file on disk.
+    Structurals are stringified, which is lossy but visible; everything
+    else passes through so openpyxl rejects it at the boundary, where the
+    traceback names the column.
+    """
+    if isinstance(value, (dict, list, tuple, set)):
+        return str(value)
+    return value
