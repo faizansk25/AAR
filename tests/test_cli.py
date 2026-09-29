@@ -173,16 +173,21 @@ class TestNoSilentLint:
             pytest.skip("ruff not installed (pip install ruff)")
 
         root = Path(__file__).resolve().parents[1]
+        # No --select: the rule set lives in pyproject.toml under
+        # [tool.ruff.lint], with a written justification for each rule, so
+        # this test and a developer running ruff by hand cannot disagree.
         proc = subprocess.run(
-            [ruff, "check", "--select", self.RULES, "--no-cache",
-             "--statistics", "src", "tests"],
+            [ruff, "check", "--no-cache", "--statistics", "src", "tests"],
             cwd=root, capture_output=True, text=True, timeout=300)
         # ruff exits 1 when it finds anything; 0 when clean. Anything else is
-        # a tool failure, which should not be reported as a clean run.
-        assert proc.returncode in (0, 1), proc.stderr[-2000:]
+        # a tool failure (a malformed pyproject.toml, say) which must not be
+        # mistaken for a clean run - that mistake is what let a real
+        # TypeError ship to five failing tests once already.
+        assert proc.returncode in (0, 1), (
+            f"ruff could not run (exit {proc.returncode}):\n{proc.stderr[-2000:]}")
         assert proc.returncode == 0, (
-            "lint findings - run `ruff check --select "
-            f"{self.RULES} --fix src tests`:\n{proc.stdout}")
+            "lint findings - run `ruff check --fix src tests`:\n"
+            f"{proc.stdout}")
 
     def test_no_unreachable_code(self):
         import shutil

@@ -365,16 +365,20 @@ class Executor:
         descriptions = dict(node.descriptions or {})
 
         fields = []
-        for field in table.schema.fields:
-            if field.name in columns:
-                new = field.with_classification(*tags)
-                note = descriptions.get(field.name)
+        # Named `schema_field`, not `field`: `dataclasses.field` is imported at
+        # module scope in this file, and a loop variable of the same name
+        # would shadow it for the rest of the function. Harmless today,
+        # misleading tomorrow.
+        for schema_field in table.schema.fields:
+            if schema_field.name in columns:
+                new = schema_field.with_classification(*tags)
+                note = descriptions.get(schema_field.name)
                 if note:
                     new = Field(new.name, new.type, new.nullable,
                                 new.classification, note, new.lineage)
                 fields.append(new)
             else:
-                fields.append(field)
+                fields.append(schema_field)
         return table.with_schema(Schema(tuple(fields)))
 
 

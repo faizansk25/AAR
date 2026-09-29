@@ -187,7 +187,7 @@ class MongoConnector:
             pushed = True
         else:
             match = render_match(node.predicate)
-            projection = {c: 1 for c in spec.columns} or None
+            projection = dict.fromkeys(spec.columns, 1) or None
             cursor = collection.find(filter=match or {},
                                      projection=projection)
             if match:
@@ -226,7 +226,7 @@ class MongoConnector:
         else:
             parts.append("{}")
         if spec.columns:
-            parts.append(f"projection={ {c: 1 for c in spec.columns} !r}")
+            parts.append(f"projection={ dict.fromkeys(spec.columns, 1) !r}")
         parts.append(")")
         return "".join(parts)
 

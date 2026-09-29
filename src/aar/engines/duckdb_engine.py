@@ -250,7 +250,7 @@ class DuckDBEngine(Engine):
                 rel_l.sql(
                     f'SELECT {cols} FROM {_quote_ident(rel_l.name)} l '
                     f'{how_sql} JOIN {_quote_ident(rel_r.name)} r ON {on}'),
-                source=left, derived={n: both for n in out_names})
+                source=left, derived=dict.fromkeys(out_names, both))
         finally:
             rel_l.release()
             rel_r.release()

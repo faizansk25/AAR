@@ -56,6 +56,14 @@ class LineageEvent:
 
     __slots__ = ("output", "sources", "rule", "justification")
 
+    # Defining `__eq__` without this sets `__hash__ = None`, which makes the
+    # class unhashable. Nothing hashes an event yet, so nothing is broken
+    # today - but it is a value object by design, and "compare by content"
+    # and "cannot go in a set" are not obviously related to a reader. `Col`
+    # defines `__hash__` for the same reason.
+    def __hash__(self) -> int:
+        return hash((self.output, self.sources, self.rule, self.justification))
+
     def __init__(self, output: str, sources: Sequence[str], rule: str,
                  justification: str = "") -> None:
         self.output = output

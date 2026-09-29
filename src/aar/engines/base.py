@@ -19,6 +19,7 @@ Two rules make this work and both are load-bearing:
 from __future__ import annotations
 
 import abc
+import math
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
@@ -84,8 +85,15 @@ class Engine(abc.ABC):
     def supports(self, op: str) -> bool:
         return self._capabilities.can(op)
 
-    def close(self) -> None:
-        """Release long-lived resources. Must be idempotent."""
+    def close(self) -> None:  # noqa: B027 - deliberately not abstract
+        """Release long-lived resources. Must be idempotent.
+
+        Intentionally an empty concrete method rather than an abstract one:
+        most engines have nothing to release (Arrow and pandas hold no
+        connection), and making it abstract would force eight no-op
+        overrides to express "nothing to do". An engine that *does* hold a
+        resource - DuckDB's connection - overrides it.
+        """
 
     def __enter__(self) -> "Engine":
         return self
@@ -145,7 +153,10 @@ def _is_null(value: Any) -> bool:
     """
     if value is None:
         return True
-    return isinstance(value, float) and value != value
+    # `math.isnan` rather than the `value != value` idiom. Both are the same
+    # test; one of them explains itself to the next reader and does not look
+    # like a typo. Guarded by the isinstance check, so it cannot raise.
+    return isinstance(value, float) and math.isnan(value)
 
 
 def _is_null_literal(expr: Any) -> bool:

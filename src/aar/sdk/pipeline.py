@@ -298,12 +298,12 @@ def sort(input_node: Node, *keys: str, descending: bool = False,
          estimated_bytes: int | None = None) -> Node:
     """Sort. Pass ``key='col desc'`` style names for direction."""
     parsed: list[tuple[str, bool]] = []
-    for k in keys:
-        k = k.strip()
-        if k.lower().endswith(" desc"):
-            parsed.append((k[: -len(" desc")].strip(), False))
+    for raw in keys:
+        key = raw.strip()
+        if key.lower().endswith(" desc"):
+            parsed.append((key[: -len(" desc")].strip(), False))
         else:
-            parsed.append((k.removesuffix(" asc").strip(), True))
+            parsed.append((key.removesuffix(" asc").strip(), True))
     n = Node(NodeType.SORT, inputs=[input_node], sort_keys=tuple(parsed))
     n.estimated_bytes = estimated_bytes
     return _inherit(input_node, n)

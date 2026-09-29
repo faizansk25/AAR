@@ -25,7 +25,7 @@ __all__ = [
     "AARError", "CapabilityError", "SchemaDriftError", "TypeMismatchError",
     "PrivacyViolation", "QualityCheckFailed", "ResourceExhausted",
     "SourceUnavailable", "PolicyDenied", "UDFExecutionError",
-    "Degradation", "DegradationLedger", "register_modes", "MODES",
+    "Degradation", "DegradationLedger", "register_modes",
 ]
 
 

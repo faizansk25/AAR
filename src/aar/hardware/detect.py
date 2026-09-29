@@ -502,6 +502,14 @@ def _run_hidden(cmd: list[str], timeout: int = 8) -> str | None:
     if key in _RUN_CACHE:
         return _RUN_CACHE[key]
     try:
+        # `check=False` is explicit and belongs in the dict here rather than at
+        # the `subprocess.run` call: a probe that exits non-zero means "this
+        # tool is not usable here", which is a fact about the machine and not
+        # an error worth propagating. The except clause turns a missing tool
+        # into None and the caller reports it as unavailability.
+        # (ruff's PLW1510 flags the call site because it cannot see a value
+        # passed through a `**kwargs` dict - adding `check=False` there as
+        # well is a TypeError, not a fix.)
         kwargs: dict[str, Any] = {
             "capture_output": True, "text": True, "timeout": timeout,
             "check": False,

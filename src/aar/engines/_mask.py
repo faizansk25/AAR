@@ -120,7 +120,7 @@ def _null_test(frame: Any, expr: Any, negate: bool) -> Any:
     right_null = _is_null_literal(expr.right)
     if left_null == right_null:
         raise NotImplementedError(
-            f"IS/IS NOT is only defined against NULL, not against a value")
+            "IS/IS NOT is only defined against NULL, not against a value")
     target = expr.right if left_null else expr.left
     value = to_value(frame, target)
     return value.notnull() if negate else value.isnull()

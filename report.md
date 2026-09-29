@@ -177,6 +177,78 @@ installed. This is the third gate alongside `pytest` and
 `verify_release.py` — and it is the first one that can catch a defect in
 code that *no execution path on this machine reaches*.
 
+### Round 13 — logic-bug lint, and a linter-induced regression
+
+Widened `ruff` from the five pyflakes rules to the full logic-bug set
+(`B` bugbear, `RET`, `SIM`, `PLW`, `C4`, `PIE`). Starting state: **381
+findings**. Ending state: **0**, with every exclusion carrying a written
+reason in `pyproject.toml` rather than a bare ignore code.
+
+#### The real defects
+
+| finding | where | what it was |
+|---|---|---|
+| `F822` undefined export | `failures/registry.py` | `__all__` listed `MODES`, which does not exist (the name is private `_MODES`; the public accessor is `register_modes()`). `from aar.failures.registry import *` would have raised `AttributeError` |
+| `PLW1641` eq without hash | `lineage/taint.py` | `LineageEvent` defines `__eq__` and not `__hash__`, which Python turns into `__hash__ = None` — the class is unhashable. Nothing hashes it today, but it is a value object by design and `Col` defines `__hash__` for the same reason |
+| `SIM115` unclosed file | `tests/test_hardware.py` | `json.loads(open(path).read())` leaked a handle; on Windows an unclosed handle keeps the file locked, which is a latent flake |
+| `F402` shadowed import | `policy.py`, `executor.py` | a loop variable named `field` shadowed `dataclasses.field` for the rest of the function |
+| `PLR0124` self-comparison | `engines/base.py` | the NaN test `value != value`, which is correct and cryptic; now `math.isnan(value)` |
+| `C416`, `PLW2901`, `SIM108`, `SIM118` | 4 sites | mechanical |
+
+#### A regression the linter caused, and the fix for the gate
+
+`PLW1510` ("`subprocess.run` without explicit `check`") is a **false
+positive** here: `check=False` was already explicit, inside the `**kwargs`
+dict, which ruff cannot see through. "Fixing" it by adding `check=False` at
+the call site produced **`TypeError: subprocess.run() got multiple values for
+keyword argument 'check'`** and broke five tests in `TestProbes`.
+
+That is worth recording twice over. First, the honest reason to keep a
+linter is that it finds things humans miss — and the reason to keep a
+human in the loop is that a confident, well-formatted finding can still be
+wrong, and acting on it blindly breaks working code. `PLW1510` is now
+globally ignored with that reason written down, and `detect.py` carries a
+comment at the call site so the next person does not re-add it.
+
+Second, the lint gate itself had a hole: it asserted `returncode in (0, 1)`
+and then `== 0`, but reported a malformed `pyproject.toml` — a genuine tool
+failure — indistinguishably from findings. It now distinguishes the two and
+names the cause. Adding `[tool.ruff]` also exposed a **pre-existing config
+bug**: `addopts` was a space-separated string where the schema requires a
+list, so `ruff` could not parse the file at all. Fixed to a proper array.
+
+#### The 20 `B023` late-binding findings, and why they are excluded
+
+All 20 are the microbenchmark closures in `hardware/calibrate.py`. They are
+**false positives**: `measure()` invokes each closure via `_time(fn)` inside
+the same loop iteration, so late binding cannot occur.
+
+But "false positive today" is not the same as "cannot go wrong", and the
+failure mode if a refactor ever deferred those calls is nasty: every
+calibration point would report the *last* input size, and the resulting cost
+curves would still look entirely plausible — the worst way for a benchmark
+to fail, and precisely the class of defect this project already retracted
+once. So rather than rewrite 20 lambdas or ignore the rule blindly:
+
+- `calibrate.py` is exempted from `B023` with the reason written down, and
+- **`test_each_calibration_point_records_its_own_size`** was added as the
+  real guard. It asserts more than one distinct input size appears across
+  the points. Late binding would collapse that to one and fail.
+
+The exclusion comment names that test, so the exemption cannot outlive the
+guard it depends on.
+
+#### What was excluded, and why
+
+Nine rule families are globally ignored with a reason each, not left as
+silent suppressions: `TID252` (relative imports keep the package
+relocatable and preserve the `aar` import-name / `aar-analytics` distribution
+split), `PLW0108`, `SIM105`, `SIM117`, `B017`, `PLW0603` (module-level
+memoisation is why the hardware probes are fast), `PLW1510`, `B007`, `B905`,
+`RET503`, `RET504`, `PIE810`, `SIM108`, `SIM118`. `PLR*` and `ARG*` are
+absent entirely — they report complexity and argument counts, which this
+codebase documents in prose instead.
+
 ---
 
 ## 2. System creation status

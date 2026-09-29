@@ -117,7 +117,7 @@ class TestTagPreservation:
         joined = engine.join(left, right, ["region"], JoinType.INNER)
         # The joined `salary` is a function of a row from *both* sides, so it
         # must inherit the union of their tags rather than either one's.
-        assert CONF <= set(joined.schema.get("salary").classification)
+        assert set(joined.schema.get("salary").classification) >= CONF
         # 3 rows each side; joining on `region` pairs NA with NA twice
         # (2 x 2 = 4 rows) and EU with EU once, so 5. Written out because
         # "however many rows came out" is not a useful assertion.

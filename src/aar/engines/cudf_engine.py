@@ -210,8 +210,7 @@ class CudfEngine(Engine):
                                     list(keys) + _other_columns(left, right,
                                                                  keys))
         out_names = list(frame.columns)
-        return self._table(frame, source=left, derived={n: both
-                                                        for n in out_names})
+        return self._table(frame, source=left, derived=dict.fromkeys(out_names, both))
 
     def udf(self, table: Table, fn: Any, mode: str = "row") -> Table:
         """A Python UDF cannot run on a GPU, by construction.
@@ -341,8 +340,8 @@ def _need(column: str | None) -> str:
     """The column a non-counting aggregate must name."""
     if column is None:
         raise NotImplementedError(
-            f"the cuDF engine needs a column here, but the aggregate has "
-            f"none; use COUNT(*) if you meant a row count")
+            "the cuDF engine needs a column here, but the aggregate has "
+            "none; use COUNT(*) if you meant a row count")
     return column
 
 

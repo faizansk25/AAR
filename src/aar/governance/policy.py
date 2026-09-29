@@ -411,11 +411,11 @@ class PolicyEngine:
                         Action.MASK, column=column, rule=f"cls.{role}",
                         reason=f"role {role!r} sees a masked {column!r}"))
 
-        for field in fields:
-            name = getattr(field, "name", None)
+        for schema_field in fields:
+            name = getattr(schema_field, "name", None)
             if not name or name in drops or name in masks:
                 continue
-            level = sensitivity_of(getattr(field, "classification", ()))
+            level = sensitivity_of(getattr(schema_field, "classification", ()))
             if level >= self.policy.mask_threshold:
                 obligations.append(Obligation(
                     Action.MASK, column=name, rule="cls.default",

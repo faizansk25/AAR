@@ -86,10 +86,128 @@ where = ["src"]
 [tool.setuptools.package-data]
 "aar.workbench" = ["static/*.html", "static/*.css", "static/*.js"]
 
+# ---------------------------------------------------------------------------
+# Lint configuration
+#
+# `ruff` and `vulture` are dev-only tools, never runtime dependencies -
+# `verify_release.py` asserts the installed wheel has zero third-party
+# packages. The rules selected here are the ones that found real defects in
+# this codebase, not a style wish-list. Each has a reason:
+#
+#   F401  unused import          91 found; mostly drift from refactors
+#   F811  redefinition            a name defined twice, later one wins
+#   F821  undefined name         found `Schema`/`Field` used in
+#                                 arrow_engine._arrow_group_by without being
+#                                 imported - a NameError that only fires on
+#                                 an Arrow build where the native kernel works
+#   F822  undefined export       found `MODES` in __all__ with no such name
+#   F841  unused variable        found two tests that asserted nothing
+#   F632  is-literal-comparison  `x is 1` compares identity to a literal
+#   B023  loop-variable closure  late binding would mean every benchmark
+#                                 measured the same size
+#   B905  zip without strict=    zip truncates silently, which hides a
+#                                 length mismatch between two columns
+#   PLR0124 comparison-with-self flagged the NaN idiom, now math.isnan
+#   PLW1641 eq-without-hash      __eq__ without __hash__ makes a value
+#                                 object unhashable
+#   F402  import shadowed        a loop variable named `field` shadowing
+#                                 dataclasses.field for the whole function
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+exclude = [".venv", "build", "dist", "data"]
+
+[tool.ruff.lint]
+select = [
+    "F",    # pyflakes: undefined names, unused imports and variables
+    "E7",   # statements that are almost always wrong
+    "E9",   # syntax and IO errors
+    "B",    # bugbear: the logic-bug rules
+    "C4",   # comprehension simplifications
+    "PIE",  # misc lints
+    "RET",  # return-statement clarity
+    "SIM",  # simplifications that do not change behaviour
+    "PLW",  # pylint warnings (not the refactor rules)
+]
+# PLR* and ARG* are deliberately absent: they report complexity and
+# argument counts, which this codebase documents in prose instead.
+ignore = [
+    # Relative imports are what keep the package relocatable; a flat
+    # absolute-import style would hard-code the distribution name into every
+    # module and break the `aar` import-name / `aar-analytics` distribution
+    # split that RELEASING.md explains.
+    "TID252",
+    # `lambda: f(x)` wrapping a bare name is slower and reads worse than
+    # passing `f`. The codebase wraps in ~17 places where the intent is
+    # "call this later, with no extra behaviour", and the wrapper documents
+    # that. Not worth 17 edits for a micro-optimisation nobody asked for.
+    "PLW0108",
+    # `contextlib.suppress` is not clearer than try/except/pass when the
+    # body is a single line, and this codebase has 16 of them.
+    "SIM105",
+    # `with a: with b:` is a nesting preference, not a defect.
+    "SIM117",
+    # `pytest.raises(Exception)` in a few tests is deliberate: the point is
+    # that *something* raises, not which type.
+    "B017",
+    # Module-level caches (`_RUN_CACHE`, `_GROUP_BY_KERNEL`) are memoisation
+    # by design and are the reason the probes are fast.
+    "PLW0603",
+    # Values passed through a `**kwargs` dict: ruff cannot see the `check`
+    # key, and adding it at the call site too is a TypeError. One of these
+    # is a real mistake this linter caused, now documented in detect.py.
+    "PLW1510",
+    # `for _ in x:` is clearer than naming an unused variable.
+    "B007",
+    # `zip()` without `strict=`: every site here zips columns of a table
+    # whose lengths are guaranteed equal by construction, and the sites that
+    # *might* differ (a join, a scan of ragged input) already check. Adding
+    # `strict=` to 18 correct call sites is churn, and `strict=False` - which
+    # is what ruff would suggest - would document the truncation as intended
+    # rather than remove it.
+    "B905",
+    # A function whose `if` branch returns and whose tail falls off the end
+    # returning None is clearer than a three-line ternary in three cases.
+    "RET503",
+    # Assigning then immediately returning is sometimes clearer than inlining.
+    "RET504",
+    # `startswith(a) or startswith(b)` vs `startswith((a, b))`: a style call.
+    "PIE810",
+    # Ternary vs if/else: the if/else here carries a four-line comment
+    # explaining why a whole-table aggregate selects instead of grouping,
+    # which a ternary would push off the end of a 160-character line.
+    "SIM108",
+    # `for key in doc.keys():` is flagged, but that loop *iterates* the keys
+    # to build an ordered column list; it is not a membership test, and
+    # `for key in doc:` would be the change ruff actually wants.
+    "SIM118",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The microbenchmark closures in this module are created and consumed inside
+# the same loop iteration - `measure()` calls `_time(fn)` before the loop
+# advances - so late binding cannot occur. Excluded rather than rewritten
+# because binding 20 lambdas by hand is churn that hides the pattern.
+# `tests/test_hardware.py::test_each_calibration_point_records_its_own_size`
+# is the real guard: if a refactor ever deferred those calls, every point
+# would report the last size and that test would fail.
+"src/aar/hardware/calibrate.py" = ["B023"]
+# Tests build fixtures with `zip` over columns of known-equal length, and a
+# `strict=` on every one adds noise without catching anything.
+"tests/*" = ["B905"]
+
+
+# ---------------------------------------------------------------------------
+# pytest
+# ---------------------------------------------------------------------------
 [tool.pytest.ini_options]
 minversion = "7.0"
 testpaths = ["tests"]
-addopts = "-q --strict-markers --durations=10"
+# A list, not a space-separated string: ruff validates pyproject.toml against
+# a schema and rejects `addopts = "..."` outright, so the two tools cannot
+# both be happy unless this is a proper array.
+addopts = ["-q", "--strict-markers", "--durations=10"]
 markers = [
   "slow: long-running calibration or large-data tests",
   "gpu: requires a CUDA GPU",

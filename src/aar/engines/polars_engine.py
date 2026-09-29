@@ -155,7 +155,7 @@ class PolarsEngine(Engine):
         out_names = list(left.column_names) + [
             c for c in right.column_names if c not in keys]
         return self._table(joined, source=left,
-                           derived={n: both for n in out_names})
+                           derived=dict.fromkeys(out_names, both))
 
     def udf(self, table: Table, fn: Any, mode: str = "row") -> Table:
         from .arrow_engine import ArrowEngine

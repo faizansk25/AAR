@@ -824,7 +824,7 @@ def _arrow_group_by(table: Table, keys: list[str],
     # `tools/probe_arrow_groupby.py`.
     if list(result.schema.names[:len(keys)]) != keys:
         result = result.rename_columns(
-            [*keys, *[n for n in result.schema.names[len(keys):]]])
+            [*keys, *result.schema.names[len(keys):]])
 
     canonical = Schema(tuple(
         Field(f.name, _from_pa(f.type), nullable=f.nullable,

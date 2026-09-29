@@ -167,7 +167,12 @@ class TestCalibrationStore:
         store = CalibrationStore(tmp_profile)
         store.add_points([CalibrationPoint("filter", "cpu", 1e6, 0.01)])
         store.save()
-        payload = json.loads(open(tmp_profile, encoding="utf-8").read())
+        # A context manager, not `open(...).read()`: the bare form leaves the
+        # handle to the garbage collector, and on Windows an unclosed handle
+        # keeps the file locked, which turns this into a flaky failure the
+        # moment anything else in the test touches `tmp_profile`.
+        with open(tmp_profile, encoding="utf-8") as fh:
+            payload = json.load(fh)
         assert "curves" in payload and "version" in payload
 
     def test_best_device_falls_back_to_cpu_without_gpu(self, tmp_profile):
@@ -189,4 +194,38 @@ class TestLiveCalibration:
             assert len(curve.points) >= 1
             assert curve.predict(1e6) >= 0
         assert CalibrationStore.load(tmp_profile, "live").is_calibrated
+
+    def test_each_calibration_point_records_its_own_size(self, tmp_profile):
+        """A point must report the size it was measured at, not the last one.
+
+        The microbenchmark closures in `calibrate.py` are defined inside a
+        loop and read a loop variable (`tbl`, `host`, `path`). They are
+        correct only because `measure()` invokes each one before the loop
+        advances. If a refactor ever collected the closures and called them
+        afterwards, Python's late binding would make every point measure the
+        *final* size - and the resulting cost curves would still look
+        plausible, which is the worst way for this to fail.
+
+        The invariant that catches it is simple: more than one distinct
+        input size must appear in the points. That is why
+        `src/aar/hardware/calibrate.py` is exempted from ruff's B023 rather
+        than rewritten - this test is the guard, not the exclusion.
+
+        Uses the CPU benchmark directly rather than a full `calibrate()` run
+        so it stays fast; the full run is covered above.
+        """
+        pytest.importorskip("pyarrow")
+        from aar.hardware.calibrate import _cpu_benchmarks
+
+        points = [p for p in _cpu_benchmarks(sizes=(1_000_000, 8_000_000),
+                                             repeats=1)
+                  if p.rows > 0]
+        if not points:
+            pytest.skip("this machine could not allocate the test frames")
+
+        sizes = {p.nbytes for p in points}
+        assert len(sizes) > 1, (
+            f"every calibration point used the same input size {sizes}; "
+            "late binding in the benchmark closures would look exactly "
+            "like this")
 
