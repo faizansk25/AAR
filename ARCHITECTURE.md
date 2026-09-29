@@ -13,9 +13,9 @@ python tools\cycle_roots.py
 
 ## Import cycles
 
-`pyan3 -C` reports **155 cycles**, which is a rotation
+`pyan3 -C` reports **157 cycles**, which is a rotation
 count, not a problem count. Grouped by member set that is
-**36 distinct module sets**:
+**37 distinct module sets**:
 
 - **6 rotations, 6 modules:** `connectors.__init__`, `connectors.mongo`, `engines.__init__`, `engines.arrow_engine`, `engines.cudf_engine`, `engines.factory`
 - **6 rotations, 6 modules:** `connectors.__init__`, `connectors.mongo`, `engines.__init__`, `engines.arrow_engine`, `engines.duckdb_engine`, `engines.factory`
@@ -52,6 +52,7 @@ count, not a problem count. Grouped by member set that is
 - **3 rotations, 3 modules:** `engines.__init__`, `engines.factory`, `engines.polars_gpu_engine`
 - **3 rotations, 3 modules:** `engines.__init__`, `engines.factory`, `engines.python_engine`
 - **2 rotations, 2 modules:** `engines.__init__`, `engines.factory`
+- **2 rotations, 2 modules:** `planner.__init__`, `planner.planner`
 - **2 rotations, 2 modules:** `workbench.__init__`, `workbench.server`
 
 ### Why they are all here anyway

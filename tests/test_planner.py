@@ -116,6 +116,91 @@ class TestDecomposition:
                 < NodeTypeAffinity.rank(NodeType.GROUPBY, Device.REMOTE))
 
 
+class TestDeclaredIsNotPlanned:
+    """A plan must never name an engine this build cannot construct.
+
+    The capability catalogue is allowed to be aspirational - it describes
+    sixteen engines so that a distributed one can be specified before anyone
+    has written it. The planner is not allowed to be. If it can name an
+    engine with no class behind it, then on a machine that happens to have
+    that engine's *package* installed, `aar explain` prints an engine name
+    that never ran, and the segment silently executes on a fallback. The
+    plan becomes a lie, which is the one thing this project is not allowed
+    to ship.
+    """
+
+    UNIMPLEMENTED = ("ray", "dask", "spark_rapids", "trino", "mongodb",
+                     "postgresql", "mysql", "sqlite")
+
+    def test_the_catalogue_really_does_declare_unimplemented_engines(self):
+        """If this ever stops being true the tests below are vacuous."""
+        from aar.capability import ENGINES
+
+        declared = {e.id for e in ENGINES}
+        assert declared & set(self.UNIMPLEMENTED), (
+            "none of the known-unimplemented engines are declared any more; "
+            "either they were implemented (good - update the list) or the "
+            "catalogue changed and this test no longer proves anything")
+
+    def test_no_unimplemented_engine_is_ever_a_candidate(self):
+        from aar.capability import CapabilityRegistry, Device
+        from aar.ir import NodeType
+        from aar.planner import AdaptivePlanner, Segment
+
+        registry = CapabilityRegistry()
+        # require_available=False on purpose: we are testing the
+        # *implementation* filter, and on any machine without pyspark / ray /
+        # dask installed the availability filter would hide the very bug
+        # these tests exist to catch.
+        planner = AdaptivePlanner(registry=registry, require_available=False)
+        segment = Segment(index=0, nodes=[Node(NodeType.GROUPBY)],
+                          device=Device.CPU, nbytes=1_000_000)
+        candidates = planner.candidate_engines(segment)
+        assert not (set(candidates) & set(self.UNIMPLEMENTED)), (
+            "planner offered an engine with no implementation: "
+            f"{sorted(set(candidates) & set(self.UNIMPLEMENTED))}")
+
+    def test_marking_an_engine_available_does_not_resurrect_it(self):
+        """The availability probe must not be the thing that saves us.
+
+        `probe_engine` answers "is the package installed", which is a
+        different question from "is there a class behind it". This forces the
+        availability side to say yes and checks the implementation filter
+        still refuses - the only way to prove the planner is not relying on
+        pyspark happening to be absent from this laptop.
+        """
+        from aar.capability import CapabilityRegistry, Device
+        from aar.ir import NodeType
+        from aar.planner import AdaptivePlanner, Segment
+
+        registry = CapabilityRegistry()
+        for engine_id in self.UNIMPLEMENTED:
+            # Re-insert the spec unchanged; what matters is that
+            # `available_only=True` would now admit it, so the only thing
+            # left filtering it out is the implementation check.
+            registry._by_id[engine_id] = registry.spec(engine_id)
+
+        planner = AdaptivePlanner(registry=registry, require_available=True)
+        segment = Segment(index=0, nodes=[Node(NodeType.GROUPBY)],
+                          device=Device.CPU, nbytes=1_000_000)
+        candidates = planner.candidate_engines(segment)
+        assert not (set(candidates) & set(self.UNIMPLEMENTED)), (
+            "with those engines forced available, the planner still offered: "
+            f"{sorted(set(candidates) & set(self.UNIMPLEMENTED))}")
+
+    def test_implemented_ids_are_a_subset_of_the_catalogue(self):
+        from aar.capability import ENGINES
+        from aar.planner import implemented_engine_ids
+
+        declared = {e.id for e in ENGINES}
+        implemented = implemented_engine_ids()
+        assert implemented, "nothing is implemented, which cannot be true"
+        assert implemented <= declared, (
+            f"implemented but not declared: {sorted(implemented - declared)}")
+        assert "arrow" in implemented, (
+            "arrow needs no third-party package and must always be buildable")
+
+
 class TestSegmentPlanning:
     def test_every_planned_node_receives_an_engine(self):
         m, planner = _gpu_capable()

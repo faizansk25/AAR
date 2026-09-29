@@ -669,10 +669,10 @@ class ArrowEngine(Engine):
             pacsv.write_csv(table.arrow, target)
             return table.num_rows
         if fmt == "excel":
-            from ..connectors.excel import write_excel
+            from ..interchange.sinks import sink_for
 
-            return write_excel(table, target, sheet=node.scan.sheet
-                               if node.scan else None)
+            return sink_for(fmt)(table, target, sheet=node.scan.sheet
+                                 if node.scan else None)
         raise NotImplementedError(
             f"the Arrow engine cannot write {fmt or 'that format'!r}")
 

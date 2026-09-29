@@ -322,12 +322,29 @@ class AdaptivePlanner:
         Every node in the segment must be supported, so the feasible set is
         the *intersection* across the segment rather than the union. Unioning
         would let a plan pick an engine that cannot run one of its nodes.
+
+        The feasible set is then narrowed to engines that are actually
+        *implemented*, which is a different question from whether they are
+        installed and a different question again from whether they support
+        the node. The capability catalogue declares sixteen engines;
+        `create_engine` can build a subset of them. Without this narrowing,
+        a machine that happens to have `pyspark` installed would score
+        `spark_rapids` as available, plan onto it, print "spark_rapids" in
+        `aar explain`, and then quietly run the segment on DuckDB - a plan
+        that describes an engine which never executed, which is exactly the
+        "declared is not implemented" failure the project promises not to
+        have. The catalogue is allowed to be aspirational; the planner is
+        not.
         """
         feasible: set[str] | None = None
         for node in segment.nodes:
             here = set(self._registry.feasible(
                 node, available_only=self._require_available))
             feasible = here if feasible is None else (feasible & here)
+        if not feasible:
+            return []
+
+        feasible &= self._implemented()
         if not feasible:
             return []
         return sorted(
@@ -338,6 +355,25 @@ class AdaptivePlanner:
                                self._registry.spec(e).device),
                            e),
         )
+
+    def _implemented(self) -> set[str]:
+        """Engine ids this build can actually construct.
+
+        Imported lazily and by module reference rather than at the top of
+        this file: `aar.engines.factory` imports the capability registry, so
+        a module-level import here would be a cycle. The registry is the
+        lower layer, so it must not learn about the factory; the planner
+        sits above both and is the right place to join them.
+
+        A missing `aar.engines` (a stripped install) leaves only `arrow`,
+        which is the one engine with no third-party dependency and therefore
+        the one thing that can always be assumed to build.
+        """
+        try:
+            from . import implemented_engine_ids
+        except ImportError:  # pragma: no cover - defensive
+            return {"arrow"}
+        return implemented_engine_ids()
 
     def _fits_memory(self, engine: str, nbytes: int) -> bool:
         if self._profile is None:

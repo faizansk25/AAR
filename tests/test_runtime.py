@@ -848,6 +848,90 @@ def _pipeline_for(path: str):
     return limit(ranked, 2)
 
 
+class TestSinkTable:
+    """The write-format table must name modules that exist.
+
+    `interchange/sinks.py` exists so that `engines` can find a writer without
+    importing `connectors` - the import ran the other way and was a cycle.
+    The cost of a table over an import is that it can drift: nothing checks
+    that `aar.connectors.parquet` is a module that exists. That is not
+    hypothetical - the first version of this table named three modules and
+    two of them were invented.
+
+    So the table is checked, entry by entry, against a real import.
+    """
+
+    def test_every_declared_sink_really_imports(self):
+        import importlib
+
+        from aar.interchange.sinks import SINKS
+
+        assert SINKS, "the sink table is empty, which cannot be right"
+        for fmt, (module_path, attr) in SINKS.items():
+            module = importlib.import_module(module_path)
+            assert hasattr(module, attr), (
+                f"SINKS[{fmt!r}] names {module_path}.{attr}, which does not "
+                f"exist")
+
+    def test_an_unknown_format_says_what_is_available(self):
+        from aar.interchange.sinks import SinkUnavailable, sink_for
+
+        with pytest.raises(SinkUnavailable) as exc:
+            sink_for("xlsx-ish-nonsense")
+        message = str(exc.value)
+        assert "xlsx-ish-nonsense" in message, message
+        # It must name the alternatives: a user who cannot get the format
+        # they asked for needs to know what they *can* get.
+        assert "excel" in message, message
+
+    def test_looking_up_a_format_does_not_import_the_connector(self):
+        """The whole point: the table defers the import, it does not hoist it.
+
+        If this fails, the "lazy import" is cosmetic and `import aar` is
+        paying for openpyxl whether or not anyone writes a workbook.
+        """
+        import subprocess
+        import sys
+
+        code = (
+            "import sys;"
+            "import aar.interchange.sinks as s;"
+            "print(any(m.startswith('aar.connectors') for m in sys.modules))"
+        )
+        proc = subprocess.run([sys.executable, "-c", code],
+                              capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        assert proc.stdout.strip().endswith("False"), (
+            "importing the sink table pulled in a connector: "
+            f"{proc.stdout.strip()}")
+
+    def test_the_arrow_engine_still_writes_excel(self, tmp_path):
+        pytest.importorskip("pyarrow")
+        pytest.importorskip("openpyxl")
+        import pyarrow as pa
+
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.interchange import Table
+        from aar.types import Field, INT64, Schema
+
+        tbl = Table(
+            pa.table({"a": pa.array([1, 2], type=pa.int64())}),
+            Schema((Field("a", INT64),)),
+        )
+        target = tmp_path / "out.xlsx"
+        assert ArrowEngine().write(tbl, _write_node(str(target), "excel")) == 2
+        assert target.exists(), "the sink table did not reach the real writer"
+
+
+def _write_node(target: str, fmt: str):
+    """A minimal WRITE node for the sink tests."""
+    from aar.ir import Node, NodeType
+
+    node = Node(NodeType.WRITE, target=target)
+    node.write_format = fmt
+    return node
+
+
 class TestEndToEnd:
     """The whole path: build -> plan -> execute -> rows."""
 
