@@ -146,6 +146,90 @@ class TestCalibrate:
         assert cli_mod is not None
 
 
+class TestExamples:
+    """The examples are code, not prose, so they are tested as code.
+
+    An example that does not compile is a bug in the documentation, and it
+    only surfaces when a new user copies it - the worst possible moment to
+    find out. These tests are cheap: parsing a string is instant, and the
+    shortest one is planned for real.
+    """
+
+    def test_every_example_parses(self):
+        import ast
+
+        from aar import examples
+
+        for name in examples.names():
+            try:
+                ast.parse(examples.source(name), filename=f"<{name}>")
+            except SyntaxError as exc:
+                pytest.fail(f"example {name!r} does not parse: {exc}")
+
+    def test_every_example_imports_only_names_the_sdk_exports(self):
+        """A typo in an import is a crash on the user's very first run.
+
+        Checked against the live ``__all__`` rather than a copy of it, so
+        renaming an SDK function fails here instead of in a terminal.
+        """
+        import ast
+        import importlib
+
+        from aar import examples
+
+        sdk = importlib.import_module("aar.sdk")
+        for name in examples.names():
+            tree = ast.parse(examples.source(name), filename=f"<{name}>")
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module == "aar.sdk":
+                    missing = [a.name for a in node.names
+                               if a.name not in sdk.__all__]
+                    assert not missing, (
+                        f"example {name!r} imports {missing} from aar.sdk, "
+                        f"which does not export them")
+                assert not any(
+                    isinstance(n, ast.ImportFrom)
+                    and n.module is not None
+                    and not n.module.startswith("aar")
+                    for n in ast.walk(tree)
+                ), f"example {name!r} imports a third-party module"
+
+    def test_the_shortest_example_really_plans(self, tmp_path):
+        """`aar explain` on a written-out example must succeed.
+
+        This is the path a new user takes first, and planning touches the
+        whole chain: load the file, build the IR, plan it, choose an
+        engine. A break anywhere in that shows up here rather than in
+        their face.
+        """
+        pytest.importorskip("pyarrow")
+        target = tmp_path / "hello.py"
+        assert main(["examples", "--write", "hello", str(target)]) == 0
+        assert target.exists()
+        assert main(["explain", str(target)]) == 0
+
+    def test_writing_twice_refuses_to_clobber_your_own_work(self, tmp_path):
+        target = tmp_path / "hello.py"
+        assert main(["examples", "--write", "hello", str(target)]) == 0
+        target.write_text("# my own work\n", encoding="utf-8")
+        assert main(["examples", "--write", "hello", str(target)]) != 0
+        assert target.read_text(encoding="utf-8") == "# my own work\n"
+
+    def test_an_unknown_name_lists_the_real_ones(self, capsys):
+        assert main(["examples", "--show", "nope"]) != 0
+        err = capsys.readouterr().err
+        assert "nope" in err
+        assert "hello" in err
+
+    def test_bare_listing_names_every_example(self, capsys):
+        from aar import examples
+
+        assert main(["examples"]) == 0
+        out = capsys.readouterr().out
+        for name in examples.names():
+            assert name in out
+
+
 class TestErrorHandling:
     def test_exceptions_become_a_message_not_a_traceback(self, capsys,
                                                          monkeypatch):

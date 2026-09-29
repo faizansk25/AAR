@@ -104,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
     w.add_argument("--open", action="store_true",
                    help="open a browser window immediately")
 
+    p_examples = sub.add_parser(
+        "examples", help="list, show, or write out a runnable example pipeline")
+    p_examples.add_argument("--show", metavar="NAME", default=None,
+                            help="print an example's source to stdout")
+    p_examples.add_argument("--write", nargs=2, metavar=("NAME", "PATH"),
+                            default=None,
+                            help="write an example to PATH, ready to edit")
+
     sub.add_parser("version", help="version and optional-dependency status")
     return parser
 
@@ -370,6 +378,58 @@ def _cmd_workbench(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
+def _cmd_examples(args: argparse.Namespace) -> int:
+    """List the bundled example pipelines, or hand one over.
+
+    `aar run` and `aar explain` both take a path to a pipeline file, which
+    means a first-time user is asked for a file they have never seen the
+    shape of. This closes that loop without a tutorial: one command lists
+    them, one more writes a working copy.
+    """
+    from . import examples
+
+    if args.show is not None:
+        if args.show not in examples.EXAMPLES:
+            print(f"no example named {args.show!r}. "
+                  f"Available: {', '.join(examples.names())}",
+                  file=sys.stderr)
+            return _EXIT_USER_ERROR
+        print(examples.source(args.show), end="")
+        return _EXIT_OK
+
+    if args.write is not None:
+        name, path = args.write
+        if name not in examples.EXAMPLES:
+            print(f"no example named {name!r}. "
+                  f"Available: {', '.join(examples.names())}",
+                  file=sys.stderr)
+            return _EXIT_USER_ERROR
+        try:
+            with open(path, "x", encoding="utf-8") as fh:
+                fh.write(examples.source(name))
+        except FileExistsError:
+            # Not an overwrite. A pipeline someone has edited is theirs, and
+            # silently replacing it is the kind of thing that loses an hour
+            # of work.
+            print(f"{path} already exists; not overwriting it", file=sys.stderr)
+            return _EXIT_USER_ERROR
+        except OSError as exc:
+            print(f"could not write {path}: {exc}", file=sys.stderr)
+            return _EXIT_USER_ERROR
+        print(f"wrote {path}  (from the {name!r} example)")
+        print(f"next:  aar explain {path}    # plan it, needs no data")
+        print(f"      aar run {path}          # execute it")
+        return _EXIT_OK
+
+    print("Example pipelines. Start with 'hello'.\n")
+    width = max(len(n) for n in examples.names())
+    for name in examples.names():
+        print(f"  {name:<{width}}  {examples.describe(name)}")
+    print("\n  aar examples --show hello        print the source")
+    print("  aar examples --write hello mine.py   write a copy to edit")
+    return _EXIT_OK
+
+
 _COMMANDS = {
     "doctor": _cmd_doctor,
     "engines": _cmd_engines,
@@ -378,6 +438,7 @@ _COMMANDS = {
     "run": _cmd_run,
     "policy": _cmd_policy,
     "workbench": _cmd_workbench,
+    "examples": _cmd_examples,
     "version": _cmd_version,
 }
 
