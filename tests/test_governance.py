@@ -13,11 +13,11 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 from aar.governance import (  # noqa: E402
-    NETWORK_SINKS, Action, Policy, PolicyEngine, Sensitivity, Sink, Subject,
+    NETWORK_SINKS, Policy, PolicyEngine, Sensitivity, Sink, Subject,
     mask_value, sensitivity_of,
 )
 from aar.interchange import Table  # noqa: E402
-from aar.types import FLOAT64, INT64, UTF8, Field, Schema  # noqa: E402
+from aar.types import FLOAT64, Field, Schema  # noqa: E402
 
 
 @pytest.fixture()
@@ -63,7 +63,6 @@ class TestEgress:
         So the test is a *partition*: everything is either a known local sink
         or treated as egress, and nothing sits in an unclassified middle.
         """
-        from aar.governance import LOCAL_SINKS
 
         for kind in ("postgres", "mongodb", "s3", "kafka", "http", "webhook",
                      "bigquery", "snowflake", "smb", "ftp", "nfs"):
@@ -90,7 +89,7 @@ class TestEgress:
         deliberate decision rather than the side effect of forgetting to
         update a deny-list.
         """
-        from aar.governance import LOCAL_SINKS, NETWORK_SINKS
+        from aar.governance import LOCAL_SINKS
 
         assert LOCAL_SINKS.isdisjoint(NETWORK_SINKS)
         assert len(LOCAL_SINKS) < len(NETWORK_SINKS), (
@@ -411,7 +410,6 @@ class TestPolicyInExecution:
     def test_a_denied_write_stops_the_run(self, tmp_path):
         """A network target must not produce a file."""
         from aar.failures import PrivacyViolation
-        from aar.ir import Node, NodeType
         from aar.planner import AdaptivePlanner
         from aar.runtime import Executor
         from aar.sdk import parquet, write_csv

@@ -185,7 +185,6 @@ class PredicateCompiler:
 
     @staticmethod
     def _binary(expr: Any, row: dict[str, Any]) -> bool:
-        from ..ir import BinOp, Lit
 
         op = expr.op
         if op == "AND":
@@ -264,5 +263,3 @@ class PredicateCompiler:
         def predicate(row: dict[str, Any]) -> bool:
             return cls.evaluate(expr, row)
         return predicate
-
-        raise NotImplementedError(f"{self.id} cannot run a Python UDF")

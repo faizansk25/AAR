@@ -23,9 +23,9 @@ from typing import Any, Sequence
 from ..capability import Device
 from ..failures import SourceUnavailable
 from ..interchange import Table, reconcile, require_arrow
-from ..ir import Col, Expr, JoinType, Lit, Node, NodeType
+from ..ir import Col, Expr, Lit, Node
 from ..lineage import taint as _lineage
-from .base import Engine, PredicateCompiler
+from .base import Engine
 
 __all__ = ["DuckDBEngine"]
 
@@ -402,7 +402,7 @@ def _to_sql_where(expr: Any) -> str | None:
     thing as the predicate. A filter that quietly changed would be far worse
     than one that ran slower.
     """
-    from ..ir import BinOp, Col, Lit
+    from ..ir import BinOp
 
     if expr is None:
         return None
@@ -441,7 +441,6 @@ def _to_sql_where(expr: Any) -> str | None:
 def _agg_sql(agg: Any) -> str | None:
     """Render an aggregate as SQL, or None if AAR's form is richer."""
     from ..ir import Agg as AggExpr
-    from ..ir import Col
 
     if not isinstance(agg, AggExpr):
         return None

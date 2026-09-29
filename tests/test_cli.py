@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import sys
 
@@ -144,6 +145,61 @@ class TestCalibrate:
         assert rc == 2
         assert "no curves" in capsys.readouterr().err
         assert cli_mod is not None
+
+
+class TestNoSilentLint:
+    """The codebase is lint-clean on the rules that find real defects.
+
+    `ruff` and `vulture` are dev-only tools; this test shells out to whichever
+    is present and skips cleanly when neither is, so a developer without them
+    is not blocked from running the suite.
+
+    The selected rules are the ones that found actual bugs here, not a style
+    wish-list. F821 in particular caught `Schema` and `Field` being used in
+    `arrow_engine._arrow_group_by` without ever being imported - a NameError
+    that only fires on an Arrow build where the native kernel works, which is
+    why the whole test suite was green while the fast path was broken.
+    """
+
+    RULES = "F401,F811,F821,F841,F632"
+
+    def test_no_undefined_names_or_unused_code(self):
+        import shutil
+        import subprocess
+
+        ruff = shutil.which("ruff") or str(
+            Path(__file__).resolve().parents[1] / ".venv" / "Scripts" / "ruff.exe")
+        if not Path(ruff).exists():
+            pytest.skip("ruff not installed (pip install ruff)")
+
+        root = Path(__file__).resolve().parents[1]
+        proc = subprocess.run(
+            [ruff, "check", "--select", self.RULES, "--no-cache",
+             "--statistics", "src", "tests"],
+            cwd=root, capture_output=True, text=True, timeout=300)
+        # ruff exits 1 when it finds anything; 0 when clean. Anything else is
+        # a tool failure, which should not be reported as a clean run.
+        assert proc.returncode in (0, 1), proc.stderr[-2000:]
+        assert proc.returncode == 0, (
+            "lint findings - run `ruff check --select "
+            f"{self.RULES} --fix src tests`:\n{proc.stdout}")
+
+    def test_no_unreachable_code(self):
+        import shutil
+        import subprocess
+
+        vulture = shutil.which("vulture") or str(
+            Path(__file__).resolve().parents[1] / ".venv" / "Scripts"
+            / "vulture.exe")
+        if not Path(vulture).exists():
+            pytest.skip("vulture not installed (pip install vulture)")
+
+        root = Path(__file__).resolve().parents[1]
+        proc = subprocess.run(
+            [vulture, os.path.join("src", "aar"), "--min-confidence", "100"],
+            cwd=root, capture_output=True, text=True, timeout=300)
+        assert not proc.stdout.strip(), (
+            "unreachable code or unused variables:\n" + proc.stdout)
 
 
 class TestExamples:

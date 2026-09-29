@@ -24,7 +24,7 @@ import os
 import statistics
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 __all__ = [
     "CalibrationPoint", "CostCurve", "CalibrationStore", "calibrate",
@@ -331,7 +331,7 @@ def _r_squared(actual: list[float], pred: list[float]) -> float:
 
 
 # ------------------------------------------------------------- data fixtures
-def make_frame(nbytes: int, seed: int = 0):
+def make_frame(nbytes: int):
     """A deterministic frame close to ``nbytes`` in Arrow memory size.
 
     Deterministic on purpose: calibration must be reproducible, so a rerun on
@@ -459,7 +459,6 @@ def _bench_groupby(tbl) -> int:
 
 
 def _bench_window(tbl) -> int:
-    import pyarrow as pa
     import pyarrow.compute as pc
 
     ordered = tbl.sort_by([("ts", "ascending")])
@@ -546,7 +545,6 @@ def _gpu_benchmarks(sizes: Sequence[int], repeats: int) -> list[CalibrationPoint
         except Exception:  # noqa: BLE001
             continue
         actual = max(1, host.nbytes)
-        rows = host.num_rows
 
         def h2d():
             dev = cupy.asarray(host["value"].to_numpy(zero_copy_only=False))

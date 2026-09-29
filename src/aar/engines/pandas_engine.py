@@ -20,7 +20,7 @@ from ..failures import SourceUnavailable
 from ..interchange import Table, reconcile, require_arrow
 from ..ir import Expr, Node
 from ._mask import to_mask
-from .base import Engine, PredicateCompiler
+from .base import Engine
 
 __all__ = ["PandasEngine"]
 

@@ -355,7 +355,7 @@ def _to_mask(frame: Any, expr: Expr) -> Any:
     approximate filter returns silently wrong rows, which is the one
     failure this project exists to prevent.
     """
-    from ..ir import BinOp, Func, Lit
+    from ..ir import BinOp, Func
 
     if isinstance(expr, BinOp):
         op = expr.op

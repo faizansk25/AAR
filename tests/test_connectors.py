@@ -22,12 +22,11 @@ pa = pytest.importorskip("pyarrow")
 
 from aar.connectors import (  # noqa: E402
     MYSQL, POSTGRESQL, SQLITE, for_dialect, mock_mongo_connector,
-    mongo_type_of, mysql_connector, postgresql_connector, projection_sql,
-    quote_ident, quote_value, render_match, render_where, sqlite_connector,
+    mongo_type_of, mysql_connector, postgresql_connector, quote_ident, quote_value, render_match, sqlite_connector,
     sqlite_type_name,
 )
 from aar.ir import (  # noqa: E402
-    BinOp, Col, Func, Lit, Node, NodeType, ScanSpec,
+    BinOp, Col, Lit, Node, NodeType, ScanSpec,
 )
 from aar.types import FLOAT64, INT64, TIMESTAMP  # noqa: E402
 

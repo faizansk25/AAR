@@ -12,15 +12,12 @@ the *boundaries*, not merely that a plan was produced.
 
 from __future__ import annotations
 
-import pytest
 
 from aar.capability import CapabilityRegistry, Device
 from aar.cost import CostModel, Priors, TransferProfile
-from aar.failures import DegradationLedger, PlanInfeasible
 from aar.hardware.calibrate import CalibrationPoint, CalibrationStore
-from aar.ir import BinOp, Col, JoinType, Lit, Node, NodeType, ScanSpec
-from aar.planner import (AdaptivePlanner, NodeTypeAffinity, Plan,
-                         decompose_into_segments, estimate_bytes, self_device)
+from aar.ir import BinOp, Col, Lit, Node, NodeType, ScanSpec
+from aar.planner import (AdaptivePlanner, NodeTypeAffinity, decompose_into_segments, estimate_bytes, self_device)
 
 
 # ------------------------------------------------------------- fixtures
@@ -123,7 +120,7 @@ class TestSegmentPlanning:
     def test_every_planned_node_receives_an_engine(self):
         m, planner = _gpu_capable()
         root = _pipeline()
-        plan = planner.plan(root)
+        planner.plan(root)          # the call is the point; it assigns
         for node in root.walk():
             assert node.assigned_engine, f"{node.type} has no engine"
             assert node.reason, f"{node.type} has no reason"

@@ -585,9 +585,6 @@ def _schema_sensitivity(schema: Any) -> Sensitivity:
             getattr(item, "classification", ())))
     return level
 
-    return level
-
-
 
 # ------------------------------------------------------------------ files
 #: A worked example, written by ``aar policy check --write-example``. It is

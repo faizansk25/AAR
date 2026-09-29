@@ -1,0 +1,43 @@
+6005d1d docs
+33c9237 analysis
+## main...origin/main
+ M report.md
+ M src/aar/capability/registry.py
+ M src/aar/cli.py
+ M src/aar/connectors/excel.py
+ M src/aar/connectors/mongo.py
+ M src/aar/connectors/sql.py
+ M src/aar/cost/model.py
+ M src/aar/engines/arrow_engine.py
+ M src/aar/engines/base.py
+ M src/aar/engines/cudf_engine.py
+ M src/aar/engines/duckdb_engine.py
+ M src/aar/engines/excel_engine.py
+ M src/aar/engines/factory.py
+ M src/aar/engines/pandas_engine.py
+ M src/aar/engines/polars_engine.py
+ M src/aar/engines/polars_gpu_engine.py
+ M src/aar/failures/registry.py
+ M src/aar/governance/policy.py
+ M src/aar/hardware/calibrate.py
+ M src/aar/hardware/detect.py
+ M src/aar/interchange/table.py
+ M src/aar/ir/nodes.py
+ M src/aar/lineage/taint.py
+ M src/aar/planner/planner.py
+ M src/aar/runtime/executor.py
+ M src/aar/sdk/pipeline.py
+ M tests/test_capability.py
+ M tests/test_cli.py
+ M tests/test_connectors.py
+ M tests/test_cost.py
+ M tests/test_governance.py
+ M tests/test_gpu_engines.py
+ M tests/test_ir.py
+ M tests/test_lineage.py
+ M tests/test_metadata.py
+ M tests/test_planner.py
+ M tests/test_runtime.py
+ M tests/test_types.py
+?? cc.txt
+?? tools/probe_arrow_groupby.py

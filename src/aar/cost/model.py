@@ -26,10 +26,9 @@ Three further commitments:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Mapping
+from dataclasses import dataclass
 
-from ..capability import CapabilityRegistry, Device, EngineSpec
+from ..capability import CapabilityRegistry, Device
 from ..hardware.calibrate import CalibrationStore
 from ..ir.nodes import Node, NodeType
 

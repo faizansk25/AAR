@@ -27,12 +27,11 @@ accident of per-node greed.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
 
 from ..capability import CapabilityRegistry, Device
 from ..cost import CostBreakdown, CostModel
 from ..failures import DegradationLedger, PlanInfeasible
-from ..ir import JoinType, Node, NodeType, topological_order
+from ..ir import Node, NodeType, topological_order
 
 __all__ = [
     "Segment", "SegmentPlan", "Plan", "AdaptivePlanner",
@@ -221,7 +220,6 @@ class SegmentPlan:
     def render(self) -> str:
         arrows = ""
         if self.candidates:
-            best = self.candidates[0][1]
             arrows = " | considered: " + ", ".join(
                 f"{e}={t * 1e3:.1f}ms" for e, t in self.candidates[:4])
         inbound = (f" | inbound {self.inbound_s * 1e3:.1f}ms"

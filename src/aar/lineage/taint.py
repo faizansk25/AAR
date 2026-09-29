@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping, Sequence
 
-from ..types import Field, Schema, Sensitivity, sensitivity_of
+from ..types import Field, sensitivity_of
 
 __all__ = [
     "LineageEvent", "derive_from", "inherit_all", "merge_schemas",

@@ -21,10 +21,10 @@ from __future__ import annotations
 import importlib.util
 import os
 import sys
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from ..ir import Agg, BinOp, Col, Expr, JoinType, Lit, Node, NodeType, ScanSpec
-from ..types import Field, Schema
+from ..types import Schema
 
 __all__ = [
     "Context", "load_pipeline", "build_pipeline",

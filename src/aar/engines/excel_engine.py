@@ -18,7 +18,7 @@ from typing import Any, Sequence
 
 from ..capability import Device
 from ..interchange import Table
-from ..ir import Expr, Node, NodeType
+from ..ir import Expr, Node
 from .arrow_engine import ArrowEngine
 from .base import Engine
 

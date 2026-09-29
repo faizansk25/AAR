@@ -29,7 +29,7 @@ from typing import Any, Mapping, Sequence
 
 from ..failures import SourceUnavailable
 from ..interchange import Table
-from ..ir import BinOp, Col, Expr, Lit, Node, NodeType
+from ..ir import BinOp, Col, Lit, Node
 
 __all__ = ["MongoConnector", "mongo_connector", "mock_mongo_connector",
            "render_match", "mongo_type_of"]
@@ -247,7 +247,6 @@ def documents_to_table(documents: Sequence[Mapping[str, Any]],
     into a fixed Arrow struct would either fail or invent a shape the data
     does not have.
     """
-    import json
 
     import pyarrow as pa
 

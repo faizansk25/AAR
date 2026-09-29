@@ -17,8 +17,9 @@ from typing import Any, Sequence
 from ..capability import Device
 from ..failures import SourceUnavailable
 from ..interchange import Table, require_arrow
-from ..ir import Agg, Col, Expr, JoinType, Lit, Node, NodeType
+from ..ir import Col, Expr, JoinType, Lit, Node
 from ..lineage import taint as _lineage
+from ..types import Field, Schema
 from .base import Engine, PredicateCompiler
 
 __all__ = ["ArrowEngine"]
@@ -194,7 +195,7 @@ class ArrowEngine(Engine):
         import pyarrow as pa
         import pyarrow.compute as pc
 
-        from ..ir import BinOp, Col, Func, Lit
+        from ..ir import BinOp, Func
 
         if not _KERNELS:
             _install_kernels()
@@ -476,7 +477,6 @@ class ArrowEngine(Engine):
     def _native_join(self, left: Table, right: Table, key_names: list[str],
                      how: str) -> "Table | None":
         """``pyarrow.Table.join``, or ``None`` where its semantics differ."""
-        import pyarrow as pa
 
         from ..types import Field, Schema
 
@@ -703,8 +703,6 @@ def _aggregate_by_index(agg: Any, values: dict[str, list],
     aggregate except COUNT(*), and an all-null group yields ``None`` rather
     than zero.
     """
-    from ..ir import Agg as AggExpr
-    from ..ir import Col, Lit
 
     name = agg.func.upper()
     out: list = []
@@ -794,10 +792,8 @@ def _arrow_group_by(table: Table, keys: list[str],
     is in the SQL connector: a near-miss aggregation returns subtly wrong
     numbers, and nothing downstream can tell.
     """
-    import pyarrow as pa
 
     from ..ir import Agg as AggExpr
-    from ..ir import Col
 
     if not _group_by_kernel_works():
         return None
@@ -819,6 +815,13 @@ def _arrow_group_by(table: Table, keys: list[str],
 
     # Arrow names the key column "key_0"/"key_0" in some versions and keeps
     # the real name in others; normalise to the caller's names.
+    # NOTE: this is deliberately *outside* the try above. `Schema` and `Field`
+    # were never imported at module scope, so this line raised NameError on
+    # every call where the kernel succeeded. Nothing caught it, because
+    # `_group_by_kernel_works()` returns False on most builds and the guard
+    # short-circuits first - a landmine that only fires on a build where the
+    # fast path actually works. Caught by `ruff` F821, confirmed by
+    # `tools/probe_arrow_groupby.py`.
     if list(result.schema.names[:len(keys)]) != keys:
         result = result.rename_columns(
             [*keys, *[n for n in result.schema.names[len(keys):]]])
@@ -847,7 +850,6 @@ def _key_tag(schema: Any, name: str) -> frozenset:
 def _apply_aggregate(agg: Any, group: list[dict]) -> Any:
     """Evaluate one aggregate over a group of row dicts."""
     from ..ir import Agg as AggExpr
-    from ..ir import Col as ColExpr
 
     if not isinstance(agg, AggExpr):
         raise TypeError(f"expected an aggregate, got {type(agg).__name__}")
@@ -889,7 +891,6 @@ def _apply_aggregate(agg: Any, group: list[dict]) -> Any:
 
 
 def _values(expr: Any, group: list[dict]) -> list[Any]:
-    from ..ir import Col, Lit
 
     if isinstance(expr, Col):
         return [r.get(expr.name) for r in group]

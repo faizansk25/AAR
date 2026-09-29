@@ -19,7 +19,7 @@ from aar.interchange import Table  # noqa: E402
 from aar.ir import Agg, Col  # noqa: E402
 from aar.lineage import taint  # noqa: E402
 from aar.types import (  # noqa: E402
-    FLOAT64, INT64, UTF8, Field, Schema, Sensitivity, sensitivity_of,
+    INT64, Field, Schema, Sensitivity, sensitivity_of,
 )
 
 
@@ -285,7 +285,7 @@ class TestPropagationThroughAPipeline:
         Before this change the same pipeline produced an unmasked payroll
         total, because nothing carried the tag from the source to the sum.
         """
-        from aar.governance import Policy, PolicyEngine, Subject
+        from aar.governance import Policy, Subject
         from aar.planner import AdaptivePlanner
         from aar.runtime import Executor
         from aar.sdk import classify, group_by, parquet, sum_, write_csv

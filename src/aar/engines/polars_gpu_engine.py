@@ -167,8 +167,22 @@ class PolarsGPUEngine(Engine):
             f"PCIe. Let the executor fall back.")
 
     def write(self, table: Table, node: Node) -> int:
-        out = self._to_table(self._collect(self._lazy(table)))
+        """Materialise to the target, copying off the device once.
+
+        This method was previously truncated: it computed the host table,
+        imported ``ArrowEngine``, and then fell off the end of the function.
+        It therefore returned ``None`` where the contract promises an ``int``,
+        and wrote nothing at all - a silent no-op on the one engine whose
+        whole purpose is to be fast. The intent is visible in the two
+        surviving lines, and matches ``CudfEngine.write``.
+        """
+        fmt = (node.write_format or "").lower()
+        # For a host-native target the frame has to come back regardless;
+        # Parquet keeps the Arrow path and never needs the host frame.
+        out = table if fmt == "parquet" else self._to_table(
+            self._collect(self._lazy(table)))
         from .arrow_engine import ArrowEngine
+        return ArrowEngine().write(out, node)
 
 
 # --------------------------------------------------------------------- utils
@@ -273,7 +287,7 @@ def _pl_agg(agg: Agg) -> Any:
     """
     import polars as pl
 
-    from ..ir import Agg, Col
+    from ..ir import Col
 
     # Agg is (func, arg, distinct, custom). `arg` is the expression, so a
     # column name comes off a Col - and `agg.column` does not exist, which

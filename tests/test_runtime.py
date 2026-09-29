@@ -16,13 +16,11 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 from aar.engines import create_engine                      # noqa: E402
-from aar.engines.base import PredicateCompiler             # noqa: E402
 from aar.interchange import Table, arrow_to_canonical, canonical_to_arrow  # noqa: E402
 from aar.ir import (BinOp, Col, Lit, Node, NodeType, ScanSpec,  # noqa: E402
                     topological_order)
-from aar.sdk import (col, csv, excel, filter_, group_by, limit, lit,  # noqa: E402
-                     parquet, project, sort, sum_, udf, write_csv,
-                     write_excel, write_parquet)
+from aar.sdk import (col, filter_, group_by, limit, lit,  # noqa: E402
+                     parquet, sort, sum_, udf, write_excel, write_parquet)
 from aar.types import (FLOAT64, INT64, UTF8, Field, Schema)  # noqa: E402
 
 

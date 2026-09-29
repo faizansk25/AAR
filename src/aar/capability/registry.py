@@ -28,9 +28,9 @@ Two design commitments:
 from __future__ import annotations
 
 import enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib import metadata
-from typing import Iterable, Mapping
+from typing import Any, Iterable
 
 from ..failures import DegradationLedger, FailureKind
 from ..ir.nodes import Node, NodeType

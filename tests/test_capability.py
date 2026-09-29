@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from aar.capability import (Capability, CapabilityRegistry, Device, ENGINES,
+from aar.capability import (CapabilityRegistry, Device, ENGINES,
                             EngineSpec, Tier, default_registry, probe_engine)
-from aar.ir import Node, NodeType, ScanSpec
+from aar.ir import Node, NodeType
 
 
 def _node(node_type: NodeType, **kw) -> Node:

@@ -14,7 +14,7 @@ import datetime as _dt
 import math
 from typing import Any
 
-from ..failures import (FailureKind, SchemaDriftError, SourceUnavailable)
+from ..failures import (SchemaDriftError, SourceUnavailable)
 
 from ..interchange import Table, require_arrow
 from ..types import (BOOLEAN, DATE32, FLOAT64, INT64, NULL, TIMESTAMP, UTF8,

@@ -21,7 +21,7 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
-from ..types import EMPTY_SCHEMA, DataType, Field, Schema, UnmappableType
+from ..types import EMPTY_SCHEMA, DataType, Schema, UnmappableType
 
 __all__ = [
     "NodeType", "Privacy", "JoinType", "Node", "ScanSpec", "Expr",
@@ -648,5 +648,3 @@ def topological_order(nodes: "list[Node] | Node") -> list[Node]:
         if state.get(id(n), 0) != 2:
             visit(n)
     return out
-
-    return node.type in _SINK_NODES

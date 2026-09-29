@@ -66,7 +66,23 @@ class TestCostBreakdown:
         assert (a + b).total_s == 10
 
     def test_render_shows_every_term(self):
-        text = CostBreakdown(startup_s=0.1, compute_s=0.2).render()
+        """The render must name every term it sums.
+
+        This test used to call ``render()``, throw the string away, and assert
+        nothing - it could not fail. A cost breakdown that silently dropped a
+        term would still look plausible in `aar explain`, which is exactly
+        where a cost model is read and trusted.
+        """
+        text = CostBreakdown(startup_s=0.1, read_s=0.1, transfer_s=0.1,
+                             compute_s=0.1, spill_s=0.1,
+                             materialise_s=0.1).render()
+        assert text, "render() produced nothing at all"
+        for term in ("startup", "read", "transfer", "compute", "spill",
+                     "materialise"):
+            assert term in text, f"render() omits the {term} term: {text!r}"
+        # And the total must be the sum of the parts, not a separate number
+        # nobody can reconcile. Six terms at 100ms each.
+        assert "600.0" in text, f"total is missing from {text!r}"
 
 
 class TestComputeCostSources:

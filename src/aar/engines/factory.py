@@ -12,11 +12,10 @@ from __future__ import annotations
 import warnings
 from typing import Any, Callable
 
-from ..capability import Device
 from ..failures import (
-    CapabilityError, DegradationLedger, FailureKind, process_ledger,
+    CapabilityError, FailureKind, process_ledger,
 )
-from .base import Engine, EngineCapabilities
+from .base import Engine
 
 __all__ = ["create_engine", "ENGINE_FACTORIES", "FALLBACK_ORDER"]
 

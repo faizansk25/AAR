@@ -52,10 +52,10 @@ from aar.engines._mask import to_mask
 from aar.engines.cudf_engine import (
     ROW_COUNTER, CudfEngine, _agg_spec,
 )
-from aar.engines.factory import ENGINE_FACTORIES, create_engine
+from aar.engines.factory import create_engine
 from aar.interchange import Table, arrow_to_canonical
 from aar.ir import Agg, BinOp, Col, Func, Lit
-from aar.types import Field, INT64, Schema, UTF8
+from aar.types import Field, Schema, UTF8
 
 
 class GroupBy:

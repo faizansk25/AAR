@@ -6,7 +6,7 @@ import pytest
 
 from aar.ir import (Agg, BinOp, Col, JoinType, Lit, Node, NodeType, Privacy,
                     ScanSpec, topological_order)
-from aar.types import INT32, INT64, UTF8, Field, Schema
+from aar.types import INT32, INT64, Field, Schema
 
 
 def _scan(name: str = "t") -> Node:

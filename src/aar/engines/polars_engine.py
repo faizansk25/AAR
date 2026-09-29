@@ -17,10 +17,10 @@ from typing import Any, Sequence
 
 from ..capability import Device
 from ..failures import SourceUnavailable
-from ..interchange import Table, reconcile, require_arrow
-from ..ir import Expr, JoinType, Node
+from ..interchange import Table, reconcile
+from ..ir import Expr, Node
 from ..lineage import taint as _lineage
-from .base import Engine, PredicateCompiler
+from .base import Engine
 
 __all__ = ["PolarsEngine"]
 

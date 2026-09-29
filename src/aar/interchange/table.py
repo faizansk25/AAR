@@ -23,10 +23,9 @@ the Arrow schema and reconciles the two on every conversion.
 
 from __future__ import annotations
 
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
-from ..types import (Field, LineageRef, Schema, TypeKind, UnmappableType,
-                     from_source, lossy)
+from ..types import (Field, LineageRef, Schema, TypeKind, UnmappableType)
 
 __all__ = ["Table", "arrow_to_canonical", "canonical_to_arrow", "reconcile",
            "require_arrow"]
@@ -51,7 +50,6 @@ def arrow_to_canonical(pa_type: Any) -> "Any":
     rather than degrading to text, because a silent UTF-8 fallback is how a
     numeric column quietly becomes a string column.
     """
-    import pyarrow as pa
     import pyarrow.types as pat
 
     if pat.is_null(pa_type):

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..engines import create_engine
-from ..failures import (DegradationLedger, FailureKind, UDFExecutionError)
+from ..failures import (DegradationLedger, FailureKind)
 from ..interchange import Table
 from ..ir import Node, NodeType, topological_order
 from ..planner import Plan
@@ -380,7 +380,6 @@ class Executor:
 
     # ---------------------------------------------------- simple operations
     def _cast(self, table: Table, node: Node) -> Table:
-        import pyarrow.compute as pc
 
         from ..interchange import canonical_to_arrow
 

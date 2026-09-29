@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 607 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 609 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -95,6 +95,87 @@ third-party module, and the shortest is written to disk and run through
 `aar explain` for real. That last test caught the first draft, which used a
 chainable style against a functional SDK and `count_` where the export is
 `count` — both would have failed on a user's very first run.
+
+### Round 12 — dead code analysis (ruff + vulture), and three real bugs
+
+Installed `ruff` and `vulture` as dev-only tools. Starting state:
+**117 ruff findings** (91 unused-import, 11 redefined-while-unused,
+9 undefined-name, 6 unused-variable) and **4 vulture findings at 100%
+confidence**. All cleared; both tools now report zero.
+
+#### The one that mattered: a NameError behind a guard
+
+`ruff` F821 flagged `Schema` and `Field` used in
+`engines/arrow_engine.py::_arrow_group_by` **without being imported at module
+scope**. The line sits *outside* the `try/except` that ends a few lines
+above, so it was not covered by the decline-on-failure handler.
+
+It never fired because `_group_by_kernel_works()` returns `False` on most
+Arrow builds and short-circuits first. So this was a landmine that only
+detonates on a build where the native group-by kernel actually works — and
+on a build where it works, the engine raised `NameError` instead of
+returning a table. The "fast path" was both unreachable here and broken
+where reachable. Confirmed with `tools/probe_arrow_groupby.py`, which prints
+the module namespace, the guard's answer, and the result of calling the
+function with the guard forced on.
+
+**607 of 609 tests were green while this was in the tree.** The suite tests
+behaviour; it cannot see a name that resolves or not on a build that never
+reaches the line.
+
+#### Two truncated functions
+
+`vulture` found unreachable code, and all four instances had the same
+signature as the earlier `return openpyxl` in `connectors/excel.py` — a
+function whose body was cut short with its old tail left behind:
+
+| location | dead code |
+|---|---|
+| `engines/base.py` | `raise NotImplementedError(...)` after a `return` in `PredicateCompiler.compile` |
+| `governance/policy.py` | a second `return level` after the first |
+| `ir/nodes.py` | `return node.type in _SINK_NODES` after `return out` |
+| **`engines/polars_gpu_engine.py`** | **`write()` computed the host table, imported `ArrowEngine`, then ended** |
+
+The fourth is a functional bug, not tidiness. `PolarsGPUEngine.write()`
+returned `None` where the contract promises an `int`, and **wrote nothing
+at all** — a silent no-op on the one engine whose entire purpose is speed.
+The two surviving lines made the intent obvious and matched
+`CudfEngine.write`, so it was completed the same way: collect off the device
+once, then delegate the write to Arrow.
+
+#### Undefined names in annotations
+
+`Any` in `capability/registry.py`, `Iterable` and `Callable` in
+`hardware/calibrate.py`, `Mapping` in `interchange/table.py` and
+`sdk/pipeline.py` — all used in annotations, all absent from the imports.
+Harmless at runtime only because `from __future__ import annotations`
+defers evaluation; `typing.get_type_hints()` and any type checker would
+have failed on them.
+
+#### Two tests that could not fail
+
+The most embarrassing finding, and `ruff` F841 is what exposed it.
+`test_render_shows_every_term` called `CostBreakdown.render()` and
+discarded the string. `test_a_join_merges_both_sides` built a tagged table
+and asserted nothing, despite a docstring claiming it verified that a join
+inherits both sides' tags — which is a **privacy** property. Both now assert
+properly: the first checks every cost term appears and that the total
+reconciles; the second performs a real join and checks the joined column
+inherits the CONFIDENTIAL tag from both inputs.
+
+Writing the assertions caught two of my own errors immediately — I guessed
+`inbound_s` (the field is `read_s`/`spill_s`/`materialise_s`) and computed
+the join cardinality as 3 when it is 5 (NA×NA twice, plus EU). Both would
+have been wrong assertions, which is the argument for making these tests
+real rather than decorative.
+
+#### Now enforced
+
+`tests/test_cli.py::TestNoSilentLint` shells out to `ruff` and `vulture`
+and fails the suite on any finding, skipping cleanly when the tools are not
+installed. This is the third gate alongside `pytest` and
+`verify_release.py` — and it is the first one that can catch a defect in
+code that *no execution path on this machine reaches*.
 
 ---
 
@@ -314,7 +395,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**607 tests: 607 passing, 8 skipped, 0 failing.** Every skip states the
+**609 tests: 609 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |

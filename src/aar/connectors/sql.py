@@ -28,13 +28,12 @@ recorded rather than glossed:
 
 from __future__ import annotations
 
-from typing import Any, Mapping, Sequence
+from typing import Any, Sequence
 
-from ..failures import SourceUnavailable, TypeMismatchError
+from ..failures import SourceUnavailable
 from ..interchange import Table
-from ..ir import BinOp, Col, Expr, Func, Lit, Node, NodeType, UnaryOp
-from ..types import (BOOLEAN, DATE32, FLOAT32, FLOAT64, INT32, INT64, UTF8,
-                     DataType, Field, Schema, TIMESTAMP)
+from ..ir import BinOp, Col, Func, Lit, Node, UnaryOp
+from ..types import (DataType, Field, Schema)
 
 __all__ = [
     "SqlDialect", "SQLITE", "POSTGRESQL", "MYSQL", "SqlConnector",

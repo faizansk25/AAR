@@ -100,8 +100,28 @@ class TestTagPreservation:
             assert not out.schema.get("n").classification, engine_id
 
     def test_a_join_merges_both_sides(self):
-        """Either input can contribute to a joined row."""
+        """Either input can contribute to a joined row.
+
+        This test used to build a tagged table and assert nothing, so the
+        claim in its own docstring was never checked. A join that dropped one
+        side's tags would leak: the column would keep its value and lose the
+        CONFIDENTIAL label that governs whether it may leave.
+        """
+        from aar.engines import create_engine
+        from aar.ir import JoinType
+
         left = tagged_table()
+        right = tagged_table(rows={"region": ["NA", "EU", "NA"],
+                                  "salary": [1, 2, 3]})
+        engine = create_engine("arrow")
+        joined = engine.join(left, right, ["region"], JoinType.INNER)
+        # The joined `salary` is a function of a row from *both* sides, so it
+        # must inherit the union of their tags rather than either one's.
+        assert CONF <= set(joined.schema.get("salary").classification)
+        # 3 rows each side; joining on `region` pairs NA with NA twice
+        # (2 x 2 = 4 rows) and EU with EU once, so 5. Written out because
+        # "however many rows came out" is not a useful assertion.
+        assert joined.num_rows == 5
 
 
 class TestEngineParity:

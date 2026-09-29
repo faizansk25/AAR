@@ -6,7 +6,7 @@ import pytest
 
 from aar import types as T
 from aar.types import (DECIMAL, FLOAT64, INT32, INT64, INT8, TIMESTAMP, UINT8,
-                       ConversionLog, DataType, Field, Schema, TypeKind)
+                       ConversionLog, Field, Schema, TypeKind)
 
 
 class TestSourceMapping:

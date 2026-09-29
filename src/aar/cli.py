@@ -288,7 +288,7 @@ def _cmd_policy(args: argparse.Namespace) -> int:
     """Inspect, validate, or write out a policy file."""
     import json
 
-    from .governance import EXAMPLE_POLICY, load_policy, policy_from_dict
+    from .governance import EXAMPLE_POLICY, load_policy
 
     if args.write_example:
         with open(args.write_example, "w", encoding="utf-8") as fh:
