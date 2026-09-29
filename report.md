@@ -235,7 +235,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**540 tests: 540 passing, 5 skipped, 0 failing.** Every skip states the
+**601 tests: 601 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |
@@ -343,6 +343,33 @@ Testing found real defects, not just typos. The notable ones:
 | Unknown key in a policy file silently ignored | A misspelled `mask_threshold` leaves a policy that looks configured and protects nothing | `policy_from_dict` rejects unknown keys by name |
 | Column UDF received only the first column | A UDF could quietly operate on the wrong data and return a plausible wrong answer | Column mode receives a dict of every column |
 | BOM from PowerShell redirection | Hard syntax error in every written file | `check_syntax.py` normaliser |
+| `ws.cell(row=1, column=1)` used to ask whether a fresh sheet was empty | In openpyxl that call *materialises* cell A1, advancing the append cursor so the header landed on row 2 with a blank first row; the reader then took the wrong header and mis-inferred every type after it | Never probe a sheet this code just created |
+| `to_pylist()` + `ws.cell()` per cell in the Excel writer | Row-major materialisation of every row as a dict, and one general-purpose call per cell | `to_pydict()` + `ws.append()` per row |
+
+
+### The Excel optimisation, and a retraction
+
+Round 10 rewrote the Excel writer and then measured it, and the measurement
+disproved the premise. At 50,000 rows x 12 columns
+(`tools/probe_excel_phases.py`):
+
+| form | write ms | save ms | total ms |
+|---|---|---|---|
+| per-cell | 10,382 | 40,782 | 51,165 |
+| append | 7,398 | 40,502 | 47,900 |
+| write_only | 47,490 | 2,443 | 49,933 |
+
+`wb.save()` dominates. openpyxl stores a `Cell` object per cell in
+`ws._cells` whichever API writes it, so the save has identical work to do
+either way, and `ws.cell()` was never the bottleneck. The rewrite is a real
+~6% improvement and a large cut in call count — **it is not the speedup the
+first draft of the code comment claimed, and that comment was corrected
+rather than left to flatter the diff.** `write_only=True` does not rescue
+the time either; it relocates the 40s and its real benefit is memory.
+
+This is the second retraction in the programme. The first was the "213x
+Arrow group-by defect", which was 97% benchmark contamination. Both were
+caught the same way: by measuring instead of assuming.
 
 
 ---
