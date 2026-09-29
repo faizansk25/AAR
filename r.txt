@@ -1,3 +1,0 @@
-04e2c2c The third T4 run: cuDF verified end to end, and the GPU lost again
-To https://github.com/faizansk25/AAR.git
-   bd0ec5d..04e2c2c  main -> main

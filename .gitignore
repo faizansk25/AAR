@@ -54,6 +54,24 @@ Thumbs.db
 *.log
 *.out
 *.tmp
+# Single-letter scratch files used to capture command output. They are
+# transient by construction - created to read one result, deleted after -
+# so tracking them only ever produces a commit that removes a file nobody
+# wanted. `aar` is the package, not a log; nothing in the project is named
+# this, which is exactly why the pattern is safe.
+?.txt
+!CHANGELOG.txt
+# Generated build/verification output, in case a run is left behind.
+b.txt
+x.txt
+t.txt
+vr.txt
+g2.txt
+p.txt
+q.txt
+s.txt
+rn.txt
+rn2.txt
 .*.txt
 .*.err
 !requirements*.txt
