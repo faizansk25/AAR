@@ -148,7 +148,13 @@ def _import_cudf() -> Any:
 
 
 def _out(column: str | None, agg: Agg) -> str:
-    return getattr(agg, "output", None) or column or "value"
+    """The output column name for an aggregate.
+
+    Polars has no third positional for a name, so `custom` is where AAR
+    carries it; falling back to the source column keeps `SUM(amount)`
+    arriving as `amount`, which is what every other engine does too.
+    """
+    return getattr(agg, "custom", None) or column or "value"
 
 
 def _pl_agg(agg: Agg) -> Any:
@@ -160,8 +166,17 @@ def _pl_agg(agg: Agg) -> Any:
     """
     import polars as pl
 
-    col = agg.column
-    op = (agg.op or "").upper()
+    from ..ir import Agg, Col
+
+    # Agg is (func, arg, distinct, custom). `arg` is the expression, so a
+    # column name comes off a Col - and `agg.column` does not exist, which
+    # the first T4 run found.
+    arg = agg.arg
+    col = arg.name if isinstance(arg, Col) else None
+    op = (agg.func or "").upper()
+    if col is None and op != "COUNT":
+        raise NotImplementedError(
+            f"the polars GPU engine needs a column for {op!r}")
     if op == "SUM":
         return pl.col(col).sum().alias(_out(col, agg))
     if op == "MIN":
@@ -180,6 +195,10 @@ def _pl_agg(agg: Agg) -> Any:
         return pl.col(col).first().alias(_out(col, agg))
     raise NotImplementedError(
         f"the polars GPU engine does not implement {op!r}")
+
+
+def _out(column: str | None, agg: Agg) -> str:
+    return getattr(agg, "custom", None) or column or "value"
 
 
 def _to_pl_expr(expr: Expr) -> Any:

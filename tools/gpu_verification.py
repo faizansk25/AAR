@@ -160,8 +160,11 @@ def benchmark(result: dict) -> None:
     print(f"table: {table.num_rows:,} rows x {table.num_columns} columns",
           flush=True)
 
-    aggs = {"total": Agg("SUM", Col("v"), "total"),
-            "n": Agg("COUNT", Col("v"), "n")}
+    # Agg is (func, arg, distinct, custom). The third positional is
+    # `distinct`, so passing the output name there made every aggregate
+    # arrive flagged DISTINCT - which is exactly what the first T4 run
+    # reported for cudf, and it was this script's bug, not the engine's.
+    aggs = {"total": Agg("SUM", Col("v")), "n": Agg("COUNT", Col("v"))}
     baseline = None
     for engine_id in ("arrow", "duckdb", "polars_cpu", "pandas",
                       "cudf", "polars_gpu"):
@@ -204,29 +207,57 @@ def decisions(result: dict) -> None:
     try:
         from aar.capability import Device
         from aar.cost import default_cost_model
-
-        model = default_cost_model()
-        for nbytes in (10_000_000, 100_000_000, 1_000_000_000):
-            for kernel_ms in (5.0, 20.0, 80.0):
-                cpu = model.node_cost_for(
-                    bytes_moved=nbytes, engine="arrow", device=Device.CPU,
-                    kernel_ms=kernel_ms, transfer_ms=0.0)
-                gpu = model.node_cost_for(
-                    bytes_moved=nbytes, engine="cudf", device=Device.GPU,
-                    kernel_ms=kernel_ms * 0.1, transfer_ms=nbytes / 8e9)
-                row = {"bytes": nbytes, "kernel_ms": kernel_ms,
-                       "cpu_ms": round(cpu.total_ms, 1),
-                       "gpu_ms": round(gpu.total_ms, 1),
-                       "picked": "gpu" if gpu.total_ms < cpu.total_ms
-                                 else "cpu"}
-                result["decisions"].append(row)
-                print(f"  {nbytes:>13,}B kernel={kernel_ms:>5.1f}ms  "
-                      f"cpu={row['cpu_ms']:>8.1f}ms  "
-                      f"gpu={row['gpu_ms']:>8.1f}ms -> {row['picked']}",
-                      flush=True)
+        from aar.ir import Node, NodeType
     except Exception as exc:  # noqa: BLE001
-        result["errors"].append(f"cost model: {exc}")
-        print(f"cost model: {exc}", flush=True)
+        result["errors"].append(f"cost model import: {exc}")
+        print(f"cost model import failed: {exc}", flush=True)
+        return
+
+    # The real API is `node_cost(node, engine_id, nbytes, residency=...)`,
+    # and `residency` is the parameter that decides whether a transfer is
+    # paid at all. The first T4 run called a `node_cost_for` that never
+    # existed, so this section produced no rows at all.
+    model = default_cost_model()
+    # A sink keeps its result on the device, so nothing has to come back.
+    node = Node(NodeType.GROUP, estimated_bytes=1_000_000_000)
+    for nbytes in (10_000_000, 100_000_000, 1_000_000_000):
+        node.estimated_bytes = nbytes
+        try:
+            cpu, cpu_src = model.node_cost(node, "duckdb", nbytes)
+            gpu, gpu_src = model.node_cost(node, "cudf", nbytes)
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"cost model: {exc}")
+            print(f"cost model: {exc}", flush=True)
+            return
+        row = {
+            "bytes": nbytes,
+            "cpu_ms": round(cpu.total_ms, 1),
+            "gpu_ms": round(gpu.total_ms, 1),
+            "cpu_kernel_ms": round(cpu.kernel_ms, 1),
+            "gpu_kernel_ms": round(gpu.kernel_ms, 1),
+            "cpu_transfer_ms": round(cpu.transfer_ms, 1),
+            "gpu_transfer_ms": round(gpu.transfer_ms, 1),
+            "cpu_source": cpu_src,
+            "gpu_source": gpu_src,
+            # A device-resident feed removes the inbound transfer, which is
+            # the whole point of keeping data on the GPU across segments.
+            "gpu_resident_ms": round(
+                model.node_cost(node, "cudf", nbytes,
+                                residency=Device.GPU)[0].total_ms, 1),
+            "picked": "gpu" if gpu.total_ms < cpu.total_ms else "cpu",
+        }
+        result["decisions"].append(row)
+        print(f"  {nbytes:>13,}B  cpu={row['cpu_ms']:>9.1f}ms "
+              f"(kern {row['cpu_kernel_ms']:>8.1f} + xfer "
+              f"{row['cpu_transfer_ms']:>8.1f})  "
+              f"gpu={row['gpu_ms']:>9.1f}ms "
+              f"(kern {row['gpu_kernel_ms']:>8.1f} + xfer "
+              f"{row['gpu_transfer_ms']:>8.1f})  "
+              f"gpu-resident={row['gpu_resident_ms']:>9.1f}ms  "
+              f"-> {row['picked']}", flush=True)
+    print("\n  Note: these are estimates from the cost model on THIS host, "
+          "not measurements.\n  The measured numbers are in section 5.",
+          flush=True)
 
 
 def main() -> int:
