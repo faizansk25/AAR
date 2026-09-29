@@ -1,50 +1,63 @@
-A benchmark tool, and the 1,360x outlier it found on the first run
+Run the benchmark on real data: two engines fail outright
 
-tools/bench_engines.py measures the whole engine contract - filter,
-filter_nested, project, group_by, sort, limit, join - on every engine that
-constructs, with a median of several repeats and the spread printed
-beside it.
+tools/bench_engines.py gains --real, which benchmarks an actual Parquet
+file instead of generated arithmetic, and a set of real_operations
+chosen to be the shapes that break systems rather than the ones that
+flatter them: a skewed range, a conjunction, a disjunction, a low-
+cardinality group, a high-cardinality group on a measure (not a
+category), a date-part group, an inner join to a small dimension table,
+and a left join.
 
-The spread is the point. A benchmark reporting one number measures the
-scheduler: DuckDB's group-by was 53.7 ms and 293.6 ms on two Colab runs of
-identical code. So every figure here carries its spread, a ratio smaller
-than the spread is called noise rather than a result, and each result is
-fingerprinted so a fast *wrong* answer cannot be reported as a win.
+The synthetic data exists to be predictable, which is precisely what makes
+it unrepresentative. Here is the answer to "does this survive real
+pipelines": on 1,000,000 rows of real NYC taxi data, two of four
+executing engines FAIL.
 
-The data is deliberately wide. Narrow data hides a real cost - an engine
-that copies every column regardless of projection looks identical to one
-that pushes the projection down, as long as the group-by needs every column
-anyway - so eight `pad` columns are added that nothing reads.
+  group_by_datepart        arrow   FAIL  SchemaDriftError: fare_amount:
+  group_by_datepart        pandas  FAIL    nulls appeared in a non-nullable
+                                          column
+  group_by_datepart        duckdb        4,152.56 ms
+  group_by_datepart        polars_cpu      14.21 ms
 
-IT FOUND A 3,936x OUTLIER ON THE FIRST RUN.
+  group_by_cardinality     arrow   FAIL  same SchemaDriftError
+  group_by_cardinality     pandas  FAIL  same SchemaDriftError
 
-  operation      engine         median ms   x fastest
-  filter_nested  arrow     20,113.87 -> 14.79   3936x -> 1.0x
-  group_by       pandas          1,493.07     161x
-  group_by       arrow            1,526.29     159x
-  join           pandas          4,459.10     159x
-  join           arrow            4,622.24     159x
+  join                     arrow   FAIL  same SchemaDriftError
+  join                     pandas  FAIL  same SchemaDriftError
+  join                     duckdb    1,195.87 ms
+  join                     polars_cpu   76.54 ms
 
-ArrowEngine._vector_filter handled exactly one shape: a single comparison
-with a column on the left. A conjunction fell through to _row_filter,
-which materialises every row as a Python dict and calls a Python predicate
-per row - 20 seconds for 500,000 rows, reproducible to within 0.4%. The
-single-comparison case measured 17 ms and looked fine, which is exactly why
-it survived; the benchmark had to try the *nested* shape to see it.
+Everything that completed agrees exactly, on real data, across engines -
+that part of the correctness claim holds. The failures are all the same
+one, and it is the most important thing in this commit.
 
-It is now recursive: AND/OR, null tests and nested arithmetic all take the
-Arrow kernel path, using and_kleene/or_kleene so a null operand stays
-unknown rather than silently becoming false. Returning None still means
-"use the row path", so an exotic predicate is slower rather than wrong.
+THE CAUSE. arrow_to_canonical infers nullability from the Arrow schema. A
+Parquet file that contains nulls frequently does not record that fact in
+its schema, so the canonical Schema is built saying "non-nullable", and
+the executor's null handling then raises SchemaDriftError when it meets
+the first null. Grouping a column with a million distinct values
+materialises far more of it; joining touches all of it; either one
+surfaces the mismatch that a small aggregate happened to avoid.
 
-This is the third time the same shape of defect has appeared - pandas
-frame.apply, then cuDF query, then this - which is the argument for having
-a benchmark rather than a list of known slow things.
+Why the synthetic benchmark could never have found it: the generated data
+has no nulls, so the bug is invisible until real data with real nulls
+arrives. This is the strongest argument yet for testing on real files.
 
-MEASURED AND STILL OPEN, not fixed here:
-- arrow/pandas join ~4.5 s, 159x. ArrowEngine.join is a hand-written
-  Python hash join; pyarrow has had a native Table.join for years.
-- arrow/pandas group_by ~1.5 s, 160x. Both delegate to the same Python
-  group-by fallback.
+WHY IT MATTERS MORE THAN A SLOWDOWN. arrow and pandas are exactly the
+engines the air-gapped story depends on - arrow is the fallback that runs
+when nothing else is installed, and a `pip install aar[arrow]` install has
+no alternative. An engine that cannot group or join a real Parquet file
+without raising is not a fallback, it is a failure with a worse error
+message.
 
-594 passed, 7 skipped.
+Also visible, and not a defect: duckdb's limit takes 84 ms against
+polars' 0.97 ms. Relation materialisation for a 1,000-row head is pure
+overhead on a column engine. It is in the outlier list because the ratio
+is real, not because anything is wrong.
+
+NOT FIXED HERE. The fix is to stop inferring nullability from schema
+metadata and to take it from the data, which means a null-count pass on
+load - a real design change to the interchange layer, not a patch. It
+needs its own commit with its own tests, and the honest version of this
+report is that AAR currently does NOT survive real data on the two
+engines an air-gapped install depends on.

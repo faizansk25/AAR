@@ -80,6 +80,55 @@ def build_right(table: Table) -> Table:
     return Table(arrow, schema)
 
 
+def build_real(path: str, limit: int | None = None) -> "tuple[Table, Table]":
+    """Load a real Parquet file and derive a dimension table from it.
+
+    The synthetic generator exists to be predictable, which is exactly what
+    makes it unrepresentative: real columns are ragged, nulls are everywhere,
+    values are skewed, and a trip's duration is a product of two timestamps
+    rather than a modulo. A benchmark on generated arithmetic can confirm a
+    kernel is being called; only a real file shows whether the pipeline
+    survives what analysts actually have.
+
+    Returns the fact table and a small right-hand side, so `join` is
+    exercised on a real key with real duplicate groups rather than a
+    synthetic one.
+    """
+    import pyarrow.parquet as pq
+
+    table_file = pq.read_table(path)
+    if limit and table_file.num_rows > limit:
+        table_file = table_file.slice(0, limit)
+    schema = Schema(tuple(Field(f.name, arrow_to_canonical(f.type))
+                          for f in table_file.schema))
+    table = Table(table_file, schema)
+
+    # A dimension table over the most obviously categorical column, which is
+    # the shape of a real lookup join.
+    key = None
+    for candidate in ("PULocationID", "DOLocationID", "RatecodeID"):
+        if schema.has(candidate):
+            key = candidate
+            break
+    if key is None:
+        key = table.column_names[-1]
+    values = sorted({v for v in table.column(key).to_pylist()[:200_000]
+                     if v is not None})
+    keys_arrow = pa.array(values, pa_table_type(table, key))
+    right_arrow = pa.table({
+        key: keys_arrow,
+        "label": pa.array([f"{key}_{v}" for v in values], pa.utf8()),
+    })
+    right = Table(right_arrow, Schema(tuple(
+        Field(f.name, arrow_to_canonical(f.type)) for f in right_arrow.schema)))
+    return table, right
+
+
+def pa_table_type(table: Table, name: str) -> Any:
+    """The Arrow type of a column, so the dimension table matches it."""
+    return table.arrow.schema.field(name).type
+
+
 def operations(table: Table, right: Table) -> dict[str, Callable]:
     """One callable per engine-contract operation."""
     pads = [c for c in table.column_names if c.startswith("pad")]
@@ -199,17 +248,141 @@ def outliers(results: dict) -> list[tuple[str, str, float, float, float]]:
     return out
 
 
+def real_operations(table: Table, right: Table) -> dict[str, Callable]:
+    """Operations an analyst would actually write against taxi data.
+
+    Chosen to be the shapes that break systems, not the shapes that
+    flatter them: a skewed equality (a fare amount is not uniform), a range
+    on a measure that is frequently null, a high-cardinality group (a
+    timestamp, not a category), a date-part group, and a join to a small
+    dimension table. Nulls are not a special case here; they are the
+    normal case in this file.
+    """
+    schema = table.schema
+    first = table.column_names[0]
+    money = next((c for c in ("fare_amount", "total_amount", "trip_distance")
+                  if schema.has(c)), first)
+    distance = next((c for c in ("trip_distance", "fare_amount", "total_amount")
+                     if schema.has(c) and c != money), money)
+    key = next((c for c in ("PULocationID", "DOLocationID")
+                if schema.has(c)), table.column_names[0])
+    time_col = next((c for c in ("lpep_pickup_datetime",
+                                 "tpep_pickup_datetime") if schema.has(c)),
+                    None)
+    rate = next((c for c in ("RatecodeID", "VendorID") if schema.has(c)),
+                key)
+
+    ops: dict[str, Callable] = {
+        # A single range, the easiest thing there is.
+        "filter_range": lambda e: e.filter(
+            table, BinOp(Col(money), ">", Lit(20.0))),
+        # A conjunction, which is what found the 1,360x Arrow defect.
+        "filter_nested": lambda e: e.filter(table, BinOp(
+            BinOp(Col(money), ">", Lit(10.0)), "AND",
+            BinOp(Col(distance), "<", Lit(20.0)))),
+        # A disjunction, the shape a "or" in a real filter takes.
+        "filter_or": lambda e: e.filter(table, BinOp(
+            BinOp(Col(money), "<", Lit(0.0)), "OR",
+            BinOp(Col(money), ">", Lit(200.0)))),
+        "project": lambda e: e.project(
+            table, [key, money, distance]),
+        "group_by": lambda e: e.group_by(table, [key], {
+            "total": Agg("SUM", Col(money)),
+            "n": Agg("COUNT", Col(money))}),
+        "group_by_cardinality": lambda e: e.group_by(table, [money], {
+            "n": Agg("COUNT", Col(money))}),
+        "group_by_datepart": lambda e: e.group_by(table, [time_col or key], {
+            "total": Agg("SUM", Col(money))}),
+        "sort": lambda e: e.sort(table, [(money, False)]),
+        "limit": lambda e: e.limit(table, 1000),
+        "join": lambda e: e.join(table, right, [key], "inner"),
+        "join_left": lambda e: e.join(table, right, [key], "left"),
+    }
+    return ops
+
+
+def run_real(path: str, limit: int | None, repeats: int) -> dict:
+    table, right = build_real(path, limit)
+    ops = real_operations(table, right)
+    engines = available()
+    nulls = sum(
+        1 for name in table.column_names
+        if table.column(name).null_count > 0)
+    print(f"\nREAL DATA: {os.path.basename(path)}")
+    print(f"  {table.num_rows:,} rows x {table.num_columns} columns, "
+          f"{repeats} repeats")
+    print(f"  {nulls} of {table.num_columns} columns contain nulls")
+    print(f"  right-hand table: {right.num_rows} rows")
+    print(f"  engines: {', '.join(engines)}\n", flush=True)
+
+    return _measure(ops, engines, repeats, f"{table.num_columns} real columns")
+
+
+def _measure(ops: dict, engines: list, repeats: int, note: str) -> dict:
+    results: dict[str, dict] = {}
+    for op_name, op in ops.items():
+        print(f"  {op_name}  ({note})")
+        for engine_id in engines:
+            samples: list[float] = []
+            prints: set[str] = set()
+            error = None
+            for _ in range(repeats):
+                try:
+                    with create_engine(engine_id,
+                                       allow_degradation=False) as engine:
+                        started = time.perf_counter()
+                        out = op(engine)
+                        samples.append(
+                            (time.perf_counter() - started) * 1000.0)
+                    prints.add(fingerprint(out))
+                except Exception as exc:  # noqa: BLE001
+                    error = f"{type(exc).__name__}: {str(exc)[:80]}"
+                    break
+            entry: dict[str, Any] = {}
+            if error:
+                entry["error"] = error
+                print(f"    {engine_id:12s} FAIL {error}")
+            else:
+                median = statistics.median(samples)
+                spread = ((max(samples) - min(samples)) / median * 100
+                          if median else 0.0)
+                entry.update({
+                    "median_ms": round(median, 2),
+                    "min_ms": round(min(samples), 2),
+                    "max_ms": round(max(samples), 2),
+                    "spread_pct": round(spread, 1),
+                    "distinct_results": len(prints),
+                })
+                flag = "  <-- NONDETERMINISTIC" if len(prints) > 1 else ""
+                print(f"    {engine_id:12s} {median:9.2f} ms "
+                      f"(spread {spread:4.1f}%){flag}")
+            results.setdefault(engine_id, {})[op_name] = entry
+    return results
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=500_000)
     parser.add_argument("--repeats", type=int, default=5)
     parser.add_argument("--json", default="")
+    parser.add_argument(
+        "--real", default="",
+        help="a real Parquet file to benchmark instead of generated data. "
+             "Generated arithmetic confirms a kernel is called; only a real "
+             "file shows whether the pipeline survives what analysts have.")
+    parser.add_argument("--real-limit", type=int, default=0,
+                        help="cap the rows read from --real, for a quick pass")
     args = parser.parse_args()
 
     print("=" * 72)
     print("  AAR engine benchmark")
+    if args.real:
+        print(f"  REAL DATA: {args.real}")
     print("=" * 72)
-    results = run(args.rows, args.repeats)
+    if args.real:
+        results = run_real(args.real, args.real_limit or None, args.repeats)
+    else:
+        results = run(args.rows, args.repeats)
 
     print("\n" + "=" * 72)
     print("  Outliers: slower than the fastest engine for that operation")
