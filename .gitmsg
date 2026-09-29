@@ -1,0 +1,30 @@
+Correct the release fixture, not the reader, twice
+
+The end-to-end release check had been failing for two reasons, and both
+were the fixture asserting behaviour the system does not have - which is
+the more embarrassing direction to be wrong in.
+
+1. The fixture wrote a CSV with a padded header, `"  region ,  amount"`,
+   and expected the reader to strip it. pyarrow.csv does not strip
+   whitespace from header names, so the column really is called
+   `"  region "` and the group-by fails with
+   `KeyError: 'Field "region" does not exist in schema'`.
+
+   I invented that expectation. The honest fix is to stop asserting it.
+   Stripping header whitespace is a defensible *feature* - real exports
+   have padded headers - but it is a semantic change to every reader, and
+   making it quietly, at the end of a session, to satisfy a test I wrote,
+   is how a reader change turns into an unreviewed behaviour change. It is
+   recorded as a gap instead.
+
+2. The fixture then split the output on commas by hand and found `"r0"`
+   where it expected `r0`. The writer is correct: quoting string fields is
+   RFC 4180 and what every Arrow and pandas writer does. The fixture was
+   wrong and now parses with the csv module, which also survives a value
+   containing a comma.
+
+14/14 release checks pass. The installed wheel now runs a real pipeline
+end to end, and its output is checked against an independent Python loop
+rather than against another engine.
+
+594 passed, 7 skipped. twine check passes for wheel and sdist.

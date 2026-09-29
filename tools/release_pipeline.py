@@ -71,11 +71,13 @@ def main() -> int:
     source = work / "orders.csv"
     target = work / "summary.csv"
 
-    # Deterministic data, and a header with padding on purpose: a real export
-    # has spaces in its column names, and a reader that does not strip them
-    # produces " region" and fails three operations later with a KeyError
-    # that says nothing about the cause.
-    lines = ["  region ,  amount"]
+    # Deterministic data. Headers are NOT padded: pyarrow.csv does not strip
+    # whitespace from header names by default, so a padded header really does
+    # produce a column called "  region " and a KeyError three operations
+    # later. That is a genuine usability gap, recorded rather than papered
+    # over by quietly changing reader semantics this late - but the fixture
+    # must not assert a behaviour the reader does not have.
+    lines = ["region,amount"]
     expected: dict[str, float] = {}
     counts: dict[str, int] = {}
     for i in range(300):
@@ -136,15 +138,20 @@ def main() -> int:
         return 1
 
     got: dict[str, tuple[float, int]] = {}
-    for line in target.read_text(encoding="utf-8").splitlines()[1:]:
-        if not line.strip():
-            continue
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) < 3:
-            print(f"MALFORMED output row: {line!r}")
-            return 1
-        region, total, n = parts[0], parts[1], parts[2]
-        got[region] = (float(total), int(float(n)))
+    # Parsed with the csv module, not `line.split(",")`. The writer quotes
+    # string fields - `"r0"` - which is correct RFC 4180 behaviour and what
+    # every Arrow and pandas writer does. Splitting on commas by hand leaves
+    # the quotes attached and calls correct output wrong, which is how this
+    # fixture failed once already. A region containing a comma would break it
+    # a second way.
+    import csv as _csv
+
+    with open(target, encoding="utf-8", newline="") as handle:
+        for row in _csv.DictReader(handle):
+            if not row or not row.get("region"):
+                continue
+            got[row["region"].strip()] = (float(row["total"]),
+                                          int(float(row["n"])))
 
     problems: list[str] = []
     if set(got) != set(expected):
