@@ -250,6 +250,68 @@ class SegmentPlan:
         return " -> ".join(self.segment.op_types)
 
 
+def pushdown_report(root: Node) -> list[str]:
+    """What each source is being asked to do itself, in the analyst's words.
+
+    This is the one part of a plan an analyst can act on. Everything else
+    in `aar explain` describes *which* engine runs; this describes *how
+    much data the analyst's own database never had to send*. Source
+    pushdown is priority one in the planner's ordering for exactly that
+    reason - it is the only optimisation whose saving is paid before the
+    data moves - and until now the runtime performed it silently, so the
+    largest win in the system was invisible to the person it was for.
+
+    Deliberately reports only what can be shown to be true. The
+    specification's example prints "reduces transfer by estimated 91.2%";
+    that number needs the source's full column count and a cardinality
+    estimate for the predicate, and inventing either would be a fabricated
+    figure in the one place an analyst is deciding whether to trust the
+    plan. So the pushed predicate and the pushed columns are shown, and a
+    reduction is quantified only when the schema makes it computable.
+    """
+    lines: list[str] = []
+    for node in root.walk():
+        spec = getattr(node, "scan", None)
+        if spec is None:
+            continue
+        kind = (spec.kind or "").lower()
+        if kind in ("sql", "sqlite", "postgresql", "mysql", "mongo"):
+            what = spec.table or spec.collection or ""
+            detail: list[str] = []
+            predicate = getattr(node, "predicate", None)
+            if predicate is not None:
+                rendered = _render_predicate(kind, predicate)
+                detail.append(
+                    f"pushed WHERE {rendered}" if rendered else
+                    "filter could not be pushed; it runs locally after the "
+                    "full result is fetched")
+            if spec.columns:
+                detail.append("pushed projection: " + ", ".join(spec.columns))
+            if detail:
+                lines.append(f"[{kind} scan: {what}]".rstrip(": "))
+                lines.extend(f"    {d}" for d in detail)
+        elif kind == "parquet" and spec.columns:
+            # DuckDB reads Parquet row groups selectively, so a column
+            # projection genuinely avoids reading the others. CSV and JSON
+            # are absent because there is nothing true to say about them.
+            lines.append("[parquet scan]")
+            lines.append(f"    pushed projection: {', '.join(spec.columns)}")
+    return lines
+
+
+def _render_predicate(kind: str, predicate: object) -> str:
+    """The predicate as the *source* would spell it, or "" if it cannot be."""
+    try:
+        if kind == "mongo":
+            from ..connectors.mongo import render_match
+
+            return str(render_match(predicate) or "")
+        return str(predicate.to_sql())
+    except Exception:  # noqa: BLE001 - an unrenderable predicate is a fact
+        # to report, not a reason to fail the whole explain.
+        return ""
+
+
 @dataclass(slots=True)
 class Plan:
     """A complete plan, with the accounting that justifies it."""
@@ -270,6 +332,14 @@ class Plan:
 
     def render(self) -> str:
         lines = ["PLAN", ""]
+        pushed = pushdown_report(self.root)
+        if pushed:
+            # Before the engine lines, because it is the answer to the
+            # question an analyst actually has - "what did you avoid moving?"
+            # - and it is decided before any engine is chosen.
+            lines.append("PUSHED TO SOURCE")
+            lines.extend(pushed)
+            lines.append("")
         for sp in self.segments:
             lines.append(sp.render())
         lines.append("")

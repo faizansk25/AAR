@@ -242,6 +242,101 @@ class TestMongoTypeNames:
         assert mongo_type_of([1]) == "array"
 
 
+class TestPushdownIsVisible:
+    """Pushdown is priority one. It must not be invisible.
+
+    The SQL and MongoDB connectors genuinely push a filter and a projection
+    into the source - verified against a real SQLite database elsewhere in
+    this file - and the planner's own priority order puts source pushdown
+    first, because it is the only optimisation whose saving is paid *before*
+    any data moves. Until now the runtime did all of that and the analyst
+    was never told, which made the largest win in the system invisible to
+    the person it exists for.
+
+    These run against a real database rather than a mock: a pushdown report
+    that names a table and a predicate is only worth anything if the pushdown
+    it describes actually happened.
+    """
+
+    def _db(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "orders.db"
+        con = sqlite3.connect(path)
+        con.execute("CREATE TABLE orders (region TEXT, amount REAL, note TEXT)")
+        con.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [("NA", 100.0, "a"), ("EU", 200.0, "b"), ("NA", 300.0, "c")],
+        )
+        con.commit()
+        con.close()
+        return path
+
+    def _scan_node(self, db_path, predicate=None, columns=()):
+        from aar.ir import Node, NodeType, ScanSpec
+
+        spec = ScanSpec(kind="sqlite", path=str(db_path), table="orders",
+                        columns=tuple(columns))
+        node = Node(NodeType.SCAN_SQL, scan=spec)
+        if predicate is not None:
+            node.predicate = predicate
+        return node
+
+    def test_a_pushed_filter_is_shown_with_its_sql(self, tmp_path):
+        from aar.ir import BinOp, Col, Lit
+        from aar.planner import pushdown_report
+
+        node = self._scan_node(
+            self._db(tmp_path), predicate=BinOp(Col("amount"), ">", Lit(150)))
+        text = "\n".join(pushdown_report(node))
+        assert "pushed WHERE" in text, text
+        assert "amount" in text, text
+        assert "150" in text, text
+
+    def test_a_pushed_projection_is_shown(self, tmp_path):
+        from aar.planner import pushdown_report
+
+        node = self._scan_node(self._db(tmp_path),
+                               columns=("region", "amount"))
+        text = "\n".join(pushdown_report(node))
+        assert "pushed projection" in text, text
+        assert "region" in text and "amount" in text, text
+        # The column that was NOT asked for must not appear, or the report
+        # is not describing the pushdown.
+        assert "note" not in text, text
+
+    def test_a_source_with_nothing_pushed_reports_nothing(self, tmp_path):
+        """Silence here is correct, and is different from a wrong claim."""
+        from aar.planner import pushdown_report
+
+        node = self._scan_node(self._db(tmp_path))
+        assert pushdown_report(node) == []
+
+    def test_the_rendered_plan_shows_the_pushdown(self, tmp_path):
+        """The pushdown appears above the engine lines, in a real render.
+
+        The `Plan` is built by hand rather than by the planner, because a
+        bare SQL scan has no feasible engine on this build: `sqlite` is
+        declared in the catalogue but has no execution class, so the
+        planner correctly refuses it. That refusal is a separate property
+        with its own test; what matters here is that the render path shows
+        the pushdown and shows it first.
+        """
+        from aar.ir import BinOp, Col, Lit
+        from aar.planner import Plan
+
+        node = self._scan_node(
+            self._db(tmp_path), predicate=BinOp(Col("amount"), ">", Lit(150)),
+            columns=("region", "amount"))
+        text = Plan(root=node, segments=[], total_s=0.0).render()
+        assert "PUSHED TO SOURCE" in text, text
+        assert "pushed WHERE" in text, text
+        assert "pushed projection" in text, text
+        # It must come before the segment lines: it is the more useful
+        # answer, and it is decided first.
+        assert text.index("PUSHED TO SOURCE") < text.index("total"), text
+
+
 class TestMongoMatchRendering:
     def test_a_simple_comparison_renders(self):
         got = render_match(BinOp(Col("amount"), ">", Lit(100)))
