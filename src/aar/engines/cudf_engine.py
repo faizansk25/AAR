@@ -14,8 +14,12 @@ about, and it is asserted in the tests: one device-to-host transfer per
 boundary, not per node.
 
 **What this is and is not.** It is real code against the real RAPIDS API.
-It has not been executed on a GPU, because the development machine has no
-CUDA device - see ``report.md`` section 8.2. Writing it does not calibrate
+It has not been executed on a GPU *on the development machine*, because that
+machine has no CUDA device - the GPU evidence, including what a T4 run did
+and did not establish, is in `data/gpu/README.md`. (An earlier version of
+this docstring pointed at a "report.md section 8.2" that does not exist;
+`data/gpu/README.md` is the document that actually carries the evidence.)
+Writing it does not calibrate
 it, and nothing here is a performance claim. What the tests *do* establish
 on a CPU-only host is that the Arrow/cuDF boundary, the device-residency
 guarantee, the aggregate mapping and the decline behaviour are correct.

@@ -35,6 +35,16 @@ every CPU engine on the same data. `polars_gpu` does not: Polars' own GPU
 backend rejects the grouped plan, so that engine declines with a recorded
 reason and the executor falls back.
 
+> **The run-3 artifact is not in this directory.** Only `t4_run1.json` and
+> `cpu_baseline.json` are committed. The figures above are a transcript of a
+> Colab run whose JSON was not saved back to the repository, so today a
+> reader can verify the CPU baseline and run 1 from these files and cannot
+> verify run 3 from anything here. That is exactly the state this file
+> exists to prevent — a number in a report with no file behind it is a
+> rumour — so it is stated here rather than left for someone to discover.
+> The fix is to re-run `tools/gpu_verification.py` on a T4 and commit the
+> output, not to keep the claim and lose the evidence.
+
 **The GPU lost, twice.** cuDF took 364 ms and 613.8 ms against DuckDB's
 53.7 ms and 293.6 ms on 2M rows / 512 groups. This is the specification's
 counter-example measured rather than asserted: 2M x 2 columns is about

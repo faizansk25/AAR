@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 609 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 622 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -278,17 +278,22 @@ codebase documents in prose instead.
 | 18 | CLI — `aar explain plan` | §16 | ✅ **Complete** | `aar explain` |
 | 19 | Analyst Workbench UI | §17 | 🟡 **Partial — live, translatable, a11y** | 30 workbench tests |
 
-**Progress: 8 of 19 layers complete (42% of the specified system), plus
+**Progress: 9 of 19 layers complete (47% of the specified system), plus
 3 partial.** The completed layers form the chain from "what does this data
 mean" through "what can this machine do" to "what will it cost" to "let me
 see and change it". Each was built to be independently useful and testable
 before its consumer existed.
 
-**What still does not work, stated plainly:** there is no executor, no
-connectors and no SDK, so an analyst cannot yet point AAR at a file and get an
-answer. Everything built so far is substrate. `aar explain plan` is
-deliberately absent rather than stubbed, because a command that prints "not
-implemented" is worse than no command.
+**What still does not work, stated plainly:** an analyst can point AAR at a
+file and get an answer — `aar run` does exactly that, and the release gate
+executes a pipeline from the *installed wheel*. What is missing is the harder
+half of the specification: **GPU and distributed execution at scale, the
+scheduler's real resource management (thread counts, memory ceilings, worker
+concurrency), a data profiler that measures real statistics instead of
+trusting declared cardinalities, and complete Workbench panels.** The
+connector set is narrow for the same reason: Excel, Parquet, CSV and SQLite
+are real; PostgreSQL, MySQL and MongoDB have dialects and pushdown logic but
+have never spoken to a live server.
 
 
 ### 3.6 Capability registry — `src/aar/capability/registry.py`
@@ -467,8 +472,11 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**609 tests: 609 passing, 8 skipped, 0 failing.** Every skip states the
-missing dependency rather than passing vacuously.
+**622 tests: 622 passing, 8 skipped, 0 failing.** Every skip states the
+missing dependency rather than passing vacuously. `README.md` states the same
+number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
+the two ever disagree again — a stale count is the cheapest way to lose a
+reader's trust, and this project shipped one for months.
 
 | Suite | Tests | Coverage |
 |---|---|---|

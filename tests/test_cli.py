@@ -57,6 +57,35 @@ class TestParser:
         assert main([]) == 2
         assert "usage" in capsys.readouterr().out.lower()
 
+    def test_no_docstring_points_at_a_section_that_does_not_exist(self):
+        """A dangling cross-reference is a claim with nothing behind it.
+
+        `cudf_engine.py` pointed readers at "report.md section 8.2" for its
+        GPU evidence. No such section exists, and no test noticed, because
+        prose is not code. The evidence actually lives in
+        `data/gpu/README.md`; this is the check that would have said so.
+        """
+        import re
+
+        root = Path(__file__).resolve().parents[1]
+        report = (root / "report.md").read_text(encoding="utf-8")
+        sections = set(re.findall(r"^#{2,3}\s+(\d+(?:\.\d+)?)[\s.]", report,
+                                  re.MULTILINE))
+        assert sections, "report.md has no numbered sections to check against"
+
+        offenders = []
+        for path in (root / "src").rglob("*.py"):
+            text = path.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r"report\.md`?\s+section\s+(\d+(?:\.\d+)?)",
+                                 text, re.IGNORECASE):
+                if m.group(1) not in sections:
+                    offenders.append(
+                        f"{path.relative_to(root)} -> report.md section "
+                        f"{m.group(1)} (which does not exist)")
+        assert not offenders, (
+            "docstrings reference report.md sections that do not exist:\n  "
+            + "\n  ".join(offenders))
+
     def test_the_readme_test_count_is_the_real_one(self, capsys):
         """A wrong number in the README is how an external reviewer goes wrong.
 
