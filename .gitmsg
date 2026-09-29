@@ -1,0 +1,53 @@
+Native Arrow join: 35x, with the two cases where Arrow is wrong kept slow
+
+The last real outlier. ArrowEngine.join materialised both sides as Python
+dicts and built a Python hash table - 1,000,000 rows by 19 columns is
+roughly 19 million Python objects. Isolated measurement on real NYC taxi
+data: 4,462 ms against polars' 100 ms.
+
+`pyarrow.Table.join` is a native C++ hash join and has been for years. It is
+now tried first, and the Python implementation is kept as `_python_join`,
+still correct, still the fallback.
+
+  operation   engine   before      after
+  join        arrow   4,462.56 ->  129.10 ms   35x faster
+  join        pandas  4,436.52 ->  144.55 ms   31x faster
+  join_left   arrow   4,651.38 ->  219.85 ms   21x faster
+  join_left   pandas  4,590.99 ->  236.31 ms   19x faster
+
+WHAT IS DELIBERATELY STILL SLOW. Two cases where Arrow's answer is not the
+answer this system owes, and a fast wrong answer is worse than a slow right
+one:
+
+1. **NULL in a join key.** SQL says NULL never equals NULL, not even to
+   itself. The Python path implements that on purpose; Arrow's hash join
+   matches null keys to null keys. A null anywhere in a key column routes
+   to the Python path.
+2. **A non-key column on both sides.** Arrow disambiguates with
+   `_left`/`_right` suffixes; this system's contract is that the right side
+   wins. Rather than change the contract to match the library, a collision
+   routes to the Python path.
+
+Both guards are a null count and a set intersection. Both describe dirty or
+unusual data, which is not what a performance fix is for.
+
+TWO OF MY OWN BUGS, CAUGHT BY EXISTING TESTS
+
+`str(JoinType.INNER)` is `"JoinType.INNER"` on Python 3.11+, not
+`"inner"` - JoinType is a `str` mixin enum and stopped inheriting
+`str.__str__`. My first version compared that against plain names, never
+matched, and ran the Python path for every join. This is the most
+dangerous class of no-op: the change looks like it works and every test
+still passes, because the Python path is *correct*, just slow.
+
+Then the classification union passed the right side's column names to the
+*left* side's schema. A column absent from a schema does not raise, it is
+simply not found, so `pii` was silently dropped from `bonus`.
+`test_a_join_merges_both_sides` caught it on the first run, which is that
+test earning its keep.
+
+Metadata is preserved through the native path: joined columns inherit the
+union of both sides, a key keeps the left's own tags, and the cross-engine
+metadata suite passes on every engine.
+
+200 passed, 6 skipped on the affected modules.

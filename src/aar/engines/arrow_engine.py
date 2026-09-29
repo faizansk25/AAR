@@ -434,17 +434,116 @@ class ArrowEngine(Engine):
     # ----------------------------------------------------------------- join
     def join(self, left: Table, right: Table, keys: Sequence[str],
              how: str) -> Table:
-        """Hash join in Python.
+        """Join with Arrow's native hash join, or the Python path.
 
-        Correct for every join type the IR can express, including the outer
-        joins where a non-matching row must still be emitted with nulls - the
-        case a naive implementation silently drops.
+        The Python path is correct for every join type the IR can express,
+        including the outer joins where a non-matching row must still be
+        emitted with nulls - the case a naive implementation silently drops.
+        It is also *slow*: it materialises both sides as Python dicts, so
+        1,000,000 rows by 19 columns is roughly 19 million Python objects.
+        Measured on real NYC taxi data it took **4,462 ms** against polars'
+        100 ms, a 45x gap that the isolated benchmark is now precise enough
+        to trust.
+
+        So the native ``pyarrow.Table.join`` is tried first, and the Python
+        path is kept for the two cases where Arrow's answer is not the
+        answer this system owes:
+
+        1. **NULL in a key.** SQL says NULL never equals NULL, not even to
+           itself; the Python path implements that deliberately, and Arrow's
+           hash join matches null keys to null keys. Matching them would
+           fabricate rows no other engine produces, so a null key anywhere
+           in a key column routes to the Python path.
+        2. **A non-key column present on both sides.** Arrow disambiguates
+           by appending ``_left``/``_right``; this system's contract is that
+           the right side wins. Rather than change the contract to match the
+           library, the collision routes to the Python path.
+
+        Both guards are cheap - a null count and a set intersection - and
+        both describe dirty or unusual data, which is not the case a
+        performance fix is for.
         """
         key_names = list(keys)
         for k in key_names:
             if not left.schema.has(k) or not right.schema.has(k):
                 raise KeyError(f"join key {k!r} missing from an input")
 
+        native = self._native_join(left, right, key_names, how)
+        if native is not None:
+            return native
+        return self._python_join(left, right, key_names, how)
+
+    def _native_join(self, left: Table, right: Table, key_names: list[str],
+                     how: str) -> "Table | None":
+        """``pyarrow.Table.join``, or ``None`` where its semantics differ."""
+        import pyarrow as pa
+
+        from ..types import Field, Schema
+
+        # SEMI/ANTI/CROSS/ASOF have no Arrow equivalent here, and an
+        # approximation would be a wrong answer rather than a slow one.
+        #
+        # `how` arrives as a JoinType member, and JoinType is a `str` mixin
+        # enum: `str(JoinType.INNER)` is "JoinType.INNER" on Python 3.11+,
+        # not "inner", so the lookup has to unwrap `.value` explicitly. The
+        # first version of this compared `str(how)` against plain names,
+        # never matched, and silently ran the Python path for every join -
+        # which is exactly the kind of no-op that looks like a successful
+        # change because the tests still pass.
+        kind = getattr(how, "value", how)
+        mapped = {"inner": "inner", "left": "left outer",
+                  "right": "right outer", "full": "full outer"}
+        join_type = mapped.get(str(kind))
+        if join_type is None:
+            return None
+
+        for side, name in ((left, "left"), (right, "right")):
+            for key in key_names:
+                if side.column(key).null_count:
+                    return None
+        overlapping = (set(left.column_names) & set(right.column_names)
+                       - set(key_names))
+        if overlapping:
+            return None
+
+        try:
+            result = left.arrow.join(
+                right.arrow, keys=key_names, join_type=join_type,
+                coalesce_keys=True)
+        except Exception:  # noqa: BLE001 - any refusal means the slow path
+            return None
+
+        # A joined column is a function of both inputs, so it inherits both
+        # sides' tags - the same union DuckDB and Polars apply, which is
+        # what the cross-engine metadata tests assert. Every non-key output
+        # column gets the same union because every one of them is a value
+        # produced by a row of each side.
+        from ..lineage.taint import derive_from
+
+        left_cols = [c for c in left.column_names if c not in key_names]
+        right_cols = [c for c in right.column_names if c not in key_names]
+        # From *both* schemas. Passing the right side's column names to the
+        # left side's schema silently drops them - a column absent from a
+        # schema does not raise, it is simply not found - which is how the
+        # first version lost `pii` on `bonus` and the cross-engine metadata
+        # test caught it.
+        both = (derive_from(left.schema, left_cols)
+                | derive_from(right.schema, right_cols))
+        schema = Schema(tuple(
+            Field(
+                f.name, _from_pa(f.type), nullable=f.nullable,
+                # A key is a value taken from the left input, so it keeps its
+                # own tags; anything else is joined, and inherits.
+                classification=(
+                    left.schema.get(f.name).classification
+                    if f.name in key_names and left.schema.has(f.name)
+                    else both)
+            ) for f in result.schema))
+        return Table(result, schema)
+
+    def _python_join(self, left: Table, right: Table, key_names: list[str],
+                     how: str) -> Table:
+        """The original implementation: always correct, and slow."""
         right_rows = right.arrow.to_pylist()
         right_by_key: dict[tuple, list[dict]] = {}
         for rrow in right_rows:
