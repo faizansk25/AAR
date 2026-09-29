@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "adaptive-analytics-runtime"
+name = "aar-analytics"
 version = "0.1.0"
 description = "AAR - privacy-first, hardware-aware analytics orchestration layer"
 readme = "README.md"
@@ -58,11 +58,16 @@ dev       = ["pytest>=7.4", "pyarrow>=14", "openpyxl>=3.1", "duckdb>=0.10", "pol
 # Everything except the GPU stack, which needs a matching CUDA and is
 # deliberately opt-in: pulling cudf on a CPU-only host fails at install
 # time rather than degrading, which would break
-# `pip install adaptive-analytics-runtime[all]` for most users.
-# NB the name is NOT `aar` - that name is taken on PyPI by an unrelated
-# project. The import name and the console script are both `aar`; only the
-# distribution name is spelled out.
-all       = ["adaptive-analytics-runtime[arrow,excel,duckdb,polars,pandas,sql]"]
+# `pip install aar-analytics[all]` for most users.
+# NB the distribution name is NOT `aar` - that name is taken on PyPI by an
+# unrelated project. The import name and the console script are both `aar`;
+# only the distribution name is spelled out.
+#
+# The self-reference below must match `name` above EXACTLY. A mismatch is
+# invisible in a local install and fails only for someone who types
+# `pip install aar-analytics[all]`, which is the worst possible place to
+# discover a typo.
+all       = ["aar-analytics[arrow,excel,duckdb,polars,pandas,sql]"]
 
 [project.scripts]
 aar = "aar.cli:main"

@@ -1,6 +1,6 @@
 # Releasing AAR to PyPI
 
-Distribution name: **`adaptive-analytics-runtime`**
+Distribution name: **`aar-analytics`**
 Import name: **`aar`**  ·  Console script: **`aar`**
 
 Work through these in order. Skipping step 5 is how people discover, after
@@ -14,7 +14,7 @@ Three names, and only one of them has to be unique:
 
 | Role | Name | Has to be free on PyPI? |
 |---|---|---|
-| Distribution (`pip install X`) | `adaptive-analytics-runtime` | **Yes** |
+| Distribution (`pip install X`) | `aar-analytics` | **Yes** |
 | Import (`import aar`) | `aar` | No — local namespace only |
 | Console script (`aar --version`) | `aar` | No — local command only |
 
@@ -24,7 +24,7 @@ November 2024). Anyone who types `pip install aar` gets *that* project, not
 this one. So every install instruction in this repository spells the
 distribution name out in full. Do not "simplify" them.
 
-`adaptive-analytics-runtime` was confirmed free (HTTP 404 on the PyPI JSON
+`aar-analytics` was confirmed free (HTTP 404 on the PyPI JSON
 API) at the time of writing. Re-check immediately before publishing:
 names are permanent, and a squatter could take it in between.
 
@@ -39,7 +39,7 @@ description and keywords carry the full expansion for that reason.
 **You cannot re-upload the same filename. Ever.**
 
 If `twine upload` fails halfway — network drop, 2FA timeout, a typo in the
-token — that exact `adaptive_analytics_runtime-0.1.0.tar.gz` is taken
+token — that exact `aar_analytics-0.1.0.tar.gz` is taken
 forever, for everyone, not just you. The version is burned. You must bump
 `version` in `pyproject.toml` to `0.1.1` and start again.
 
@@ -86,12 +86,12 @@ Save as `C:\Users\<you>\.pypirc` on Windows, or `~/.pypirc` elsewhere.
 
 Names on PyPI are permanent. Check *before* you build:
 
-- <https://pypi.org/project/adaptive-analytics-runtime/> — a 404 means
+- <https://pypi.org/project/aar-analytics/> — a 404 means
   the name is available.
 - Also check `aar`, in case you prefer the shorter name.
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import urllib.request as u; u.urlopen('https://pypi.org/pypi/adaptive-analytics-runtime/json')"
+.\.venv\Scripts\python.exe -c "import urllib.request as u; u.urlopen('https://pypi.org/pypi/aar-analytics/json')"
 ```
 
 A `HTTPError: 404` means the name is free.
@@ -125,7 +125,7 @@ git push origin main --tags
 ```powershell
 # Start clean. A stale dist/ is how you upload yesterday's wheel.
 Remove-Item -Recurse -Force dist, build -ErrorAction SilentlyContinue
-Remove-Item -Recurse -Force src\adaptive_analytics_runtime.egg-info -ErrorAction SilentlyContinue
+Remove-Item -Recurse -Force src\aar_analytics.egg-info -ErrorAction SilentlyContinue
 
 .\.venv\Scripts\python.exe -m pip install --upgrade build twine
 .\.venv\Scripts\python.exe -m build
@@ -134,8 +134,8 @@ Remove-Item -Recurse -Force src\adaptive_analytics_runtime.egg-info -ErrorAction
 You should get exactly two files in `dist\`:
 
 ```
-adaptive_analytics_runtime-0.1.0-py3-none-any.whl
-adaptive_analytics_runtime-0.1.0.tar.gz
+aar_analytics-0.1.0-py3-none-any.whl
+aar_analytics-0.1.0.tar.gz
 ```
 
 ---
@@ -160,7 +160,7 @@ cd $env:TEMP
 Remove-Item -Recurse -Force aar-verify -ErrorAction SilentlyContinue
 python -m venv aar-verify
 .\aar-verify\Scripts\python.exe -m pip install --upgrade pip
-.\aar-verify\Scripts\python.exe -m pip install d:\AAR\dist\adaptive_analytics_runtime-0.1.0-py3-none-any.whl
+.\aar-verify\Scripts\python.exe -m pip install d:\AAR\dist\aar_analytics-0.1.0-py3-none-any.whl
 
 # The console script must exist and run.
 .\aar-verify\Scripts\aar.exe --version
@@ -179,7 +179,7 @@ step 4.
 Optionally test the extras too:
 
 ```powershell
-.\aar-verify\Scripts\python.exe -m pip install "d:\AAR\dist\adaptive_analytics_runtime-0.1.0-py3-none-any.whl[duckdb,polars]"
+.\aar-verify\Scripts\python.exe -m pip install "d:\AAR\dist\aar_analytics-0.1.0-py3-none-any.whl[duckdb,polars]"
 ```
 
 ---
@@ -203,7 +203,7 @@ cd $env:TEMP
 Remove-Item -Recurse -Force aar-testpypi -ErrorAction SilentlyContinue
 python -m venv aar-testpypi
 .\aar-testpypi\Scripts\python.exe -m pip install --upgrade pip
-.\aar-testpypi\Scripts\python.exe -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ adaptive-analytics-runtime
+.\aar-testpypi\Scripts\python.exe -m pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ aar-analytics
 .\aar-testpypi\Scripts\aar.exe --version
 ```
 
@@ -228,8 +228,8 @@ Username `__token__`, password the **production** token.
 
 The upload takes 30–60 seconds to appear. Verify:
 
-- <https://pypi.org/project/adaptive-analytics-runtime/>
-- From a clean venv: `pip install adaptive-analytics-runtime`, then
+- <https://pypi.org/project/aar-analytics/>
+- From a clean venv: `pip install aar-analytics`, then
   `aar --version`.
 
 ---
@@ -292,7 +292,7 @@ the exact bug caught during development, and it is invisible in
 `pip install` output:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import zipfile;print('\n'.join(n for n in zipfile.ZipFile('dist/adaptive_analytics_runtime-0.1.0-py3-none-any.whl').namelist() if 'static' in n or 'LICENSE' in n))"
+.\.venv\Scripts\python.exe -c "import zipfile;print('\n'.join(n for n in zipfile.ZipFile('dist/aar_analytics-0.1.0-py3-none-any.whl').namelist() if 'static' in n or 'LICENSE' in n))"
 ```
 
 You must see:
@@ -301,5 +301,5 @@ You must see:
 aar/workbench/static/app.css
 aar/workbench/static/app.js
 aar/workbench/static/index.html
-adaptive_analytics_runtime-0.1.0.dist-info/licenses/LICENSE
+aar_analytics-0.1.0.dist-info/licenses/LICENSE
 ```

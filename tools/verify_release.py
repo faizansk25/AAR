@@ -113,7 +113,7 @@ def main() -> int:
             installed = {p["name"].lower(): p["version"]
                          for p in json.loads(proc.stdout)}
         third_party = {n: v for n, v in installed.items()
-                       if n not in _STDLIB and "analytics-runtime" not in n}
+                       if n not in _STDLIB and "aar-analytics" not in n}
         # The design claim: a bare install must be pure standard library, so
         # AAR runs on an air-gapped machine with nothing preinstalled.
         check("zero third-party dependencies", not third_party,
@@ -154,7 +154,7 @@ def main() -> int:
 
         proc = run([str(py), "-c",
                     "import importlib.metadata as m;"
-                    "d=m.distribution('adaptive-analytics-runtime');"
+                    "d=m.distribution('aar-analytics');"
                     "m2=d.metadata;"
                     "print(bool(m2.get('License-Expression') or "
                     "'Apache' in str(m2.get('License'))))"], workdir)

@@ -243,7 +243,7 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         result["errors"].append(f"AAR not importable: {exc}")
         print("AAR is not importable. Either "
-              "`pip install adaptive-analytics-runtime`", flush=True)
+              "`pip install aar-analytics`", flush=True)
         print("or run this from a checkout with src/ on PYTHONPATH.",
               flush=True)
         with open(RESULT_PATH, "w", encoding="utf-8") as handle:

@@ -693,6 +693,66 @@ class TestDeclaredIsNotImplemented:
                 assert engine.capabilities.reason("execute")
 
 
+class TestPackagingIdentity:
+    """The distribution name is a one-way door, so its wiring is tested.
+
+    Renaming `adaptive-analytics-runtime` to `aar-analytics` would have
+    broken `pip install aar-analytics[all]` in a way no local test noticed,
+    because the `all` extra self-references the distribution name: change one
+    and not the other and the failure lands on a user typing an extras
+    install, which is the worst place to discover a typo.
+
+    The project is still *called* Adaptive Analytics Runtime; only the PyPI
+    distribution was renamed. Both spellings therefore have to be correct in
+    their own place, and conflating them is its own bug.
+    """
+
+    NAME = "aar-analytics"
+
+    @staticmethod
+    def _pyproject() -> dict:
+        import tomllib
+        from pathlib import Path
+
+        root = Path(__file__).resolve().parent.parent
+        with open(root / "pyproject.toml", "rb") as handle:
+            return tomllib.load(handle)
+
+    def test_the_distribution_name_is_the_agreed_one(self):
+        assert self._pyproject()["project"]["name"] == self.NAME
+
+    def test_the_import_name_is_still_aar(self):
+        import aar
+
+        # The distribution was renamed; the module was not. `import aar` is
+        # in every existing script and must not break.
+        assert aar.__name__ == "aar"
+
+    def test_the_all_extra_self_reference_matches_the_name(self):
+        extras = self._pyproject()["project"]["optional-dependencies"]
+        assert "all" in extras
+        for requirement in extras["all"]:
+            assert requirement.startswith(f"{self.NAME}["), (
+                f"the 'all' extra self-references {requirement!r} but the "
+                f"distribution is {self.NAME!r}; `pip install "
+                f"{self.NAME}[all]` would fail to resolve")
+
+    def test_every_extra_is_declared_and_usable(self):
+        extras = self._pyproject()["project"]["optional-dependencies"]
+        # `all` must not pull the GPU stack: RAPIDS fails at *install* time on
+        # a CPU-only host rather than degrading, which would break the one
+        # extra most people would reach for.
+        for engine in ("cudf", "pynvml"):
+            assert engine not in " ".join(extras["all"]), (
+                f"the 'all' extra must not require {engine}; a CPU-only host "
+                f"cannot install it")
+        assert "gpu" in extras, "the GPU stack should be reachable, but opt-in"
+
+    def test_the_console_script_survives_the_rename(self):
+        scripts = self._pyproject()["project"].get("scripts", {})
+        assert scripts.get("aar") == "aar.cli:main"
+
+
 class TestDeclaredOperationsMatchTheImplementation:
     """A capability that under-declares is a silent infeasibility.
 
