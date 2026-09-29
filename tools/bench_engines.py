@@ -360,6 +360,128 @@ def _measure(ops: dict, engines: list, repeats: int, note: str) -> dict:
     return results
 
 
+def measure_one(op_name: str, engine_id: str, table: Table, right: Table,
+                repeats: int) -> dict[str, Any]:
+    """Time one operation on one engine, with the result fingerprinted.
+
+    Isolated by the caller into a fresh process - see ``run_isolated``.
+    Running every measurement in one process makes the *previous*
+    measurement part of the current one, because a large join leaves the
+    allocator holding memory and the next allocation is slow. That is not a
+    small effect: an identical group-by measured 18 ms and 2,975 ms in the
+    same run purely because of what ran before it, which is how a
+    "213x Arrow defect" turned out to be an artefact of the harness.
+    """
+    ops = real_operations(table, right) if _REAL_MODE else operations(
+        table, right)
+    op = ops[op_name]
+    samples: list[float] = []
+    prints: set[str] = set()
+    error = None
+    for _ in range(repeats):
+        try:
+            with create_engine(engine_id, allow_degradation=False) as engine:
+                started = time.perf_counter()
+                out = op(engine)
+                samples.append((time.perf_counter() - started) * 1000.0)
+            prints.add(fingerprint(out))
+        except Exception as exc:  # noqa: BLE001
+            error = f"{type(exc).__name__}: {str(exc)[:120]}"
+            break
+    if error:
+        return {"error": error}
+    median = statistics.median(samples)
+    return {
+        "median_ms": round(median, 2),
+        "min_ms": round(min(samples), 2),
+        "max_ms": round(max(samples), 2),
+        "spread_pct": round(
+            (max(samples) - min(samples)) / median * 100 if median else 0.0, 1),
+        "distinct_results": len(prints),
+    }
+
+
+#: Set by the worker entry point so a spawned child builds the right
+#: operation set. A module global rather than a parameter because the
+#: subprocess boundary is a command line, not a function call.
+_REAL_MODE = False
+
+
+def run_isolated(ops: list, engines: list, repeats: int) -> dict:
+    """One fresh process per (operation, engine) measurement.
+
+    This is the whole point of the tool. In-process timing measures the
+    allocator as much as the engine, and a benchmark that reports a
+    200x "defect" which is really "the previous query dirtied the heap"
+    sends someone to optimise working code.
+
+    The cost is re-reading the data per measurement, which is why the
+    repeats live *inside* each child: the warm-up that matters is within
+    one operation, and isolation is about the *between* operations.
+    """
+    import subprocess
+
+    results: dict[str, dict] = {}
+    for op_name in ops:
+        print(f"  {op_name}", flush=True)
+        for engine_id in engines:
+            completed = subprocess.run(
+                [sys.executable, os.path.abspath(__file__),
+                 "--worker", "--op", op_name, "--engine", engine_id,
+                 "--repeats", str(repeats)]
+                + _SOURCE_ARGS(),
+                capture_output=True, text=True, timeout=900)
+            entry: dict[str, Any] = {}
+            payload = completed.stdout.strip().splitlines()
+            for line in reversed(payload):
+                if line.startswith("{"):
+                    try:
+                        entry = json.loads(line)
+                    except json.JSONDecodeError:
+                        entry = {"error": "unparseable worker output"}
+                    break
+            if not entry:
+                entry = {"error": (completed.stderr.strip()[-140:]
+                                   or "worker produced no output")}
+            results.setdefault(engine_id, {})[op_name] = entry
+            if "error" in entry:
+                print(f"    {engine_id:12s} FAIL {entry['error']}")
+            else:
+                flag = ("  <-- NONDETERMINISTIC"
+                        if entry["distinct_results"] > 1 else "")
+                print(f"    {engine_id:12s} {entry['median_ms']:9.2f} ms "
+                      f"(spread {entry['spread_pct']:4.1f}%){flag}",
+                      flush=True)
+    return results
+
+
+def _SOURCE_ARGS() -> list[str]:
+    """The data-selection flags to hand to a worker."""
+    return list(_SOURCE)  # noqa: F821 - built in main()
+
+
+def worker(op_name: str, engine_id: str, repeats: int) -> int:
+    """Run exactly one measurement and print it as JSON."""
+    if _SOURCE_PATH:  # noqa: F821 - built in main()
+        table, right = build_real(_SOURCE_PATH, _SOURCE_LIMIT)  # noqa: F821
+        global _REAL_MODE
+        _REAL_MODE = True
+    else:
+        table = build(_SOURCE_ROWS)  # noqa: F821
+        right = build_right(table)
+    print(json.dumps(measure_one(op_name, engine_id, table, right, repeats)))
+    return 0
+
+
+#: Data-selection flags, set by main() and read by the worker. A worker is
+#: a separate process, so the configuration has to survive the command
+#: line rather than a function call.
+_SOURCE: list = []
+_SOURCE_PATH: "str | None" = None
+_SOURCE_ROWS = 500_000
+_SOURCE_LIMIT: "int | None" = None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", type=int, default=500_000)
@@ -372,17 +494,56 @@ def main() -> int:
              "file shows whether the pipeline survives what analysts have.")
     parser.add_argument("--real-limit", type=int, default=0,
                         help="cap the rows read from --real, for a quick pass")
+    parser.add_argument("--worker", action="store_true",
+                        help="internal: run one measurement and print JSON")
+    parser.add_argument("--op", default="")
+    parser.add_argument("--engine", default="")
+    parser.add_argument(
+        "--in-process", action="store_true",
+        help="do NOT isolate. Kept only to demonstrate the difference; the "
+             "in-process numbers are the ones that produced a phantom "
+             "213x defect, so this flag exists to show why isolation is "
+             "the default and not a preference.")
     args = parser.parse_args()
+
+    # The worker's data selection is handed to it on the command line, so
+    # the parent has to keep the flags around to build them.
+    global _SOURCE, _SOURCE_PATH, _SOURCE_ROWS, _SOURCE_LIMIT
+    _SOURCE = []
+    if args.real:
+        _SOURCE = ["--real", args.real]
+        if args.real_limit:
+            _SOURCE += ["--real-limit", str(args.real_limit)]
+    else:
+        _SOURCE = ["--rows", str(args.rows)]
+    _SOURCE_PATH = args.real or None
+    _SOURCE_ROWS = args.rows
+    _SOURCE_LIMIT = args.real_limit or None
+
+    if args.worker:
+        return worker(args.op, args.engine, args.repeats)
 
     print("=" * 72)
     print("  AAR engine benchmark")
     if args.real:
         print(f"  REAL DATA: {args.real}")
+    print("  isolation: one fresh process per measurement"
+          if not args.in_process else
+          "  isolation: NONE (in-process; numbers are order-dependent)")
     print("=" * 72)
     if args.real:
-        results = run_real(args.real, args.real_limit or None, args.repeats)
+        table, right = build_real(args.real, args.real_limit or None)
+        ops = real_operations(table, right)
+        del table, right
     else:
+        table = build(args.rows)
+        ops = operations(table, build_right(table))
+        del table
+    engines = available()
+    if args.in_process:
         results = run(args.rows, args.repeats)
+    else:
+        results = run_isolated(list(ops), engines, args.repeats)
 
     print("\n" + "=" * 72)
     print("  Outliers: slower than the fastest engine for that operation")
