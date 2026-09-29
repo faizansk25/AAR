@@ -4,8 +4,8 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 540 tests
-**Last updated:** 2026-09-28
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 601 tests
+**Last updated:** 2026-09-29
 
 ---
 

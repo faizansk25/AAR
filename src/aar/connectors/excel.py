@@ -339,9 +339,23 @@ def write_excel(table: Table, path: str, sheet: str | None = None,
     rows: Any = zip(*(columns.get(n, []) for n in names))
 
     if created or not has_content:
-        # The fast path: one call per row, not one per cell. `ws.cell()` is
-        # openpyxl's general-purpose accessor and is orders of magnitude
-        # slower than `append`, the single-purpose "write this row" call.
+        # One call per row rather than one per cell. This is worth doing but
+        # it is NOT the bottleneck, and the comment here used to claim
+        # otherwise: measured at 50,000 rows x 12 columns, the per-cell form
+        # spent 10,382 ms writing and 40,782 ms in `wb.save()`, while this
+        # one spends 7,398 ms writing and 40,502 ms saving. openpyxl keeps a
+        # Cell object per cell in `ws._cells` whichever API writes it, so
+        # the save has identical work to do. Total 51,165 ms -> 47,900 ms.
+        # What it does buy is one call per row instead of one per cell, and
+        # column-major iteration instead of a million row dicts.
+        #
+        # The real cost is XLSX serialisation itself. `write_only=True` does
+        # not fix that either - it moves the 40s into the write phase and
+        # makes save trivial (47,490 + 2,443 = 49,933 ms), and its genuine
+        # benefit is memory, since a write-only sheet streams rows out
+        # rather than holding every cell. Time on this path is bounded by
+        # openpyxl, not by how AAR calls it.
+        #
         # Only taken when this code owns the sheet and has written nothing
         # to it, so `append`'s implicit cursor is known to start at row 1.
         ws.append(list(table.column_names))

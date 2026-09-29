@@ -61,9 +61,13 @@ fallback stays correct, just slow. [L]
 
 ### Next steps
 
-1. **Excel write** — see §2. Identified, not fixed.
-2. Full suite and release checks after each change, never before. [A]
-3. One T4 re-run to confirm no GPU regression. [A]
+1. **Excel time is bounded by openpyxl, not by AAR.** If large writes
+   matter, the lever is a different writer (`xlsxwriter`, or Calamine for
+   reading), not a different call pattern. Decide deliberately. [A]
+2. Consider `write_only=True` for its **memory** benefit on large writes,
+   at the cost of the append/overwrite path no longer being reopenable.
+3. Full suite and release checks after each change, never before. [A]
+4. One T4 re-run to confirm no GPU regression. [A]
 
 ---
 
@@ -75,11 +79,11 @@ fallback stays correct, just slow. [L]
 | `engines/pandas_engine.py` filter | fixed |
 | `engines/_mask.py` (new, shared) | added |
 | `interchange/table.py` nullability | fixed |
-| **`connectors/excel.py:337`** | **OPEN — identified** |
+| **`connectors/excel.py` write** | fixed — and the fix was smaller than claimed (§2) |
 | `arrow_engine.py::_python_join` | intentionally slow, guarded |
 | `arrow_engine.py::_row_filter` | intentionally slow, fallback |
 
-### The Excel finding — the next real defect
+### The Excel finding — fixed, and the fix was smaller than claimed
 
 ```python
 for record in table.arrow.to_pylist():
@@ -88,18 +92,39 @@ for record in table.arrow.to_pylist():
         ws.cell(row=row_cursor, column=c, value=value)
 ```
 
-The same defect class, on the system's most important target: principle 13
-is "Excel-first". `openpyxl`'s `cell()` runs at roughly 10–50k
-cells/second, so 100,000 rows × 19 columns ≈ 1.9M cells is **minutes**,
-and the table is fully materialised as Python dicts first. `ws.append(row)`
-writes a whole row in one call and `write_only=True` streams it — the same
-"call the library's row API, not its cell API" fix as the join.
+The same defect *shape* as every other win, on the system's most important
+target — principle 13 is "Excel-first". So it was rewritten to call the
+library's row API once per row and to iterate column-major.
 
-Not yet done: it needs its own measurement, and a number I have not taken
-is not a number I report. [A]
+**Then it was measured, and the claim turned out to be wrong.** At 50,000
+rows x 12 columns (`tools/probe_excel_phases.py`):
 
-Also there: an unreachable `return openpyxl` after
-`return table.num_rows` — dead code in the hottest loop of a first-class
+| form | write ms | save ms | total ms |
+|---|---|---|---|
+| per-cell | 10,382 | 40,782 | 51,165 |
+| append | 7,398 | 40,502 | 47,900 |
+| write_only | 47,490 | 2,443 | 49,933 |
+
+**The save dominates, and `ws.cell()` was never the bottleneck.** openpyxl
+keeps a `Cell` object per cell in `ws._cells` whichever API writes it, so
+`wb.save()` has exactly the same work to do. The change is a real ~6%
+improvement and a large cut in call count — it is not the 1000x the comment
+originally claimed, and that claim has been corrected in the code rather
+than left to flatter the diff. [A]
+
+`write_only=True` is not the answer to time either: it moves the 40s into
+the write phase and makes save trivial, landing in the same place. Its
+genuine benefit is **memory** — a write-only sheet streams rows out instead
+of holding every cell. Time on this path is bounded by XLSX serialisation,
+not by how AAR calls the library. [C]
+
+Also removed: an unreachable `return openpyxl` after
+`return table.num_rows`, and a latent layout bug. `_sheet_has_content`
+called `ws.cell(row=1, column=1)` to ask whether a fresh sheet was empty —
+but on a fresh sheet that call *materialises* cell A1, which advances
+openpyxl's append cursor and pushes the header to row 2. The file gained a
+blank first row, and the reader then took the wrong row as the header and
+mis-inferred every type after it. **A probe that is not a read.** [L]
 
 ---
 
@@ -205,6 +230,7 @@ fixes. [A]
 | 7 | nullability fix | all four engines survive real data |
 | 8 | isolation | the 213x defect was 97% harness |
 | 9 | native join | 4,462 ms → 129 ms |
+| 10 | Excel write | `ws.cell` → `ws.append`; **claim retracted, 1.0×** |
 
 **The cadence that produced those:** roughly one round per exchange, each
 ending in a measurement rather than a claim. The longest round was the
