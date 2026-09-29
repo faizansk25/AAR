@@ -1,0 +1,354 @@
+* Creating isolated environment: venv+pip...
+* Installing packages in isolated environment:
+  - setuptools>=68
+  - wheel
+* Getting build dependencies for sdist...
+running egg_info
+writing src\aar_analytics.egg-info\PKG-INFO
+writing dependency_links to src\aar_analytics.egg-info\dependency_links.txt
+writing entry points to src\aar_analytics.egg-info\entry_points.txt
+writing requirements to src\aar_analytics.egg-info\requires.txt
+writing top-level names to src\aar_analytics.egg-info\top_level.txt
+reading manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+* Installed build dependency versions:
+  - setuptools==84.0.0
+  - wheel==0.48.0
+* Building sdist...
+running sdist
+running egg_info
+writing src\aar_analytics.egg-info\PKG-INFO
+writing dependency_links to src\aar_analytics.egg-info\dependency_links.txt
+writing entry points to src\aar_analytics.egg-info\entry_points.txt
+writing requirements to src\aar_analytics.egg-info\requires.txt
+writing top-level names to src\aar_analytics.egg-info\top_level.txt
+reading manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+running check
+creating aar_analytics-0.1.0
+creating aar_analytics-0.1.0\src\aar
+creating aar_analytics-0.1.0\src\aar\capability
+creating aar_analytics-0.1.0\src\aar\connectors
+creating aar_analytics-0.1.0\src\aar\cost
+creating aar_analytics-0.1.0\src\aar\engines
+creating aar_analytics-0.1.0\src\aar\failures
+creating aar_analytics-0.1.0\src\aar\governance
+creating aar_analytics-0.1.0\src\aar\hardware
+creating aar_analytics-0.1.0\src\aar\interchange
+creating aar_analytics-0.1.0\src\aar\ir
+creating aar_analytics-0.1.0\src\aar\lineage
+creating aar_analytics-0.1.0\src\aar\planner
+creating aar_analytics-0.1.0\src\aar\runtime
+creating aar_analytics-0.1.0\src\aar\sdk
+creating aar_analytics-0.1.0\src\aar\workbench
+creating aar_analytics-0.1.0\src\aar\workbench\static
+creating aar_analytics-0.1.0\src\aar_analytics.egg-info
+creating aar_analytics-0.1.0\tests
+copying files to aar_analytics-0.1.0...
+copying LICENSE -> aar_analytics-0.1.0
+copying README.md -> aar_analytics-0.1.0
+copying pyproject.toml -> aar_analytics-0.1.0
+copying src\aar\__init__.py -> aar_analytics-0.1.0\src\aar
+copying src\aar\__main__.py -> aar_analytics-0.1.0\src\aar
+copying src\aar\cli.py -> aar_analytics-0.1.0\src\aar
+copying src\aar\types.py -> aar_analytics-0.1.0\src\aar
+copying src\aar\capability\__init__.py -> aar_analytics-0.1.0\src\aar\capability
+copying src\aar\capability\registry.py -> aar_analytics-0.1.0\src\aar\capability
+copying src\aar\connectors\__init__.py -> aar_analytics-0.1.0\src\aar\connectors
+copying src\aar\connectors\excel.py -> aar_analytics-0.1.0\src\aar\connectors
+copying src\aar\connectors\mongo.py -> aar_analytics-0.1.0\src\aar\connectors
+copying src\aar\connectors\sql.py -> aar_analytics-0.1.0\src\aar\connectors
+copying src\aar\cost\__init__.py -> aar_analytics-0.1.0\src\aar\cost
+copying src\aar\cost\model.py -> aar_analytics-0.1.0\src\aar\cost
+copying src\aar\engines\__init__.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\_mask.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\arrow_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\base.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\cudf_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\duckdb_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\excel_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\factory.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\pandas_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\polars_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\polars_gpu_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\engines\python_engine.py -> aar_analytics-0.1.0\src\aar\engines
+copying src\aar\failures\__init__.py -> aar_analytics-0.1.0\src\aar\failures
+copying src\aar\failures\registry.py -> aar_analytics-0.1.0\src\aar\failures
+copying src\aar\governance\__init__.py -> aar_analytics-0.1.0\src\aar\governance
+copying src\aar\governance\policy.py -> aar_analytics-0.1.0\src\aar\governance
+copying src\aar\hardware\__init__.py -> aar_analytics-0.1.0\src\aar\hardware
+copying src\aar\hardware\calibrate.py -> aar_analytics-0.1.0\src\aar\hardware
+copying src\aar\hardware\detect.py -> aar_analytics-0.1.0\src\aar\hardware
+copying src\aar\interchange\__init__.py -> aar_analytics-0.1.0\src\aar\interchange
+copying src\aar\interchange\table.py -> aar_analytics-0.1.0\src\aar\interchange
+copying src\aar\ir\__init__.py -> aar_analytics-0.1.0\src\aar\ir
+copying src\aar\ir\nodes.py -> aar_analytics-0.1.0\src\aar\ir
+copying src\aar\lineage\__init__.py -> aar_analytics-0.1.0\src\aar\lineage
+copying src\aar\lineage\taint.py -> aar_analytics-0.1.0\src\aar\lineage
+copying src\aar\planner\__init__.py -> aar_analytics-0.1.0\src\aar\planner
+copying src\aar\planner\planner.py -> aar_analytics-0.1.0\src\aar\planner
+copying src\aar\runtime\__init__.py -> aar_analytics-0.1.0\src\aar\runtime
+copying src\aar\runtime\executor.py -> aar_analytics-0.1.0\src\aar\runtime
+copying src\aar\sdk\__init__.py -> aar_analytics-0.1.0\src\aar\sdk
+copying src\aar\sdk\pipeline.py -> aar_analytics-0.1.0\src\aar\sdk
+copying src\aar\workbench\__init__.py -> aar_analytics-0.1.0\src\aar\workbench
+copying src\aar\workbench\i18n.py -> aar_analytics-0.1.0\src\aar\workbench
+copying src\aar\workbench\server.py -> aar_analytics-0.1.0\src\aar\workbench
+copying src\aar\workbench\static\app.css -> aar_analytics-0.1.0\src\aar\workbench\static
+copying src\aar\workbench\static\app.js -> aar_analytics-0.1.0\src\aar\workbench\static
+copying src\aar\workbench\static\index.html -> aar_analytics-0.1.0\src\aar\workbench\static
+copying src\aar_analytics.egg-info\PKG-INFO -> aar_analytics-0.1.0\src\aar_analytics.egg-info
+copying src\aar_analytics.egg-info\SOURCES.txt -> aar_analytics-0.1.0\src\aar_analytics.egg-info
+copying src\aar_analytics.egg-info\dependency_links.txt -> aar_analytics-0.1.0\src\aar_analytics.egg-info
+copying src\aar_analytics.egg-info\entry_points.txt -> aar_analytics-0.1.0\src\aar_analytics.egg-info
+copying src\aar_analytics.egg-info\requires.txt -> aar_analytics-0.1.0\src\aar_analytics.egg-info
+copying src\aar_analytics.egg-info\top_level.txt -> aar_analytics-0.1.0\src\aar_analytics.egg-info
+copying tests\test_capability.py -> aar_analytics-0.1.0\tests
+copying tests\test_cli.py -> aar_analytics-0.1.0\tests
+copying tests\test_connectors.py -> aar_analytics-0.1.0\tests
+copying tests\test_cost.py -> aar_analytics-0.1.0\tests
+copying tests\test_failures.py -> aar_analytics-0.1.0\tests
+copying tests\test_governance.py -> aar_analytics-0.1.0\tests
+copying tests\test_gpu_engines.py -> aar_analytics-0.1.0\tests
+copying tests\test_hardware.py -> aar_analytics-0.1.0\tests
+copying tests\test_ir.py -> aar_analytics-0.1.0\tests
+copying tests\test_lineage.py -> aar_analytics-0.1.0\tests
+copying tests\test_metadata.py -> aar_analytics-0.1.0\tests
+copying tests\test_planner.py -> aar_analytics-0.1.0\tests
+copying tests\test_runtime.py -> aar_analytics-0.1.0\tests
+copying tests\test_types.py -> aar_analytics-0.1.0\tests
+copying tests\test_workbench.py -> aar_analytics-0.1.0\tests
+Writing aar_analytics-0.1.0\setup.cfg
+Creating tar archive
+removing 'aar_analytics-0.1.0' (and everything under it)
+* Building wheel from sdist
+* Creating isolated environment: venv+pip...
+* Installing packages in isolated environment:
+  - setuptools>=68
+  - wheel
+* Getting build dependencies for wheel...
+running egg_info
+writing src\aar_analytics.egg-info\PKG-INFO
+writing dependency_links to src\aar_analytics.egg-info\dependency_links.txt
+writing entry points to src\aar_analytics.egg-info\entry_points.txt
+writing requirements to src\aar_analytics.egg-info\requires.txt
+writing top-level names to src\aar_analytics.egg-info\top_level.txt
+reading manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+* Installed build dependency versions:
+  - setuptools==84.0.0
+  - wheel==0.48.0
+* Building wheel...
+running bdist_wheel
+running build
+running build_py
+creating build\lib\aar
+copying src\aar\cli.py -> build\lib\aar
+copying src\aar\types.py -> build\lib\aar
+copying src\aar\__init__.py -> build\lib\aar
+copying src\aar\__main__.py -> build\lib\aar
+creating build\lib\aar\capability
+copying src\aar\capability\registry.py -> build\lib\aar\capability
+copying src\aar\capability\__init__.py -> build\lib\aar\capability
+creating build\lib\aar\connectors
+copying src\aar\connectors\excel.py -> build\lib\aar\connectors
+copying src\aar\connectors\mongo.py -> build\lib\aar\connectors
+copying src\aar\connectors\sql.py -> build\lib\aar\connectors
+copying src\aar\connectors\__init__.py -> build\lib\aar\connectors
+creating build\lib\aar\cost
+copying src\aar\cost\model.py -> build\lib\aar\cost
+copying src\aar\cost\__init__.py -> build\lib\aar\cost
+creating build\lib\aar\engines
+copying src\aar\engines\arrow_engine.py -> build\lib\aar\engines
+copying src\aar\engines\base.py -> build\lib\aar\engines
+copying src\aar\engines\cudf_engine.py -> build\lib\aar\engines
+copying src\aar\engines\duckdb_engine.py -> build\lib\aar\engines
+copying src\aar\engines\excel_engine.py -> build\lib\aar\engines
+copying src\aar\engines\factory.py -> build\lib\aar\engines
+copying src\aar\engines\pandas_engine.py -> build\lib\aar\engines
+copying src\aar\engines\polars_engine.py -> build\lib\aar\engines
+copying src\aar\engines\polars_gpu_engine.py -> build\lib\aar\engines
+copying src\aar\engines\python_engine.py -> build\lib\aar\engines
+copying src\aar\engines\_mask.py -> build\lib\aar\engines
+copying src\aar\engines\__init__.py -> build\lib\aar\engines
+creating build\lib\aar\failures
+copying src\aar\failures\registry.py -> build\lib\aar\failures
+copying src\aar\failures\__init__.py -> build\lib\aar\failures
+creating build\lib\aar\governance
+copying src\aar\governance\policy.py -> build\lib\aar\governance
+copying src\aar\governance\__init__.py -> build\lib\aar\governance
+creating build\lib\aar\hardware
+copying src\aar\hardware\calibrate.py -> build\lib\aar\hardware
+copying src\aar\hardware\detect.py -> build\lib\aar\hardware
+copying src\aar\hardware\__init__.py -> build\lib\aar\hardware
+creating build\lib\aar\interchange
+copying src\aar\interchange\table.py -> build\lib\aar\interchange
+copying src\aar\interchange\__init__.py -> build\lib\aar\interchange
+creating build\lib\aar\ir
+copying src\aar\ir\nodes.py -> build\lib\aar\ir
+copying src\aar\ir\__init__.py -> build\lib\aar\ir
+creating build\lib\aar\lineage
+copying src\aar\lineage\taint.py -> build\lib\aar\lineage
+copying src\aar\lineage\__init__.py -> build\lib\aar\lineage
+creating build\lib\aar\planner
+copying src\aar\planner\planner.py -> build\lib\aar\planner
+copying src\aar\planner\__init__.py -> build\lib\aar\planner
+creating build\lib\aar\runtime
+copying src\aar\runtime\executor.py -> build\lib\aar\runtime
+copying src\aar\runtime\__init__.py -> build\lib\aar\runtime
+creating build\lib\aar\sdk
+copying src\aar\sdk\pipeline.py -> build\lib\aar\sdk
+copying src\aar\sdk\__init__.py -> build\lib\aar\sdk
+creating build\lib\aar\workbench
+copying src\aar\workbench\i18n.py -> build\lib\aar\workbench
+copying src\aar\workbench\server.py -> build\lib\aar\workbench
+copying src\aar\workbench\__init__.py -> build\lib\aar\workbench
+running egg_info
+writing src\aar_analytics.egg-info\PKG-INFO
+writing dependency_links to src\aar_analytics.egg-info\dependency_links.txt
+writing entry points to src\aar_analytics.egg-info\entry_points.txt
+writing requirements to src\aar_analytics.egg-info\requires.txt
+writing top-level names to src\aar_analytics.egg-info\top_level.txt
+reading manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file 'src\aar_analytics.egg-info\SOURCES.txt'
+creating build\lib\aar\workbench\static
+copying src\aar\workbench\static\index.html -> build\lib\aar\workbench\static
+copying src\aar\workbench\static\app.css -> build\lib\aar\workbench\static
+copying src\aar\workbench\static\app.js -> build\lib\aar\workbench\static
+installing to build\bdist.win-amd64\wheel
+running install
+running install_lib
+creating build\bdist.win-amd64\wheel
+creating build\bdist.win-amd64\wheel\aar
+creating build\bdist.win-amd64\wheel\aar\capability
+copying build\lib\aar\capability\registry.py -> build\bdist.win-amd64\wheel\.\aar\capability
+copying build\lib\aar\capability\__init__.py -> build\bdist.win-amd64\wheel\.\aar\capability
+copying build\lib\aar\cli.py -> build\bdist.win-amd64\wheel\.\aar
+creating build\bdist.win-amd64\wheel\aar\connectors
+copying build\lib\aar\connectors\excel.py -> build\bdist.win-amd64\wheel\.\aar\connectors
+copying build\lib\aar\connectors\mongo.py -> build\bdist.win-amd64\wheel\.\aar\connectors
+copying build\lib\aar\connectors\sql.py -> build\bdist.win-amd64\wheel\.\aar\connectors
+copying build\lib\aar\connectors\__init__.py -> build\bdist.win-amd64\wheel\.\aar\connectors
+creating build\bdist.win-amd64\wheel\aar\cost
+copying build\lib\aar\cost\model.py -> build\bdist.win-amd64\wheel\.\aar\cost
+copying build\lib\aar\cost\__init__.py -> build\bdist.win-amd64\wheel\.\aar\cost
+creating build\bdist.win-amd64\wheel\aar\engines
+copying build\lib\aar\engines\arrow_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\base.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\cudf_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\duckdb_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\excel_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\factory.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\pandas_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\polars_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\polars_gpu_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\python_engine.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\_mask.py -> build\bdist.win-amd64\wheel\.\aar\engines
+copying build\lib\aar\engines\__init__.py -> build\bdist.win-amd64\wheel\.\aar\engines
+creating build\bdist.win-amd64\wheel\aar\failures
+copying build\lib\aar\failures\registry.py -> build\bdist.win-amd64\wheel\.\aar\failures
+copying build\lib\aar\failures\__init__.py -> build\bdist.win-amd64\wheel\.\aar\failures
+creating build\bdist.win-amd64\wheel\aar\governance
+copying build\lib\aar\governance\policy.py -> build\bdist.win-amd64\wheel\.\aar\governance
+copying build\lib\aar\governance\__init__.py -> build\bdist.win-amd64\wheel\.\aar\governance
+creating build\bdist.win-amd64\wheel\aar\hardware
+copying build\lib\aar\hardware\calibrate.py -> build\bdist.win-amd64\wheel\.\aar\hardware
+copying build\lib\aar\hardware\detect.py -> build\bdist.win-amd64\wheel\.\aar\hardware
+copying build\lib\aar\hardware\__init__.py -> build\bdist.win-amd64\wheel\.\aar\hardware
+creating build\bdist.win-amd64\wheel\aar\interchange
+copying build\lib\aar\interchange\table.py -> build\bdist.win-amd64\wheel\.\aar\interchange
+copying build\lib\aar\interchange\__init__.py -> build\bdist.win-amd64\wheel\.\aar\interchange
+creating build\bdist.win-amd64\wheel\aar\ir
+copying build\lib\aar\ir\nodes.py -> build\bdist.win-amd64\wheel\.\aar\ir
+copying build\lib\aar\ir\__init__.py -> build\bdist.win-amd64\wheel\.\aar\ir
+creating build\bdist.win-amd64\wheel\aar\lineage
+copying build\lib\aar\lineage\taint.py -> build\bdist.win-amd64\wheel\.\aar\lineage
+copying build\lib\aar\lineage\__init__.py -> build\bdist.win-amd64\wheel\.\aar\lineage
+creating build\bdist.win-amd64\wheel\aar\planner
+copying build\lib\aar\planner\planner.py -> build\bdist.win-amd64\wheel\.\aar\planner
+copying build\lib\aar\planner\__init__.py -> build\bdist.win-amd64\wheel\.\aar\planner
+creating build\bdist.win-amd64\wheel\aar\runtime
+copying build\lib\aar\runtime\executor.py -> build\bdist.win-amd64\wheel\.\aar\runtime
+copying build\lib\aar\runtime\__init__.py -> build\bdist.win-amd64\wheel\.\aar\runtime
+creating build\bdist.win-amd64\wheel\aar\sdk
+copying build\lib\aar\sdk\pipeline.py -> build\bdist.win-amd64\wheel\.\aar\sdk
+copying build\lib\aar\sdk\__init__.py -> build\bdist.win-amd64\wheel\.\aar\sdk
+copying build\lib\aar\types.py -> build\bdist.win-amd64\wheel\.\aar
+creating build\bdist.win-amd64\wheel\aar\workbench
+copying build\lib\aar\workbench\i18n.py -> build\bdist.win-amd64\wheel\.\aar\workbench
+copying build\lib\aar\workbench\server.py -> build\bdist.win-amd64\wheel\.\aar\workbench
+creating build\bdist.win-amd64\wheel\aar\workbench\static
+copying build\lib\aar\workbench\static\app.css -> build\bdist.win-amd64\wheel\.\aar\workbench\static
+copying build\lib\aar\workbench\static\app.js -> build\bdist.win-amd64\wheel\.\aar\workbench\static
+copying build\lib\aar\workbench\static\index.html -> build\bdist.win-amd64\wheel\.\aar\workbench\static
+copying build\lib\aar\workbench\__init__.py -> build\bdist.win-amd64\wheel\.\aar\workbench
+copying build\lib\aar\__init__.py -> build\bdist.win-amd64\wheel\.\aar
+copying build\lib\aar\__main__.py -> build\bdist.win-amd64\wheel\.\aar
+running install_egg_info
+Copying src\aar_analytics.egg-info to build\bdist.win-amd64\wheel\.\aar_analytics-0.1.0-py3.14.egg-info
+running install_scripts
+creating build\bdist.win-amd64\wheel\aar_analytics-0.1.0.dist-info\WHEEL
+creating 'D:\\AAR\\dist\\.tmp-jg8hxcw7\\aar_analytics-0.1.0-py3-none-any.whl' and adding 'build\\bdist.win-amd64\\wheel' to it
+adding 'aar/__init__.py'
+adding 'aar/__main__.py'
+adding 'aar/cli.py'
+adding 'aar/types.py'
+adding 'aar/capability/__init__.py'
+adding 'aar/capability/registry.py'
+adding 'aar/connectors/__init__.py'
+adding 'aar/connectors/excel.py'
+adding 'aar/connectors/mongo.py'
+adding 'aar/connectors/sql.py'
+adding 'aar/cost/__init__.py'
+adding 'aar/cost/model.py'
+adding 'aar/engines/__init__.py'
+adding 'aar/engines/_mask.py'
+adding 'aar/engines/arrow_engine.py'
+adding 'aar/engines/base.py'
+adding 'aar/engines/cudf_engine.py'
+adding 'aar/engines/duckdb_engine.py'
+adding 'aar/engines/excel_engine.py'
+adding 'aar/engines/factory.py'
+adding 'aar/engines/pandas_engine.py'
+adding 'aar/engines/polars_engine.py'
+adding 'aar/engines/polars_gpu_engine.py'
+adding 'aar/engines/python_engine.py'
+adding 'aar/failures/__init__.py'
+adding 'aar/failures/registry.py'
+adding 'aar/governance/__init__.py'
+adding 'aar/governance/policy.py'
+adding 'aar/hardware/__init__.py'
+adding 'aar/hardware/calibrate.py'
+adding 'aar/hardware/detect.py'
+adding 'aar/interchange/__init__.py'
+adding 'aar/interchange/table.py'
+adding 'aar/ir/__init__.py'
+adding 'aar/ir/nodes.py'
+adding 'aar/lineage/__init__.py'
+adding 'aar/lineage/taint.py'
+adding 'aar/planner/__init__.py'
+adding 'aar/planner/planner.py'
+adding 'aar/runtime/__init__.py'
+adding 'aar/runtime/executor.py'
+adding 'aar/sdk/__init__.py'
+adding 'aar/sdk/pipeline.py'
+adding 'aar/workbench/__init__.py'
+adding 'aar/workbench/i18n.py'
+adding 'aar/workbench/server.py'
+adding 'aar/workbench/static/app.css'
+adding 'aar/workbench/static/app.js'
+adding 'aar/workbench/static/index.html'
+adding 'aar_analytics-0.1.0.dist-info/licenses/LICENSE'
+adding 'aar_analytics-0.1.0.dist-info/METADATA'
+adding 'aar_analytics-0.1.0.dist-info/WHEEL'
+adding 'aar_analytics-0.1.0.dist-info/entry_points.txt'
+adding 'aar_analytics-0.1.0.dist-info/top_level.txt'
+adding 'aar_analytics-0.1.0.dist-info/RECORD'
+removing build\bdist.win-amd64\wheel
+Successfully built aar_analytics-0.1.0.tar.gz and aar_analytics-0.1.0-py3-none-any.whl
+Checking dist\aar_analytics-0.1.0-py3-none-any.whl: PASSED
+Checking dist\aar_analytics-0.1.0.tar.gz: PASSED

@@ -48,8 +48,9 @@ import pytest
 
 pa = pytest.importorskip("pyarrow")
 
+from aar.engines._mask import to_mask
 from aar.engines.cudf_engine import (
-    ROW_COUNTER, CudfEngine, _agg_spec, _to_mask,
+    ROW_COUNTER, CudfEngine, _agg_spec,
 )
 from aar.engines.factory import ENGINE_FACTORIES, create_engine
 from aar.interchange import Table, arrow_to_canonical
@@ -373,6 +374,78 @@ class TestCudfAggregateMapping:
             self._spec({"a": _agg("MEDIAN", "v", "a")})
 
 
+class TestPandasFilterIsVectorised:
+    """The 1,400x defect, and a guard against reintroducing it.
+
+    The pandas engine filtered with ``frame.apply(fn, axis=1)``: one Python
+    call and one dict per row. Measured at 26,723 ms for 2,000,000 rows
+    against Arrow's 18 ms, reproduced on two hosts.
+
+    Correctness is checked against Arrow rather than against a hand-written
+    expectation, so the test states what matters - the two engines agree -
+    and the guard states the property that actually broke.
+    """
+
+    def _table(self, rows: int = 200) -> Table:
+        arrow = pa.table({
+            "region": [f"r{i % 4}" for i in range(rows)],
+            "amount": [float((i * 7) % 100) for i in range(rows)],
+            "n": list(range(rows)),
+        })
+        schema = Schema(tuple(Field(f.name, arrow_to_canonical(f.type))
+                              for f in arrow.schema))
+        return Table(arrow, schema)
+
+    @pytest.mark.parametrize("predicate", [
+        BinOp(Col("amount"), ">", Lit(90.0)),
+        BinOp(Col("amount"), ">=", Lit(50.0)),
+        BinOp(Col("n"), "<", Lit(10)),
+        BinOp(Col("region"), "=", Lit("r1")),
+        BinOp(BinOp(Col("amount"), ">", Lit(10.0)), "AND",
+              BinOp(Col("n"), "<", Lit(5))),
+        BinOp(BinOp(Col("amount"), "<", Lit(5)), "OR",
+              BinOp(Col("n"), ">", Lit(195))),
+    ])
+    def test_it_agrees_with_arrow(self, predicate: Any) -> None:
+        table = self._table()
+        with create_engine("pandas") as slow, create_engine("arrow") as fast:
+            got = slow.filter(table, predicate).arrow.to_pylist()
+            want = fast.filter(table, predicate).arrow.to_pylist()
+        assert sorted(map(str, got)) == sorted(map(str, want))
+
+    def test_nulls_do_not_pass_a_comparison(self):
+        """SQL: a comparison with NULL is unknown, and unknown is not true.
+
+        A row-by-row compiler got this right by accident; a vectorised mask
+        has to be told, because pandas and cuDF both propagate null rather
+        than deciding the comparison.
+        """
+        table = Table(pa.table({"a": [1.0, None, 3.0]}))
+        predicate = BinOp(Col("a"), ">", Lit(2.0))
+        with create_engine("pandas") as engine:
+            kept = engine.filter(table, predicate).arrow.to_pylist()
+        assert kept == [{"a": 3.0}]
+
+    def test_it_does_not_call_a_python_function_per_row(self):
+        """The regression guard: no per-row Python callback.
+
+        A frame whose `apply` raises proves the filter never reaches it. The
+        cost is that the mask path needs a boolean Series, so a frame that
+        cannot produce one fails loudly here rather than slowly in production.
+        """
+        import pandas as pd
+
+        class Exploding(pd.DataFrame):
+            def apply(self, *args, **kwargs):  # pragma: no cover - the point
+                raise AssertionError(
+                    "pandas filter fell back to a per-row Python callback; "
+                    "that is the 1,400x defect")
+
+        frame = Exploding({"a": [1, 2, 3]})
+        mask = to_mask(frame, BinOp(Col("a"), ">", Lit(1)))
+        assert list(frame[mask]["a"]) == [2, 3]
+
+
 class TestCudfPredicateMasks:
     """Predicates become a boolean mask, not a query string.
 
@@ -390,7 +463,7 @@ class TestCudfPredicateMasks:
 
     def test_a_comparison_becomes_a_mask(self, cudf_host: Any) -> None:
         frame = cudf_host.DataFrame.from_arrow(_table().arrow)
-        mask = _to_mask(frame, BinOp(Col("amount"), ">", Lit(90.0)))
+        mask = to_mask(frame, BinOp(Col("amount"), ">", Lit(90.0)))
         # amount = (i*7) % 100 cycles through every residue once per 100
         # rows, and 9 of the 100 residues are above 90. Over 200 rows that
         # is 18, not 2 - the arithmetic is the point, so it is spelled out
@@ -403,15 +476,15 @@ class TestCudfPredicateMasks:
         # Of those, three are above 10.
         predicate = BinOp(BinOp(Col("amount"), ">", Lit(10.0)), "AND",
                           BinOp(Col("n"), "<", Lit(5)))
-        assert int(_to_mask(frame, predicate).sum()) == 3
+        assert int(to_mask(frame, predicate).sum()) == 3
 
     def test_null_tests(self, cudf_host: Any) -> None:
         frame = cudf_host.DataFrame.from_arrow(_table().arrow)
         # `amount` has no nulls here, so the mask is all-false; what matters
         # is that it is a mask and not a string.
-        assert int(_to_mask(frame, Func("isnull", (Col("amount"),))).sum()) == 0
+        assert int(to_mask(frame, Func("isnull", (Col("amount"),))).sum()) == 0
         assert int(
-            _to_mask(frame, Func("isNotNull", (Col("amount"),))).sum()) == 200
+            to_mask(frame, Func("isNotNull", (Col("amount"),))).sum()) == 200
 
     def test_an_unsupported_operator_declines_rather_than_guessing(
             self, cudf_host: Any) -> None:
@@ -421,7 +494,7 @@ class TestCudfPredicateMasks:
         # A column that exists, so the decline is reached on the *operator*
         # rather than on a missing column.
         with pytest.raises(NotImplementedError):
-            _to_mask(frame, Func("between", (Col("amount"), Lit(1), Lit(2))))
+            to_mask(frame, Func("between", (Col("amount"), Lit(1), Lit(2))))
 
     def test_filter_matches_arrow_through_the_mask(self, cudf_host: Any) -> None:
         table = _table()

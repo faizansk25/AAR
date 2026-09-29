@@ -31,6 +31,7 @@ from ..failures import SourceUnavailable
 from ..interchange import Table, reconcile
 from ..ir import Agg, Col, Expr, Node
 from ..lineage import taint as _lineage
+from ._mask import to_mask
 from .base import Engine
 
 __all__ = ["CudfEngine"]
@@ -136,19 +137,19 @@ class CudfEngine(Engine):
         # query parser does not accept the backtick identifier quoting that
         # numexpr (and so the pandas stand-in) tolerates.
         #
-        # Building the mask from Series operations removes the query
-        # language entirely. That is better than fixing the quoting: the
-        # mask is evaluated by cuDF's own vectorised kernels, it composes
+        # The mask builder is shared with the pandas engine, which is
+        # possible because cuDF *is* the pandas Series API on a GPU.
+        # Removing the query language is better than repairing the quoting:
+        # the mask is evaluated by cuDF's own vectorised kernels, it composes
         # for any nesting, and a column whose name contains a space or a
-        # digit - which is what a real export has - needs no escaping at
-        # all. A string-built predicate always has some input that breaks
-        # it, and the input that breaks it is a user's column name.
-        # ...and that the mask is evaluated on the device in one pass, not
-        # row by row. Two `_frame` calls here would double the transfer
-        # count and hide the very thing this counter exists to catch.
+        # digit - which is what a real export has - needs no escaping at all.
+        # A string-built predicate always has some input that breaks it, and
+        # the input that breaks it is a user's column name.
+        #
+        # One `_frame` call: two would double the transfer count and hide the
+        # very thing this counter exists to catch.
         frame = self._frame(table)
-        mask = _to_mask(frame, predicate)
-        return self._table(frame[mask], table)
+        return self._table(frame[to_mask(frame, predicate)], table)
 
     def project(self, table: Table, columns: Sequence[str]) -> Table:
         return self._table(self._frame(table)[list(columns)], table)
