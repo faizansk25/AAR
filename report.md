@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 601 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 607 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -16,6 +16,85 @@ files and large-scale data, while automatically selecting the most efficient
 **legal** execution path for the available hardware — with full explainability
 and zero external AI dependency. The goal is **minimum total analytical cost**,
 not GPU utilisation.
+
+---
+
+### Rounds 10-11 — verification, retraction, and ergonomics
+
+**Round 10: the Excel write path, and a retraction.** `connectors/excel.py`
+went from `ws.cell()` per cell to `ws.append()` per row, and from row-major
+`to_pylist()` to column-major `to_pydict()`. Then it was measured, and the
+measurement disproved the premise (`tools/probe_excel_phases.py`, 50,000
+rows x 12 columns):
+
+| form | write ms | save ms | total ms |
+|---|---|---|---|
+| per-cell | 10,382 | 40,782 | 51,165 |
+| append | 7,398 | 40,502 | 47,900 |
+| write_only | 47,490 | 2,443 | 49,933 |
+
+`wb.save()` dominates, and openpyxl stores a `Cell` object per cell whichever
+API writes it, so the save has identical work to do. **The speedup is ~6%,
+not the 1000x the first draft of the code comment claimed** — that comment
+was corrected rather than left to flatter the diff. This is the second
+retraction in the programme; the first was the "213x group-by defect" that
+turned out to be 97% benchmark contamination. Both were caught the same
+way: by measuring instead of assuming.
+
+Also found on the way: `_sheet_has_content` asked "is this fresh sheet
+empty?" by calling `ws.cell(row=1, column=1)`, and in openpyxl that call
+*materialises* cell A1, advancing the append cursor and pushing the header
+to row 2. Every written file gained a blank first row and the reader
+mis-inferred every type after it. **A probe that is not a read.**
+
+**Round 11: structural analysis with `pydeps` and `pyan3`**, both installed
+as dev-only tools (neither is a runtime dependency; `verify_release.py`
+still reports zero third-party dependencies for the installed wheel).
+
+Import cycles: **155 reported, 36 distinct module sets, 3 root shapes.** The
+155 is a rotation count, not a problem count — pyan3 emits every rotation
+of every cycle, so a 6-module cycle counts six times.
+
+| shape | closing edge |
+|---|---|
+| `cli` -> `workbench.server` -> `cli` | `server.api_explain` does `from ..cli import _plan_for` |
+| `workbench.__init__` <-> `workbench.server` | `__init__` re-exports `server`; `server` does `from .. import __version__` |
+| `engines.factory` <-> every engine | each factory closure does a deferred `from .<engine> import <Engine>` |
+| `connectors.*` <-> `engines.*` | `arrow_engine.write` does `from ..connectors.excel import write_excel` |
+
+**Every back-edge is a function-local import, and that is the point.** It is
+what keeps `import aar` free of pyarrow, duckdb, polars, pandas, cudf and
+openpyxl — an engine's third-party import happens when the engine is
+*constructed*, which is exactly when the dependency is wanted. So the
+cycles are the price of lazy loading, benign at runtime, and the count is
+identical with and without pyan3's `--init` flag (so not an artifact of
+that flag's implicit package edges). The real risk is not import failure
+but that a cycle makes a *conceptual* boundary negotiable, so
+`tools/cycle_roots.py` is checked in and regenerates `ARCHITECTURE.md` with
+the distinct count (36) rather than the rotation count (155), making growth
+visible and deliberate.
+
+pydeps found **no cycles reachable from `aar.__init__` alone** — the path a
+plain `import aar` takes. External dependencies in the graph are exactly
+the declared optional extras; nothing unexpected, nothing unguarded at
+module scope.
+
+**The ergonomics fix this review produced.** `run` and `explain` both
+demand a path to a pipeline file, and nothing told a user what one looks
+like or gave them one. `pipelines/example_orders.py` existed, but that path
+is outside the package, so it is absent from an installed wheel — on an
+air-gapped machine there is no repository to look in. Added
+`src/aar/examples.py` and `aar examples` (list / `--show` / `--write`),
+with templates embedded as strings so there is no `package-data` entry to
+forget at build time. `--write` refuses to overwrite.
+
+The examples are **tested as code**: each is parsed with `ast`, every
+`aar.sdk` import is checked against the **live `__all__`** (so renaming an
+SDK function fails a test rather than a user), no example may import a
+third-party module, and the shortest is written to disk and run through
+`aar explain` for real. That last test caught the first draft, which used a
+chainable style against a functional SDK and `count_` where the export is
+`count` — both would have failed on a user's very first run.
 
 ---
 
@@ -235,7 +314,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**601 tests: 601 passing, 8 skipped, 0 failing.** Every skip states the
+**607 tests: 607 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously.
 
 | Suite | Tests | Coverage |
