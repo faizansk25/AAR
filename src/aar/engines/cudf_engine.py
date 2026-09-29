@@ -29,7 +29,7 @@ from typing import Any, Sequence
 from ..capability import Device
 from ..failures import SourceUnavailable
 from ..interchange import Table, reconcile
-from ..ir import Agg, Col, Expr, Func, Lit, Node
+from ..ir import Agg, Col, Expr, Node
 from ..lineage import taint as _lineage
 from .base import Engine
 
@@ -131,11 +131,24 @@ class CudfEngine(Engine):
 
     # ------------------------------------------------------------- transform
     def filter(self, table: Table, predicate: Expr) -> Table:
-        # Rendered to a vectorised cuDF query, not the row-by-row
-        # PredicateCompiler: a per-row Python call on the GPU would be
-        # slower than on the CPU and would defeat the purpose entirely.
-        return self._table(self._frame(table).query(_to_query(predicate)),
-                           table)
+        # A boolean *mask*, not `.query(...)`. The first T4 run returned
+        # `SyntaxError: invalid syntax (<unknown>, line 1)` because cudf's
+        # query parser does not accept the backtick identifier quoting that
+        # numexpr (and so the pandas stand-in) tolerates.
+        #
+        # Building the mask from Series operations removes the query
+        # language entirely. That is better than fixing the quoting: the
+        # mask is evaluated by cuDF's own vectorised kernels, it composes
+        # for any nesting, and a column whose name contains a space or a
+        # digit - which is what a real export has - needs no escaping at
+        # all. A string-built predicate always has some input that breaks
+        # it, and the input that breaks it is a user's column name.
+        # ...and that the mask is evaluated on the device in one pass, not
+        # row by row. Two `_frame` calls here would double the transfer
+        # count and hide the very thing this counter exists to catch.
+        frame = self._frame(table)
+        mask = _to_mask(frame, predicate)
+        return self._table(frame[mask], table)
 
     def project(self, table: Table, columns: Sequence[str]) -> Table:
         return self._table(self._frame(table)[list(columns)], table)
@@ -332,43 +345,78 @@ def _need(column: str | None) -> str:
     return column
 
 
-def _to_query(expr: Expr) -> str:
-    """Render a predicate as a cuDF ``query`` expression.
+def _to_mask(frame: Any, expr: Expr) -> Any:
+    """Build a cuDF boolean Series from an AAR predicate.
 
-    cuDF exposes ``DataFrame.query`` rather than a boolean-mask builder, so
-    the predicate is rendered into the query language. Only operators that
-    render unambiguously are accepted; anything else is declined rather than
-    approximated, because an approximate filter returns silently wrong rows
-    - the exact failure mode this project exists to prevent.
+    Every branch is a Series operation, so the whole predicate is evaluated
+    on the device in one vectorised pass. Anything that cannot be expressed
+    as Series arithmetic is declined rather than approximated - an
+    approximate filter returns silently wrong rows, which is the one
+    failure this project exists to prevent.
     """
     from ..ir import BinOp, Func, Lit
 
-    if isinstance(expr, Col):
-        return f"`{expr.name}`"
-    if isinstance(expr, Lit):
-        return repr(expr.value)
-    if isinstance(expr, Func):
-        name = expr.name.lower()
-        args = [_to_query(a) for a in expr.args]
-        if name in ("isnull", "is_null"):
-            return f"({args[0]}).isnull()"
-        if name in ("isnotnull", "is_not_null"):
-            return f"({args[0]}).notnull()"
-        raise NotImplementedError(
-            f"the cuDF engine cannot render {expr.name!r} as a query")
     if isinstance(expr, BinOp):
         op = expr.op
         if op == "AND":
-            return f"({_to_query(expr.left)}) and ({_to_query(expr.right)})"
+            # The children are *predicates*, so they recurse through
+            # _to_mask. Routing them through _to_value was a real bug: a
+            # nested conjunction is a BinOp, and _to_value only evaluates
+            # arithmetic, so `a > 1 AND b < 5` raised "cannot evaluate
+            # BinOp as a value" instead of returning a mask.
+            return _to_mask(frame, expr.left) & _to_mask(frame, expr.right)
         if op == "OR":
-            return f"({_to_query(expr.left)}) or ({_to_query(expr.right)})"
-        if op in ("=", "<>", "!=", ">", ">=", "<", "<="):
-            return (f"({_to_query(expr.left)}) "
-                    f"{'<>' if op == '!=' else op} "
-                    f"({_to_query(expr.right)})")
+            return _to_mask(frame, expr.left) | _to_mask(frame, expr.right)
+        left = _to_value(frame, expr.left)
+        right = _to_value(frame, expr.right)
+        if op == "=":
+            return left == right
+        if op in ("<>", "!="):
+            return left != right
+        if op == ">":
+            return left > right
+        if op == ">=":
+            return left >= right
+        if op == "<":
+            return left < right
+        if op == "<=":
+            return left <= right
         if op in ("+", "-", "*", "/"):
-            return (f"({_to_query(expr.left)}) {op} "
-                    f"({_to_query(expr.right)})")
+            return {"+": lambda: left + right, "-": lambda: left - right,
+                    "*": lambda: left * right,
+                    "/": lambda: left / right}[op]()
+        raise NotImplementedError(
+            f"the cuDF engine cannot filter on {op!r}; use a native "
+            f"expression or let the executor fall back")
+    if isinstance(expr, Func):
+        value = _to_value(frame, expr.args[0]) if expr.args else None
+        name = expr.name.lower()
+        if name in ("isnull", "is_null"):
+            return value.isnull()
+        if name in ("isnotnull", "is_not_null"):
+            return value.notnull()
+        raise NotImplementedError(
+            f"the cuDF engine cannot filter on {expr.name!r}")
     raise NotImplementedError(
-        f"the cuDF engine cannot render {getattr(expr, 'op', expr)!r} as a "
-        f"query; use a native expression or let the executor fall back")
+        f"the cuDF engine cannot filter on "
+        f"{type(expr).__name__}; use a native expression or let the "
+        f"executor fall back")
+
+
+def _to_value(frame: Any, expr: Expr) -> Any:
+    """A column reference, a literal, or a nested arithmetic expression."""
+    from ..ir import BinOp, Lit
+
+    if isinstance(expr, Col):
+        return frame[expr.name]
+    if isinstance(expr, Lit):
+        return expr.value
+    if isinstance(expr, BinOp):
+        left = _to_value(frame, expr.left)
+        right = _to_value(frame, expr.right)
+        if expr.op in ("+", "-", "*", "/"):
+            return {"+": lambda: left + right, "-": lambda: left - right,
+                    "*": lambda: left * right,
+                    "/": lambda: left / right}[expr.op]()
+    raise NotImplementedError(
+        f"the cuDF engine cannot evaluate {type(expr).__name__} as a value")

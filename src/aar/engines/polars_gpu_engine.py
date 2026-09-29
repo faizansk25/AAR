@@ -35,6 +35,9 @@ class PolarsGPUEngine(Engine):
         super().__init__(**options)
         self._pl = _import_polars()
         self._cudf = _import_cudf()
+        #: Which collect call this Polars build actually accepts, recorded
+        #: rather than assumed. See `_find_collect`.
+        self.collect_api: str | None = None
         #: Collects that crossed to the device. Asserted in the tests.
         self.device_collects = 0
         if self._pl is None:
@@ -42,6 +45,20 @@ class PolarsGPUEngine(Engine):
         elif self._cudf is None:
             self._decline("execute",
                           "polars GPU needs cudf; install cudf-cu12")
+        else:
+            self.collect_api = _find_collect(self._pl)
+            if self.collect_api is None:
+                # Constructed, but there is no way to reach the device on this
+                # Polars build. Declining with the *real* reason is far better
+                # than constructing and failing on the first collect, which is
+                # what the first T4 run hit: `ValueError: Invalid engine
+                # argument engine='cudf'`.
+                self._decline(
+                    "execute",
+                    f"polars {getattr(self._pl, '__version__', '?')} accepts "
+                    f"no known GPU collect API; tried "
+                    f"collect(engine='cudf'), collect(engine='gpu') and "
+                    f"collect_cudf()")
 
     def _lazy(self, table: Table) -> Any:
         return self._pl.from_arrow(table.arrow).lazy()
@@ -52,8 +69,13 @@ class PolarsGPUEngine(Engine):
         The single crossing point: everything before it is host-side lazy
         planning, everything after is a device-resident result.
         """
+        api = self.collect_api or _find_collect(self._pl)
+        if api is None:
+            raise NotImplementedError(
+                f"{self.id}: this Polars build accepts no known GPU collect "
+                f"API, so the data cannot reach the device")
         self.device_collects += 1
-        return frame.collect(engine="cudf")
+        return _apply_collect(api, frame)
 
     def _to_table(self, collected: Any, source: Table | None = None) -> Table:
         out = Table(collected.to_arrow())
@@ -131,6 +153,72 @@ class PolarsGPUEngine(Engine):
 
 
 # --------------------------------------------------------------------- utils
+def _apply_collect(api: str, frame: Any) -> Any:
+    """Cross to the device using whichever spelling this build accepts."""
+    if api == "collect_cudf_method":
+        return frame.collect_cudf()
+    if api == "collect_cudf_function":
+        return _import_polars().collect_cudf(frame)
+    if api == "engine_gpu":
+        return frame.collect(engine="gpu")
+    return frame.collect(engine="cudf")
+
+
+def _find_collect(pl: Any) -> str | None:
+    """Which GPU collect spelling this Polars build supports.
+
+    Polars has moved this API more than once: `collect(engine="cudf")` was
+    valid for some releases and is rejected outright by others - the first
+    T4 run hit `ValueError: Invalid engine argument engine='cudf'` on
+    Polars 1.35. Guessing one spelling is how that happened in the first
+    place, so the spellings are probed and the winner recorded in
+    ``PolarsGPUEngine.collect_api`` for the run report to show.
+
+    A feature *presence* check is used rather than running a collect,
+    because probing by doing real work would either be slow or would need a
+    frame. Where presence is ambiguous, `engine_gpu` is preferred over the
+    older names: it is the spelling the project is moving toward.
+    """
+    if hasattr(pl, "collect_cudf"):
+        return "collect_cudf_function"
+    lazy = getattr(pl, "LazyFrame", None)
+    if lazy is not None and hasattr(lazy, "collect_cudf"):
+        return "collect_cudf_method"
+    if _accepts_engine(pl, "gpu"):
+        return "engine_gpu"
+    if _accepts_engine(pl, "cudf"):
+        return "engine_cudf"
+    return None
+
+
+def _accepts_engine(pl: Any, name: str) -> bool:
+    """Whether `collect(engine=name)` is a valid call on this build.
+
+    Introspects the signature rather than calling it, so the answer is a
+    fact about the build rather than the result of a trial run.
+    """
+    import inspect
+
+    lazy = getattr(pl, "LazyFrame", None)
+    if lazy is None or not hasattr(lazy, "collect"):
+        return False
+    try:
+        signature = inspect.signature(lazy.collect)
+    except (TypeError, ValueError):  # pragma: no cover - C extension
+        return False
+    engine = signature.parameters.get("engine")
+    if engine is None:
+        return False
+    if engine.default is inspect.Parameter.empty:
+        return False
+    # A Literal type is the strongest signal available; otherwise assume a
+    # plain str annotation and let the first real collect report a mismatch.
+    annotation = str(engine.annotation)
+    if "Literal" in annotation:
+        return name in annotation
+    return True
+
+
 def _import_polars() -> Any:
     try:
         import polars

@@ -49,7 +49,7 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 
 from aar.engines.cudf_engine import (
-    ROW_COUNTER, CudfEngine, _agg_spec, _to_query,
+    ROW_COUNTER, CudfEngine, _agg_spec, _to_mask,
 )
 from aar.engines.factory import ENGINE_FACTORIES, create_engine
 from aar.interchange import Table, arrow_to_canonical
@@ -373,21 +373,60 @@ class TestCudfAggregateMapping:
             self._spec({"a": _agg("MEDIAN", "v", "a")})
 
 
-class TestCudfQueryRendering:
-    """Predicates render to cuDF's query language, or decline."""
+class TestCudfPredicateMasks:
+    """Predicates become a boolean mask, not a query string.
 
-    def test_comparisons_and_logic(self) -> None:
-        assert _to_query(BinOp(Col("v"), ">", Lit(5.0))) == "(`v`) > (5.0)"
-        assert _to_query(BinOp(Col("v"), "<", Lit(2))) == "(`v`) < (2)"
-        joined = _to_query(BinOp(BinOp(Col("a"), ">", Lit(1)), "AND",
-                                 BinOp(Col("b"), "=", Lit("x"))))
-        assert joined == "((`a`) > (1)) and ((`b`) = ('x'))"
+    The first T4 run returned ``SyntaxError: invalid syntax`` from
+    ``DataFrame.query``: cudf's parser does not accept the backtick
+    identifier quoting that numexpr (and so the pandas stand-in) tolerates.
 
-    def test_null_tests(self) -> None:
-        assert _to_query(Func("isnull", (Col("v"),))) == "(`v`).isnull()"
-        assert _to_query(Func("isNotNull", (Col("v"),))) == "(`v`).notnull()"
+    Building the mask from Series operations removes the query language
+    entirely, which is better than repairing the quoting - the mask runs on
+    cuDF's own vectorised kernels, composes for any nesting, and needs no
+    escaping for a column named ``total $`` or ``2nd value``, which is what
+    a real export contains. A string-built predicate always has some input
+    that breaks it, and that input is always a user's column name.
+    """
 
-    def test_an_unrenderable_call_declines_rather_than_guessing(self) -> None:
+    def test_a_comparison_becomes_a_mask(self, cudf_host: Any) -> None:
+        frame = cudf_host.DataFrame.from_arrow(_table().arrow)
+        mask = _to_mask(frame, BinOp(Col("amount"), ">", Lit(90.0)))
+        # amount = (i*7) % 100 cycles through every residue once per 100
+        # rows, and 9 of the 100 residues are above 90. Over 200 rows that
+        # is 18, not 2 - the arithmetic is the point, so it is spelled out
+        # rather than guessed.
+        assert int(mask.sum()) == 18
+
+    def test_logic_composes(self, cudf_host: Any) -> None:
+        frame = cudf_host.DataFrame.from_arrow(_table().arrow)
+        # n < 5 selects n = 0..4, whose amounts are 0, 7, 14, 21, 28.
+        # Of those, three are above 10.
+        predicate = BinOp(BinOp(Col("amount"), ">", Lit(10.0)), "AND",
+                          BinOp(Col("n"), "<", Lit(5)))
+        assert int(_to_mask(frame, predicate).sum()) == 3
+
+    def test_null_tests(self, cudf_host: Any) -> None:
+        frame = cudf_host.DataFrame.from_arrow(_table().arrow)
+        # `amount` has no nulls here, so the mask is all-false; what matters
+        # is that it is a mask and not a string.
+        assert int(_to_mask(frame, Func("isnull", (Col("amount"),))).sum()) == 0
+        assert int(
+            _to_mask(frame, Func("isNotNull", (Col("amount"),))).sum()) == 200
+
+    def test_an_unsupported_operator_declines_rather_than_guessing(
+            self, cudf_host: Any) -> None:
+        from aar.ir import Func
+
+        frame = cudf_host.DataFrame.from_arrow(_table().arrow)
+        # A column that exists, so the decline is reached on the *operator*
+        # rather than on a missing column.
         with pytest.raises(NotImplementedError):
-            _to_query(Func("between", (Col("v"), Lit(1), Lit(2))))
+            _to_mask(frame, Func("between", (Col("amount"), Lit(1), Lit(2))))
+
+    def test_filter_matches_arrow_through_the_mask(self, cudf_host: Any) -> None:
+        table = _table()
+        predicate = BinOp(Col("amount"), ">", Lit(90.0))
+        with CudfEngine() as gpu, create_engine("arrow") as cpu:
+            assert _sorted(gpu.filter(table, predicate)) == \
+                _sorted(cpu.filter(table, predicate))
 

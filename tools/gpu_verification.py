@@ -120,8 +120,15 @@ def check_gpu_engines(result: dict) -> None:
                 continue
             entry["available"] = True
             entry["engine_class"] = type(engine).__name__
+            # Which GPU collect spelling this Polars build accepts. The
+            # first T4 run failed on `collect(engine="cudf")` being invalid
+            # in Polars 1.35, so the answer is recorded rather than assumed.
+            api = getattr(engine, "collect_api", None)
+            if api:
+                entry["collect_api"] = api
             print(f"{engine_id}: constructed OK "
-                  f"({type(engine).__name__})", flush=True)
+                  f"({type(engine).__name__})"
+                  + (f", collect via {api}" if api else ""), flush=True)
     except Exception as exc:  # noqa: BLE001
         result["errors"].append(f"engine construction failed: {exc}")
 
@@ -219,7 +226,7 @@ def decisions(result: dict) -> None:
     # existed, so this section produced no rows at all.
     model = default_cost_model()
     # A sink keeps its result on the device, so nothing has to come back.
-    node = Node(NodeType.GROUP, estimated_bytes=1_000_000_000)
+    node = Node(NodeType.GROUPBY, estimated_bytes=1_000_000_000)
     for nbytes in (10_000_000, 100_000_000, 1_000_000_000):
         node.estimated_bytes = nbytes
         try:
