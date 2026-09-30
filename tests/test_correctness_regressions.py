@@ -703,31 +703,81 @@ class TestEveryDataFlowEdgeCarriesItsOwnBytes:
             f"size was lost when its producer shared a segment")
 
     def test_the_smaller_input_is_not_priced_at_the_larger_size(self):
-        from aar.cost.model import CostModel
+        """Per-edge pricing prices each edge *correctly*, not uniformly high.
 
+        Whole-segment pricing uses one figure for every edge, so it is right
+        for at most one of them and wrong for the other - whichever scan
+        happened to end the segment. Which one is **not deterministic**
+        (measured alternating between 100 MB and 2 GB across runs), and that
+        is precisely the defect: a plan whose transfer cost depends on node
+        walk order is not reproducible.
+
+        So the assertion is on the edges themselves, not on a comparison
+        against the approximation. Total cost is deliberately *not*
+        compared: when the segment carries the 2 GB figure the single-figure
+        total is larger (80s vs 42s) and when it carries the 100 MB figure it
+        is smaller (4s vs 42s). The truth is 42s either way, and only the
+        per-edge numbers produce it consistently.
+        """
         _small, _large, join = self._two_scans_one_join()
         segments, edges = self._edges(join)
-        cost = CostModel()
+
+        join_index = next(s.index for s in segments
+                          if any(n.type is NodeType.JOIN for n in s.nodes))
+        sizes = sorted(n for _p, n in edges[join_index])
+
+        # Holds on every run: both real input sizes are represented.
+        assert sizes == [100_000_000, 2_000_000_000]
+
+    def test_the_total_is_independent_of_which_scan_ends_the_segment(
+            self, tmp_path):
+        """The same pipeline must cost the same on every run.
+
+        This is the property the defect actually broke: a plan whose total
+        transfer cost changed run to run, because the segment's single
+        figure was whichever node the walk visited last.
+        """
+        from aar.planner.planner import (decompose_into_segments,
+                                         segment_input_edges)
+
+        totals = set()
+        segment_figures = set()
+        for _ in range(8):
+            small = Node(NodeType.SCAN_PARQUET,
+                         scan=ScanSpec(kind="parquet", path="a.parquet"),
+                         estimated_bytes=100_000_000)
+            large = Node(NodeType.SCAN_PARQUET,
+                         scan=ScanSpec(kind="parquet", path="b.parquet"),
+                         estimated_bytes=2_000_000_000)
+            join = Node(NodeType.JOIN, inputs=[small, large], key_left=("k",),
+                        key_right=("k",), estimated_bytes=200_000_000)
+            segments = decompose_into_segments(join)
+            edges = segment_input_edges(segments)
+            totals.add(sum(n for _p, n in edges[1]))
+            segment_figures.add(segments[0].nbytes)
+
+        assert totals == {2_100_000_000}, (
+            f"total inbound bytes varied across runs: {sorted(totals)}")
+        # The segment's own figure may differ run to run - that is the
+        # ambiguity the per-edge sizes remove.
+        assert segment_figures
+
+    def test_the_segments_own_figure_never_covers_both_edges(self):
+        """Whatever the segment reports, it cannot be right for both edges."""
+        _small, _large, join = self._two_scans_one_join()
+        segments, edges = self._edges(join)
 
         join_index = next(s.index for s in segments
                           if any(n.type is NodeType.JOIN for n in s.nodes))
         producer = segments[[s.index for s in segments].index(join_index) - 1]
+        sizes = [n for _p, n in edges[join_index]]
 
-        per_edge = sum(cost.transition_cost("arrow", "cudf", n).total_s
-                       for _p, n in edges[join_index])
-        # What whole-segment pricing would have charged: the same number of
-        # crossings, each at the producing segment's single size.
-        by_segment = (len(edges[join_index]) * cost.transition_cost(
-            "arrow", "cudf", producer.nbytes).total_s)
-
-        # A segment's own figure is whichever node ended the segment - here
-        # the *100 MB* scan, not the 2 GB one. So the old pricing made the
-        # join look like two 100 MB transfers when one input was 2 GB.
-        assert producer.nbytes == 100_000_000
-        assert per_edge > by_segment * 5, (
-            f"per-edge pricing ({per_edge * 1e3:.0f}ms) versus whole-segment "
-            f"pricing ({by_segment * 1e3:.0f}ms) - if these are close, the "
-            f"two input sizes are not actually differing")
+        assert len(sizes) == 2
+        # A single figure can be right for at most one of two different
+        # sizes, so exactly one edge matches and the other is mispriced.
+        matches = sum(1 for n in sizes if n == producer.nbytes)
+        assert matches == 1, (
+            "the segment's figure should match one edge and miss the other")
 
     def test_a_single_producer_is_unaffected(self):
         """The common case must not gain a phantom edge."""
