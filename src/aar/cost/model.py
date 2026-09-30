@@ -78,6 +78,28 @@ def node_operation(node: Node) -> str:
 
 
 # ------------------------------------------------------------------ priors
+def _load_saved_calibration() -> CalibrationStore:
+    """Load this machine's saved profile, or an empty store.
+
+    ``CalibrationStore()`` with no arguments constructs an *empty* store. So
+    a default ``CostModel`` ignored every profile the user had produced with
+    ``aar calibrate``, and the machine measured itself only when a caller
+    happened to pass the store in explicitly - which the default CLI path did
+    not do. Calibrating and then not using the result is worse than not
+    calibrating, because the plan claims to be measured and is not.
+
+    Failures here are not fatal: an unreadable or foreign profile degrades to
+    priors, and the planner reports ``prior`` as the source, so a broken file
+    cannot make a plan claim evidence it does not have.
+    """
+    try:
+        from ..hardware.calibrate import PROFILE_PATH, CalibrationStore
+
+        return CalibrationStore.load(PROFILE_PATH)
+    except Exception:  # noqa: BLE001 - priors are always a safe fallback
+        return CalibrationStore()
+
+
 @dataclass(frozen=True, slots=True)
 class Priors:
     """Conservative defaults used where the machine has not been measured.
@@ -105,8 +127,15 @@ class Priors:
     remote_startup_s: float = 0.050
     #: Fixed per-call overhead in the interchange layer, in seconds.
     handoff_s: float = 0.0005
-    #: Serialisation cost when crossing a process boundary, in seconds.
-    serialise_s: float = 0.00002
+    #: Serialisation cost crossing a process boundary, in seconds *per byte*.
+    #: Per byte, not per call: the cost is genuinely proportional to the
+    #: volume crossing the boundary, and expressing it per byte keeps it in
+    #: the same units as the bandwidth terms beside it. The default is
+    #: ~50 MB/s, a slow but real serialisation rate. It was documented and
+    #: named as a flat number of *seconds* while being multiplied by nbytes,
+    #: so 1 MB cost 20 s - a penalty large enough to make the planner reject
+    #: correct plans on the strength of a unit error.
+    serialise_s_per_byte: float = 2.0e-8
     #: Cost of writing and re-reading a materialised intermediate, per byte.
     materialise_bytes_per_s: float = 1.0e9
     #: Spill bandwidth, per byte. A rotational disk; conservative.
@@ -135,7 +164,7 @@ class TransferProfile:
     h2d_bytes_per_s: float = DEFAULT_PRIORS.h2d_bytes_per_s
     d2h_bytes_per_s: float = DEFAULT_PRIORS.d2h_bytes_per_s
     network_bytes_per_s: float = 1.25e8   # 1 Gbit/s
-    serialise_s: float = DEFAULT_PRIORS.serialise_s
+    serialise_s_per_byte: float = DEFAULT_PRIORS.serialise_s_per_byte
     in_process: bool = True
     rdma: bool = False
 
@@ -257,7 +286,8 @@ class CostModel:
         transfer: TransferProfile | None = None,
         history: "ExecutionHistory | None" = None,
     ) -> None:
-        self._calibration = calibration if calibration is not None else CalibrationStore()
+        self._calibration = (calibration if calibration is not None
+                            else _load_saved_calibration())
         self._registry = registry if registry is not None else CapabilityRegistry()
         self._priors = priors
         self._transfer = transfer or TransferProfile()
@@ -440,12 +470,12 @@ class CostModel:
             # Device to device is a peer copy, not two host transfers.
             return CostBreakdown(
                 transfer_s=nbytes / self._transfer.h2d_bytes_per_s,
-                materialise_s=nbytes * self._transfer.serialise_s)
+                materialise_s=nbytes * self._transfer.serialise_s_per_byte)
 
         if {a.device, b.device} == {Device.GPU, Device.ACCEL_REMOTE}:
             return CostBreakdown(
                 transfer_s=self._transfer.over_network(nbytes),
-                materialise_s=nbytes * self._transfer.serialise_s)
+                materialise_s=nbytes * self._transfer.serialise_s_per_byte)
 
         crosses_bus = Device.GPU in (a.device, b.device)
         crosses_net = a.remote or b.remote
@@ -455,14 +485,14 @@ class CostModel:
         if crosses_bus:
             transfer += nbytes / self._transfer.h2d_bytes_per_s
             transfer += nbytes / self._transfer.d2h_bytes_per_s
-            serialise = nbytes * self._transfer.serialise_s
+            serialise = nbytes * self._transfer.serialise_s_per_byte
         elif crosses_net:
             transfer += self._transfer.over_network(nbytes)
-            serialise = nbytes * self._transfer.serialise_s
+            serialise = nbytes * self._transfer.serialise_s_per_byte
         elif not self._transfer.in_process:
             # Different process: an IPC hop, and the bytes must be serialised.
             transfer += nbytes / self._transfer.network_bytes_per_s
-            serialise = nbytes * self._transfer.serialise_s
+            serialise = nbytes * self._transfer.serialise_s_per_byte
         # In-process CPU to CPU is genuinely free: the C Data Interface
         # hands over the same buffers with no copy and no serialisation.
         # Charging for it would make a segment optimiser avoid perfectly

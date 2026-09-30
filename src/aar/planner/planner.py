@@ -497,6 +497,16 @@ class AdaptivePlanner:
             for engine in candidates:
                 if not self._fits_memory(engine, seg.nbytes):
                     continue
+                # ``node_cost`` already includes the inbound transition when
+                # ``from_engine`` differs, so adding ``transition_cost`` here
+                # as well charged every hop twice.
+                #
+                # ``inbound_s`` must be the *cross-engine* transition alone.
+                # It is stored separately from ``cost`` because
+                # ``SegmentPlan.total_s`` adds the two together - so handing it
+                # the whole ``transfer_s`` (which already includes the hop, plus
+                # any device crossing) would reintroduce the same double count
+                # one field over.
                 breakdown, source = self._cost.node_cost(
                     seg.nodes[-1], engine, seg.nbytes,
                     from_engine=previous_engine,
@@ -505,6 +515,15 @@ class AdaptivePlanner:
                 if previous_engine and previous_engine != engine:
                     inbound = self._cost.transition_cost(
                         previous_engine, engine, seg.nbytes).total_s
+                    # Charge the hop once, here, and stop the cost model
+                    # charging it again inside the breakdown.
+                    breakdown = CostBreakdown(
+                        startup_s=breakdown.startup_s,
+                        read_s=breakdown.read_s,
+                        transfer_s=breakdown.transfer_s - inbound,
+                        compute_s=breakdown.compute_s,
+                        spill_s=breakdown.spill_s,
+                        materialise_s=breakdown.materialise_s)
                 scored.append((engine, breakdown.total_s + inbound,
                                breakdown, inbound, source))
 

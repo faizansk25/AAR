@@ -213,7 +213,14 @@ def _grid_search(ns: list[float], ts: list[float]) -> tuple[float, float, float,
         # 1000x in magnitude; without scaling the fit collapses into
         # numerical noise on small inputs.
         x1 = [n / scale for n in ns]
-        x2 = [x * x for x in x1]
+        # The third regressor must use the exponent being tested. It used to
+        # be ``x1 * x1`` for every candidate while the fitted coefficient was
+        # stored as though it belonged to ``x ** exp``: the search reported a
+        # model it had never actually fitted, so the reported exponent was
+        # meaningless and the curve's super-linear term was wrong by an
+        # exponent's worth of power. At exp=2.0 the two agree, which is why
+        # this hid behind a linear-dominated test.
+        x2 = [(n / scale) ** exp for n in ns]
         coeffs = _solve3(x1, x2, ts)
         if coeffs is None:
             continue

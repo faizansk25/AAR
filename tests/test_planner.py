@@ -12,6 +12,7 @@ the *boundaries*, not merely that a plan was produced.
 
 from __future__ import annotations
 
+import pytest
 
 from aar.capability import CapabilityRegistry, Device
 from aar.cost import CostModel, Priors, TransferProfile
@@ -306,4 +307,45 @@ class TestSegmentBoundaries:
         plan = self._expensive_gpu_plan().plan(_pipeline(1_000_000_000))
         assert plan.boundaries >= 0
         assert "boundary" in plan.render()
+
+    def test_a_cross_boundary_transfer_is_charged_exactly_once(self):
+        """The accounting invariant: the planner must not pay a hop twice.
+
+        ``node_cost`` folds the inbound transition into ``transfer_s``, and
+        ``SegmentPlan.total_s`` adds ``inbound_s`` on top of
+        ``cost.total_s``. Both are correct only if the hop is *removed* from
+        the breakdown when it is recorded separately - which is what the
+        planner now does.
+        """
+        n = 1_000_000_000
+        planner = self._expensive_gpu_plan()
+        model = planner._cost
+        plan = planner.plan(_pipeline(n))
+
+        for sp in plan.segments:
+            if sp.inbound_s <= 0:
+                continue
+            # The recorded inbound hop must be a real transition cost.
+            engine_before = plan.engines[plan.segments.index(sp) - 1]
+            expected = model.transition_cost(engine_before, sp.engine,
+                                             sp.segment.nbytes).total_s
+            assert sp.inbound_s == pytest.approx(expected, rel=1e-9)
+            # And it must not also be sitting inside the breakdown's transfer,
+            # which the cost model added it to.
+            raw, _ = model.node_cost(
+                sp.segment.nodes[-1], sp.engine, sp.segment.nbytes,
+                from_engine=engine_before,
+                residency=model._registry.spec(engine_before).device)
+            assert sp.cost.transfer_s == pytest.approx(
+                raw.transfer_s - sp.inbound_s, rel=1e-6), (
+                f"segment {sp.segment.index}: inbound {sp.inbound_s:.6f}s was "
+                f"counted in transfer_s as well as in inbound_s")
+
+    def test_the_plan_total_is_the_sum_of_its_segments(self):
+        """No segment may be billed twice inside the plan total."""
+        planner = self._expensive_gpu_plan()
+        plan = planner.plan(_pipeline(1_000_000_000))
+        summed = sum(sp.total_s for sp in plan.segments)
+        expected = summed * (1.0 + planner._margin)
+        assert plan.total_s == pytest.approx(expected, rel=1e-6)
 

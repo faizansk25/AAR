@@ -122,10 +122,10 @@ def _failure(exc: BaseException) -> dict:
 
 def api_explain(path: str) -> dict:
     """Plan a pipeline and return the decision trace."""
-    from ..cli import _plan_for
+    from ..application import PipelineService
 
     try:
-        _root, plan = _plan_for(path)
+        plan = PipelineService().explain(path)
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return _failure(exc)
     return {"ok": True, "plan": plan.render()}
@@ -133,15 +133,22 @@ def api_explain(path: str) -> dict:
 
 def api_run(path: str, role: str | None = None,
             policy_path: str | None = None) -> dict:
-    """Plan and execute a pipeline, returning what actually happened."""
-    from ..runtime import Executor
-    from ..sdk import load_pipeline
+    """Plan and execute a pipeline, returning what actually happened.
+
+    This used to call ``Executor().run(node, policy=..., role=...)``. The
+    executor has no ``run`` method - it has ``execute(plan)`` - and it takes
+    a plan rather than a root node, so the endpoint raised ``AttributeError``
+    for every valid pipeline. The tests passed because they only checked the
+    missing-file path, which fails earlier and for a different reason.
+    """
+    from ..application import PipelineService
 
     try:
-        node = load_pipeline(path)
-        result = Executor().run(node, policy=policy_path, role=role)
+        report = PipelineService().run(path, role=role,
+                                       policy_path=policy_path)
     except (Exception, SystemExit) as exc:  # noqa: BLE001
         return _failure(exc)
+    result = report.result
     table = getattr(result, "table", None)
     fields = table.schema.fields if table is not None else ()
     token = _remember(table) if table is not None else ""
@@ -150,7 +157,10 @@ def api_run(path: str, role: str | None = None,
         "token": token,
         "rows": table.num_rows if table is not None else 0,
         "columns": list(table.column_names) if table is not None else [],
-        "schema": [{"name": f.name, "type": f.type.render(),
+        # ``DataType`` has no ``render()``; it renders through ``__str__``.
+        # Calling ``.render()`` here raised AttributeError for every field, so
+        # this line only ever worked for a result with no schema at all.
+        "schema": [{"name": f.name, "type": str(f.type),
                     "classification": sorted(f.classification)}
                    for f in fields],
         "degradations": [getattr(d, "reason", str(d)) for d in

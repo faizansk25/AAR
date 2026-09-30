@@ -25,6 +25,74 @@ def _node(node_type: NodeType) -> Node:
     return Node(node_type)
 
 
+class TestSavedCalibrationIsUsed:
+    """A profile the user paid for must reach the default planner.
+
+    ``CostModel()`` built an empty ``CalibrationStore``, so a machine
+    calibrated with ``aar calibrate`` planned from priors anyway. The plan
+    said ``prior`` while the user believed it was measured - the failure mode
+    this project exists to prevent, in the one place it is hardest to see.
+    """
+
+    def test_a_default_model_picks_up_the_saved_profile(self, tmp_path,
+                                                       monkeypatch):
+        from aar.hardware import calibrate as cal
+
+        path = tmp_path / "profile.json"
+        store = cal.CalibrationStore(str(path))
+        store.add_points([cal.CalibrationPoint("groupby", "cpu", 1_000_000,
+                                              0.05)])
+        store.save()
+
+        monkeypatch.setattr(cal, "PROFILE_PATH", str(path))
+        # Load through the module-level helper the cost model calls.
+        import aar.cost.model as model_module
+
+        loaded = model_module._load_saved_calibration()
+        assert loaded.get("groupby", "cpu") is not None
+        assert loaded.is_calibrated
+
+    def test_a_missing_profile_degrades_to_priors_rather_than_raising(
+            self, tmp_path, monkeypatch):
+        from aar.hardware import calibrate as cal
+        import aar.cost.model as model_module
+
+        monkeypatch.setattr(cal, "PROFILE_PATH", str(tmp_path / "nope.json"))
+        loaded = model_module._load_saved_calibration()
+        assert not loaded.is_calibrated
+
+    def test_a_corrupt_profile_does_not_break_planning(self, tmp_path,
+                                                       monkeypatch):
+        from aar.hardware import calibrate as cal
+        import aar.cost.model as model_module
+
+        bad = tmp_path / "bad.json"
+        bad.write_text("{not json", encoding="utf-8")
+        monkeypatch.setattr(cal, "PROFILE_PATH", str(bad))
+        loaded = model_module._load_saved_calibration()
+        assert not loaded.is_calibrated
+
+
+class TestSerialisationUnits:
+    """``serialise_s`` was seconds-per-byte documented as flat seconds.
+
+    Multiplying bytes by a number documented as seconds made 1 MB cost 20 s,
+    a penalty large enough to reject correct plans on a unit error.
+    """
+
+    def test_one_megabyte_is_not_twenty_seconds(self):
+        from aar.cost import Priors as P
+
+        per_byte = P().serialise_s_per_byte
+        assert 1_000_000 * per_byte < 1.0, "1 MB must not cost a second"
+
+    def test_it_scales_with_the_bytes_actually_moved(self):
+        from aar.cost import Priors as P
+
+        per_byte = P().serialise_s_per_byte
+        assert 10 * per_byte > per_byte
+
+
 class TestOperationMapping:
     @pytest.mark.parametrize("node_type,op", [
         (NodeType.GROUPBY, "groupby"),

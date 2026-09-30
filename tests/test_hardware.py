@@ -131,6 +131,45 @@ class TestCostCurveFitting:
         assert curve.predict(1e8) >= 1.0
 
 
+class TestGridSearchRecoversAKnownCurve:
+    """The fitted curve must be the curve that was actually fitted.
+
+    The third regressor was ``x * x`` for every candidate exponent while the
+    resulting coefficient was stored as belonging to ``x ** exp`` - so the
+    search returned a model it had never fit. Generating data from a known
+    nonlinear curve is the only way to see it: at exp=2.0 the two
+    expressions coincide, so a linear-dominated sample hides the bug.
+    """
+
+    def test_it_recovers_a_known_superlinear_curve(self):
+        from aar.hardware.calibrate import _grid_search
+
+        ns = [1e6, 2e6, 4e6, 8e6, 16e6]
+        # A genuine n^1.3 term: fixed + linear + power law.
+        truth = [1e-3 + 2e-9 * n + 5e-15 * (n ** 1.3) for n in ns]
+        fixed, slope, power, exponent, r2 = _grid_search(ns, truth)
+        assert r2 > 0.999, f"a perfect fit scored R2={r2:.4f}"
+        assert 1.2 <= exponent <= 1.4, exponent
+
+        # The returned coefficients must reproduce the data when used exactly
+        # as ``CostCurve.predict`` uses them.
+        for n, want in zip(ns, truth):
+            got = fixed + slope * n + power * (n ** exponent)
+            assert got == pytest.approx(want, rel=0.05), (n, got, want)
+
+    def test_the_fitted_and_predicted_models_are_the_same_function(self):
+        """Regression: the regressor must use the exponent under test."""
+        from aar.hardware.calibrate import _grid_search
+
+        ns = [1e6, 3e6, 9e6, 27e6]
+        truth = [1e-3 + 1e-8 * n + 4e-14 * (n ** 1.2) for n in ns]
+        fixed, slope, power, exponent, _ = _grid_search(ns, truth)
+        assert exponent < 2.0, "expected a sub-quadratic exponent"
+        for n, want in zip(ns, truth):
+            got = fixed + slope * n + power * (n ** exponent)
+            assert got == pytest.approx(want, rel=0.05)
+
+
 class TestCalibrationStore:
     def test_round_trip(self, tmp_profile):
         store = CalibrationStore(tmp_profile)

@@ -31,6 +31,15 @@ from ..planner import Plan
 
 __all__ = ["ExecutionResult", "Executor"]
 
+#: Node types the executor computes itself, with no engine behind them.
+#: Recorded in the trace so ``engine_used`` names the component that actually
+#: did the work rather than the engine that was merely assigned to it.
+_EXECUTOR_SIDE: frozenset[NodeType] = frozenset({
+    NodeType.CAST, NodeType.NULL_HANDLE, NodeType.DEDUPLICATE,
+    NodeType.QUALITY_CHECK, NodeType.TAG, NodeType.WINDOW,
+    NodeType.UNION, NodeType.MATERIALIZE, NodeType.CACHE,
+})
+
 
 @dataclass(slots=True)
 class NodeOutcome:
@@ -187,14 +196,19 @@ class Executor:
             requested = node.assigned_engine or "arrow"
             outcome = NodeOutcome(
                 node_id=node.id, node_type=str(node.type),
-                engine_requested=requested, engine_used=requested,
+                engine_requested=requested,
+                # Truthful by construction: a node the executor computes itself
+                # did not run on the engine it was assigned to.
+                engine_used=("executor" if self._runs_in_executor(node.type)
+                             else requested),
                 rows_in=inputs[0].num_rows if inputs else 0,
                 bytes_in=inputs[0].nbytes if inputs else 0,
             )
             try:
                 engine, degraded = self._engine(
                     requested, result.ledger, node)
-                outcome.engine_used = engine.id
+                outcome.engine_used = ("executor" if self._runs_in_executor(node.type)
+                                  else engine.id)
                 outcome.degraded = degraded
                 table = self._dispatch(node, engine, inputs)
                 if table is None:
@@ -255,12 +269,25 @@ class Executor:
             return
 
     # ------------------------------------------------------------- dispatch
+    @staticmethod
+    def _runs_in_executor(node_type: NodeType) -> bool:
+        """Whether this node type is computed by the executor itself.
+
+        Eight operations - cast, null handling, dedup, quality, tag, window,
+        union and the materialise/cache pass-through - have no engine
+        implementation. They run here, in Python, whatever the plan assigned.
+        The trace still reported the *assigned* engine as ``engine_used``,
+        which is the one field an analyst uses to ask "what actually ran?" -
+        so a window node planned onto DuckDB appeared to have run there.
+        """
+        return node_type in _EXECUTOR_SIDE
 
     def _dispatch(self, node: Node, engine: Any, inputs: list[Table]) -> Table:
         """Run one node on its engine."""
         t = node.type
         if t in (NodeType.SCAN_PARQUET, NodeType.SCAN_CSV, NodeType.SCAN_JSON,
-                 NodeType.SCAN_EXCEL, NodeType.SCAN_ARROW):
+                 NodeType.SCAN_EXCEL, NodeType.SCAN_ARROW, NodeType.SCAN_SQL,
+                 NodeType.SCAN_MONGO):
             return engine.read_scan(node)
         if t is NodeType.FILTER:
             return engine.filter(_one(inputs), node.predicate)
@@ -442,7 +469,17 @@ class Executor:
         raise ValueError(f"unknown null strategy {node.null_strategy!r}")
 
     def _dedup(self, table: Table, node: Node) -> Table:
-        """Keep one row per distinct key combination."""
+        """Keep one row per distinct key combination.
+
+        ``first`` keeps the earliest row for each key. ``last`` keeps the
+        latest - and the subtlety is that replacing a row must replace *that
+        key's* row, not the most recently appended one. Appending
+        ``keep[-1] = i`` instead corrupts the output whenever a new key
+        arrives after a duplicate: for keys ``A, B, A`` it overwrites ``B``
+        with ``A``, yielding ``A, A`` and silently dropping ``B`` from a
+        result the analyst asked to deduplicate. A key->position map is the
+        only structure that gets this right.
+        """
         keys = list(node.dedup_keys) or list(table.column_names)
         for k in keys:
             if not table.schema.has(k):
@@ -450,19 +487,34 @@ class Executor:
         if table.num_rows == 0:
             return table
         strategy = (node.dedup_strategy or "first").lower()
-        seen: set[tuple] = set()
+        if strategy not in ("first", "last"):
+            raise ValueError(
+                f"unknown dedup strategy {strategy!r}; expected 'first' or "
+                f"'last'")
+        seen: dict[tuple, int] = {}
         keep: list[int] = []
         for i, row in enumerate(table.arrow.to_pylist()):
             k = tuple(_hash(row.get(name)) for name in keys)
             if k not in seen:
-                seen.add(k)
+                seen[k] = len(keep)
                 keep.append(i)
             elif strategy == "last":
-                keep[-1] = i
-        return table.take(keep)
+                keep[seen[k]] = i
+        # Output stays in original input order: ``last`` changes *which* row
+        # survives, not the order the surviving rows come back in. Sorting the
+        # indices is what keeps that promise.
+        return table.take(sorted(keep))
 
     def _quality(self, table: Table, node: Node) -> Table:
-        """Run declared quality rules, and fail loudly if one fails."""
+        """Run declared quality rules, and fail loudly if one fails.
+
+        An unrecognised rule name is an error rather than a no-op. Silently
+        ignoring ``"positive "`` (trailing space) or a typo like ``"notnull"``
+        would report a passing check that never ran, which is the exact
+        failure mode a quality gate exists to prevent.
+        """
+        known = {"not_null", "nonnull", "required", "unique", "distinct",
+                 "positive"}
         failures: list[str] = []
         for column, rule in node.quality_rules:
             if not table.schema.has(column):
@@ -471,6 +523,11 @@ class Executor:
             values = table.column(column).to_pylist()
             present = [v for v in values if v is not None]
             name = (rule or "").lower()
+            if name not in known:
+                failures.append(
+                    f"{column}: unknown quality rule {rule!r}; expected one of "
+                    f"{sorted(known)}")
+                continue
             if name in ("not_null", "nonnull", "required"):
                 missing = sum(1 for v in values if v is None)
                 if missing:
@@ -494,19 +551,37 @@ class Executor:
 
 
     def _window(self, table: Table, node: Node) -> Table:
-        """A window function, via the row-wise path.
+        """Window functions with real frame semantics.
 
-        Window semantics - framing, ordering, partitioning - are the easiest
-        thing in an analytical engine to get subtly wrong, so this is explicit
-        rather than clever. An engine with native window support should
-        override it.
+        A window function is evaluated over a *frame* - a moving range of
+        rows within a partition - not over the whole partition. Evaluating
+        ``_apply_aggregate(fn, partition)`` once per row produces a constant
+        per partition, which is what this used to do: a running total
+        returned the partition total on every row, and ``row_number`` would
+        have returned 1 forever. That is not a subtle numeric drift, it is
+        a wrong answer that looks right, so the frame is parsed explicitly.
+
+        Supported frames (SQL spelling, case-insensitive)::
+
+            rows between unbounded preceding and current row   (default)
+            rows between current row and current row
+            rows between N preceding and current row
+            rows between current row and N following
+            rows between unbounded preceding and unbounded following
+            rows between <start> preceding and <end> following
+
+        The start and end bounds are resolved per row against the partition's
+        ordered positions, which is what makes a cumulative sum cumulative.
         """
         from ..engines.arrow_engine import _apply_aggregate
 
-        if not node.window:
+        if not node.window or not node.window_functions:
             return table
         spec = node.window
         rows = table.arrow.to_pylist()
+        if not rows:
+            return table
+
         partitions: dict[tuple, list[int]] = {}
         order: list[tuple] = []
         for i, row in enumerate(rows):
@@ -519,12 +594,30 @@ class Executor:
         for k in order:
             indices = partitions[k]
             for col, ascending in spec.order_by:
-                indices.sort(key=lambda i: rows[i].get(col),
+                indices.sort(key=lambda i: _sort_key(rows[i].get(col)),
                              reverse=not ascending)
+            span = len(indices)
             for name, fn in node.window_functions.items():
-                for i in indices:
-                    rows[i][name] = _apply_aggregate(
-                        fn, [rows[i] for i in indices])
+                for pos, i in enumerate(indices):
+                    # ROW_NUMBER and RANK are positional: they depend on where
+                    # the row sits in the partition, not on the values inside
+                    # the frame. Summing a one-row frame would give every row
+                    # 1, so they are resolved before the aggregate path.
+                    func = getattr(fn, "func", "").upper()
+                    if func in ("ROW_NUMBER", "ROWNUMBER"):
+                        rows[i][name] = pos + 1
+                        continue
+                    if func == "RANK":
+                        key_col = _rank_key(spec)
+                        rows[i][name] = 1 + sum(
+                            1 for prev in indices[:pos]
+                            if _sort_key(rows[prev].get(key_col)) ==
+                            _sort_key(rows[i].get(key_col)))
+                        continue
+                    lo, hi = _frame_bounds(spec.frame, pos, span)
+                    frame = [rows[j] for j in indices[lo:hi]]
+                    rows[i][name] = _apply_aggregate(fn, frame)
+
         return _rebuild(rows, table)
 
     @staticmethod
@@ -601,24 +694,106 @@ def _hash(value: Any) -> Any:
     return value
 
 
+def _rank_key(spec: Any) -> str | None:
+    """The column ``RANK`` ties on: the first ``order_by`` key, if any."""
+    return spec.order_by[0][0] if spec.order_by else None
+
+
+def _sort_key(value: Any) -> tuple[int, Any]:
+    """A total order over possibly-mixed values, for window ``order_by``.
+
+    ``None`` cannot be compared against ``int`` in Python, so a partition
+    containing a null in the ordering column raised ``TypeError`` instead of
+    sorting. Nulls sort first, which matches the Arrow/Parquet default.
+    """
+    if value is None:
+        return (0, 0)
+    if isinstance(value, bool):
+        return (1, int(value))
+    if isinstance(value, (int, float)):
+        return (1, value)
+    return (2, str(value))
+
+
+def _frame_bounds(frame: str | None, pos: int, span: int) -> tuple[int, int]:
+    """Resolve a SQL frame to a half-open ``[lo, hi)`` slice of the partition.
+
+    ``pos`` is the row's index within its ordered partition and ``span`` the
+    partition length. Returns indices into that ordered list, so ``span`` is
+    the upper clamp and ``0`` the lower one - an out-of-range bound is
+    clamped rather than raising, matching SQL's treatment of a frame that
+    runs off the end of the partition.
+    """
+    text = (frame or "").lower().replace("_", " ")
+    text = " ".join(text.split())
+    if not text or "unbounded preceding and unbounded following" in text:
+        return 0, span
+    if "unbounded preceding and current row" in text:
+        return 0, pos + 1
+    if "current row and current row" in text:
+        return pos, pos + 1
+
+    import re
+
+    m = re.search(
+        r"between\s+(\d+)\s+preceding\s+and\s+current\s+row", text)
+    if m:
+        return max(0, pos - int(m.group(1))), pos + 1
+    m = re.search(r"between\s+current\s+row\s+and\s+(\d+)\s+following", text)
+    if m:
+        return pos, min(span, pos + int(m.group(1)) + 1)
+    m = re.search(r"between\s+(\d+)\s+preceding\s+and\s+(\d+)\s+following",
+                  text)
+    if m:
+        return max(0, pos - int(m.group(1))), min(span,
+                                                  pos + int(m.group(2)) + 1)
+    if "unbounded preceding" in text:
+        # ``between unbounded preceding and N following``
+        m = re.search(r"and\s+(\d+)\s+following", text)
+        if m:
+            return 0, min(span, pos + int(m.group(1)) + 1)
+        return 0, pos + 1
+    # An unrecognised frame is a mistake in the pipeline, not a request for
+    # the whole partition. Defaulting silently would make a typo return a
+    # plausible answer, which is how a wrong result survives review.
+    raise ValueError(
+        f"unsupported window frame {frame!r}; expected SQL frame syntax such "
+        f"as 'rows between unbounded preceding and current row'")
+
+
 def _rebuild(rows: list[dict], table: Table) -> Table:
-    """Rebuild a table from mutated row dicts, keeping known column types."""
+    """Rebuild a table from mutated row dicts, keeping known column types.
+
+    Columns that did not exist before - the window functions a frame just
+    computed - are added to the *canonical* schema as well as to Arrow. Only
+    extending Arrow leaves ``Table``'s field-count check to fail, and the
+    failure lands on an unrelated-looking ``ValueError`` at construction
+    rather than on the operation that actually dropped the column.
+    """
     import pyarrow as pa
 
     from ..engines.arrow_engine import _infer_arrow_type
-    from ..interchange import Table, canonical_to_arrow
+    from ..interchange import Table, arrow_to_canonical, canonical_to_arrow
+    from ..types import Field, Schema
 
     known = list(table.column_names)
     extra = [n for n in rows[0] if n not in known] if rows else []
     names = known + extra
     fields = []
+    canonical: list[Field] = []
     for name in names:
         if table.schema.has(name):
-            fields.append(pa.field(name, canonical_to_arrow(
-                table.schema.get(name).type)))
+            existing = table.schema.get(name)
+            fields.append(pa.field(name, canonical_to_arrow(existing.type)))
+            canonical.append(existing)
         else:
-            fields.append(pa.field(name, _infer_arrow_type(
-                [r.get(name) for r in rows])))
+            inferred = _infer_arrow_type([r.get(name) for r in rows])
+            fields.append(pa.field(name, inferred))
+            # A derived column inherits no tags: it is a function of columns
+            # the analyst can already see, and guessing at its sensitivity is
+            # worse than recording none. ``inherit_classification`` exists for
+            # the cases that do need an explicit link.
+            canonical.append(Field(name, arrow_to_canonical(inferred)))
     return Table(pa.Table.from_pylist(rows, schema=pa.schema(fields)),
-                 table.schema)
+                 Schema(tuple(canonical)))
 

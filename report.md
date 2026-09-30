@@ -4,8 +4,56 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 623 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 652 tests
 **Last updated:** 2026-09-29
+
+---
+
+### Round 12 — external audit findings, verified and fixed
+
+An external audit of commit `d1c748e` claimed nine specific defects. **Every
+one was checked against the source before acting on it**, because an audit
+that is wrong about `run()` vs `execute()` would send someone rewriting
+working code. All nine were real; two of them turned out to hide further
+bugs that only surfaced once the first was fixed.
+
+| Claim | Verdict | What was actually wrong |
+|---|---|---|
+| Workbench calls nonexistent `Executor().run()` | **Real** | `Executor` has only `execute(plan)`; `/api/run` failed for every valid pipeline |
+| `dedup` `last` keeps the wrong rows | **Real** | `keep[-1] = i` overwrote the last row appended, not that key's row |
+| Windows compute partition aggregates, not frames | **Real** | `_apply_aggregate(fn, partition)` per row; a running total returned a constant |
+| Unknown quality rules silently ignored | **Real** | no `else` branch; a typo reported a passing check that never ran |
+| `SCAN_SQL`/`SCAN_MONGO` never dispatched | **Real** | fell through to `NotImplementedError` |
+| Calibration fits `x²` but stores `x^exp` | **Real** | the search returned a model it had never fitted |
+| `serialise_s` units | **Real** | documented as seconds, multiplied by bytes: 1 MB cost 20 s |
+| Transfers charged twice | **Real** | `node_cost` added the hop and the planner added it again |
+| Greedy, not dynamic programming | **Real** | confirmed by reading `plan()`; **not yet fixed** |
+
+#### Two more bugs the fixes exposed
+
+Fixing the Workbench endpoint revealed that `f.type.render()` did not exist
+on `DataType` — a second `AttributeError` on the same line, one call deeper.
+The existing tests could not have caught either: they asserted that a
+*missing file* produced an error, which fails earlier and for a different
+reason. **A test suite can be green while the product's main function is
+dead.** The audit's request for a successful end-to-end test is now met by
+four of them.
+
+Fixing the transfer double-count exposed the third bug: `SegmentPlan.total_s`
+is `cost.total_s + inbound_s`, so removing the second addition was not
+sufficient — `inbound_s` also had to be reduced. Two rounds of "fix the
+double count" were both wrong until the invariant was written down as a test
+rather than reasoned about in prose.
+
+#### Tests that would have caught these
+
+`tests/test_correctness_regressions.py` collects them, each naming the defect
+it reproduces. The pattern they share is worth stating plainly: **every one
+of these operations returned a plausible wrong answer instead of an error.**
+A dedup that drops a row, a running total that is constant, a quality check
+that passes without running, a trace that credits DuckDB with work Python
+did. None of them would fail loudly, which is why a green suite proved
+nothing about them.
 
 ---
 
@@ -472,7 +520,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**623 tests: 623 passing, 8 skipped, 0 failing.** Every skip states the
+**652 tests: 649 passing, 7 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously. `README.md` states the same
 number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
 the two ever disagree again — a stale count is the cheapest way to lose a

@@ -80,11 +80,79 @@ class TestInternationalisation:
         assert len(api_i18n()["available"]) >= 5
 
 
+def _write_pipeline(directory, csv_text: str = "region,amount\nnorth,10\nsouth,20\n"):
+    """A real, runnable pipeline file - not a mock of one."""
+    src = directory / "orders.csv"
+    src.write_text(csv_text, encoding="utf-8")
+    pipeline = directory / "pipeline.py"
+    pipeline.write_text(
+        "from aar.sdk import csv, write_csv\n"
+        "\n"
+        "def build():\n"
+        "    return write_csv(csv(r%r), r%r)\n"
+        % (str(src), str(directory / "out.csv")),
+        encoding="utf-8")
+    return pipeline
+
+
 class TestPipelineApi:
     def test_a_missing_pipeline_reports_an_error_not_a_crash(self):
         result = api_explain("definitely_not_a_real_file.py")
         assert result["ok"] is False
         assert result["error"]
+
+    def test_run_executes_a_real_pipeline_and_returns_rows(self, tmp_path):
+        """The success path, which no test covered until it was broken.
+
+        ``api_run`` called ``Executor().run(...)`` - a method that does not
+        exist - so every valid pipeline failed with ``AttributeError``. The
+        existing tests all passed because they only asserted that a *missing*
+        file reports an error, and that assertion was satisfied by a code
+        path that never reached the broken line. A test suite can be green
+        while the product's main function is dead.
+        """
+        pipeline = _write_pipeline(tmp_path)
+        result = api_run(str(pipeline))
+        assert result["ok"] is True, result.get("error")
+        assert result["rows"] == 2
+        assert result["columns"]
+        assert result["token"]
+
+    def test_the_result_grid_can_read_back_the_rows(self, tmp_path):
+        """A run that returns a token the grid cannot read is still broken."""
+        from aar.workbench import api_rows
+
+        pipeline = _write_pipeline(tmp_path)
+        run = api_run(str(pipeline))
+        assert run["ok"] is True, run.get("error")
+        page = api_rows(run["token"])
+        assert page["ok"] is True
+        assert page["total"] == 2
+        assert {r["region"] for r in page["rows"]} == {"north", "south"}
+
+    def test_explain_returns_a_real_plan_for_a_real_pipeline(self, tmp_path):
+        """``api_explain`` had the same CLI-import coupling as ``api_run``."""
+        pipeline = _write_pipeline(tmp_path)
+        result = api_explain(str(pipeline))
+        assert result["ok"] is True, result.get("error")
+        assert "segment" in result["plan"].lower()
+
+    def test_the_cli_and_the_workbench_agree_on_the_result(self, tmp_path):
+        """Both front ends now share one service, so both must see one answer.
+
+        This is the equivalence the duplicated orchestration made impossible
+        to state: same pipeline, same rows, through two different entry
+        points.
+        """
+        from aar.application import PipelineService
+
+        pipeline = _write_pipeline(tmp_path)
+        report = PipelineService().run(str(pipeline))
+        via_api = api_run(str(pipeline))
+        assert via_api["ok"] is True, via_api.get("error")
+        assert report.result.table.num_rows == via_api["rows"]
+        assert sorted(report.result.table.column_names) == \
+            sorted(via_api["columns"])
 
     def test_run_reports_an_error_for_a_missing_pipeline(self):
         result = api_run("definitely_not_a_real_file.py")

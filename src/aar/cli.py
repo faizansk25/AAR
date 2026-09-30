@@ -190,22 +190,26 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
 
 
 def _plan_for(path: str):
-    """Load and plan a pipeline file. Returns the root node and the plan."""
-    from .failures import PlanInfeasible
-    from .planner import AdaptivePlanner
-    from .sdk import load_pipeline
+    """Load and plan a pipeline file. Returns the root node and the plan.
 
-    if not os.path.isfile(path):
-        print(f"aar: no such pipeline: {path}", file=sys.stderr)
-        raise SystemExit(_EXIT_USER_ERROR)
+    Delegates to :class:`PipelineService` so the CLI and the Workbench plan
+    through the same code. The CLI's own ``SystemExit`` behaviour is kept
+    here because only a command line has an exit code to set.
+    """
+    from .application import PipelineService
+    from .failures import PlanInfeasible
+
     try:
-        root = load_pipeline(path)
+        root = PipelineService().load(path)
+    except FileNotFoundError as exc:
+        print(f"aar: {exc}", file=sys.stderr)
+        raise SystemExit(_EXIT_USER_ERROR) from exc
     except Exception as exc:  # noqa: BLE001
         print(f"aar: could not load {path}: {type(exc).__name__}: {exc}",
               file=sys.stderr)
         raise SystemExit(_EXIT_USER_ERROR) from exc
     try:
-        return root, AdaptivePlanner().plan(root)
+        return root, PipelineService().plan(root)
     except PlanInfeasible as exc:
         print(f"aar: {exc}", file=sys.stderr)
         raise SystemExit(_EXIT_USER_ERROR) from exc
