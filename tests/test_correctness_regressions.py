@@ -541,6 +541,95 @@ class TestPlanSaysHowItWasOptimized:
         assert "reason" in payload
 
 
+class TestPlanningRespectsTheMachineItRunsOn:
+    """The default planner had no hardware profile, so no memory check ran.
+
+    ``AdaptivePlanner(profile=None)`` - the default - left ``_profile`` as
+    ``None``, and ``_fits_memory`` returns ``True`` when there is no profile.
+    The capability registry was therefore consulted on every candidate engine
+    and answered "yes" to all of them, permanently. Measured: a 40 GB
+    group-by planned as comfortably as a 1 MB filter.
+
+    A plan that cannot fit is a claim the planner could not previously make
+    in either direction - it neither refused nor reserved.
+    """
+
+    class _Profile:
+        def __init__(self, ram: int, vram: int = 0):
+            self.memory_budget_bytes = ram
+            self.vram_budget_bytes = vram
+
+    def _oversized(self, nbytes: int = 40_000_000_000):
+        from aar.ir import Node, NodeType, ScanSpec
+
+        scan = Node(NodeType.SCAN_CSV,
+                    scan=ScanSpec(kind="csv", path="big.csv"),
+                    estimated_bytes=nbytes)
+        return Node(NodeType.GROUPBY, inputs=[scan], key_left=("k",),
+                    estimated_bytes=nbytes)
+
+    def _small(self):
+        from aar.ir import BinOp, Col, Lit, Node, NodeType, ScanSpec
+
+        scan = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="s.csv"),
+                    estimated_bytes=1_000_000)
+        return Node(NodeType.FILTER, inputs=[scan],
+                    predicate=BinOp(Col("v"), ">", Lit(0)))
+
+    def test_the_default_planner_has_a_hardware_profile(self):
+        """Otherwise every memory check below is a no-op."""
+        from aar.planner import AdaptivePlanner
+
+        assert AdaptivePlanner()._profile is not None
+
+    def test_a_workload_beyond_the_budget_is_refused(self):
+        from aar.failures import PlanInfeasible
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False,
+                                  profile=self._Profile(8_000_000_000))
+        assert planner._fits_memory("duckdb", 40_000_000_000) is False
+        with pytest.raises(PlanInfeasible):
+            planner.plan(self._oversized())
+
+    def test_a_workload_within_the_budget_still_plans(self):
+        """The check must reject the impossible, not everything."""
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False,
+                                  profile=self._Profile(8_000_000_000))
+        plan = planner.plan(self._small())
+        assert plan.segments
+        assert plan.total_s > 0
+
+    def test_an_explicit_profile_is_used_instead_of_detected(self):
+        from aar.planner import AdaptivePlanner
+
+        profile = self._Profile(1_000_000_000)
+        assert AdaptivePlanner(profile=profile)._profile is profile
+
+    def test_the_refusal_names_the_bytes_that_did_not_fit(self):
+        """A bare "infeasible" sends the reader back to the start."""
+        from aar.failures import PlanInfeasible
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False,
+                                  profile=self._Profile(8_000_000_000))
+        with pytest.raises(PlanInfeasible) as caught:
+            planner.plan(self._oversized())
+        assert "40000000000" in str(caught.value)
+
+    def test_a_planner_for_another_machine_still_refuses(self):
+        """Memory feasibility is about the target, not the observer."""
+        from aar.failures import PlanInfeasible
+        from aar.planner import AdaptivePlanner
+
+        tiny = AdaptivePlanner(require_available=False,
+                               profile=self._Profile(1_000_000))
+        with pytest.raises(PlanInfeasible):
+            tiny.plan(self._oversized(50_000_000))
+
+
 class TestDedupKeepsTheRightRow:
     """``keep[-1] = i`` overwrote the last row appended, not that key's row.
 

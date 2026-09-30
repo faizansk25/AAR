@@ -597,7 +597,18 @@ class AdaptivePlanner:
     ) -> None:
         self._cost = cost_model or CostModel()
         self._registry = registry or CapabilityRegistry()
-        self._profile = profile
+        # **Detect the hardware unless a profile was supplied.**
+        #
+        # Leaving this as None made every memory check a no-op: `_fits_memory`
+        # returns True when there is no profile, so a 40 GB group-by planned
+        # as comfortably as a 40 KB one. The capability registry was built,
+        # wired to the registry, and consulted on every candidate - and
+        # answered "yes" to all of them, forever.
+        #
+        # Detection is cheap and memoised, and it is what makes "this plan
+        # will not fit on this machine" a statement AAR can actually make.
+        # Pass ``profile=`` explicitly to plan for a different machine.
+        self._profile = profile if profile is not None else self._detect()
         self._ledger = ledger or DegradationLedger()
         #: When True (the default) an engine that is not installed cannot be
         #: chosen, so the plan is executable. Set False to plan for a machine
@@ -675,6 +686,22 @@ class AdaptivePlanner:
             return True
         return self._registry.fits_memory(engine, nbytes, self._profile)
 
+
+    @staticmethod
+    def _detect():
+        """This machine's hardware profile, or ``None`` if it cannot be read.
+
+        A failure here must not stop planning: the cost model works without
+        hardware, and a plan built with no memory checks is far better than
+        no plan. The plan records that the checks were unavailable so the
+        gap is visible rather than silent.
+        """
+        try:
+            from ..hardware import detect
+
+            return detect.HardwareProfile()
+        except Exception:  # noqa: BLE001 - hardware detection is best-effort
+            return None
 
     # --------------------------------------------------------------- planning
     def plan(self, root: Node) -> Plan:
