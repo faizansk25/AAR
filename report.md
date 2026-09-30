@@ -4,8 +4,67 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 761 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 767 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 17 — peak-memory planning actually consults the machine
+
+Audit item 6, and the last of the three the audit asked for before the
+optimizer. The capability registry, the memory budgets, and `fits_memory` all
+existed and were correct. **Nothing called them.**
+
+`AdaptivePlanner(profile=None)` is the default, and it left `self._profile` as
+`None`. `_fits_memory` returns `True` when there is no profile, so every
+candidate engine passed every check. Measured before the fix:
+
+```
+planner hardware profile: None
+_fits_memory(duckdb, 40GB) -> True
+planned anyway: ['arrow', 'arrow']
+```
+
+A 40 GB group-by planned exactly as comfortably as a 1 MB filter. The registry
+was consulted on every candidate and answered "yes" to all of them,
+permanently.
+
+The planner now **detects the hardware unless a profile is supplied**, with
+detection wrapped so a failure degrades to no-checks rather than to no-plan:
+
+```
+profile now: HardwareProfile
+_fits_memory(duckdb, 40GB) -> False
+_fits_memory(duckdb, 1MB)  -> True
+```
+
+and the same 40 GB pipeline is now **refused** rather than planned:
+
+```
+PlanInfeasible [NO_FEASIBLE_PLAN] every engine for segment 0 exceeds the
+memory budget (40000000000 bytes)
+```
+
+The refusal names the byte count, because "infeasible" on its own sends the
+reader back to the start. An explicitly supplied profile is still honoured, so
+planning *for another machine* keeps working.
+
+**767 passed, 7 skipped, 0 failed; ruff clean.** NYC taxi Parquet unchanged:
+3,627,882 rows / 55,682,369 bytes.
+
+#### Where this leaves the optimizer
+
+The audit's precondition is now met: transfers are priced per edge from real
+predecessor sizes, the engine search says whether it proved anything, and a
+plan that cannot fit is refused. The search is still exhaustive over the
+assignment product — now *visible* when it falls back, but not faster.
+
+A DP over engine sets is the next step, and it is deliberately **not**
+attempted here: a scalable search returns a good answer slightly less often
+than an exact one returns the right answer, and until the cost inputs are
+validated against real executions there is no evidence the second is worth
+more than the first. That validation is the missing piece, and it is what
+persistent estimation history would finally make possible.
 
 ---
 
