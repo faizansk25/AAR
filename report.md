@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 692 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 695 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -652,7 +652,7 @@ chosen with.
 
 ## 4. Testing
 
-**692 tests: 692 passing, 8 skipped, 0 failing.** Every skip states the
+**695 tests: 695 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously. `README.md` states the same
 number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
 the two ever disagree again — a stale count is the cheapest way to lose a
@@ -1059,15 +1059,17 @@ streaming progress are not yet built.
    them; a data profiler that measures real statistics is not yet built. The
    executor does return observed row counts and elapsed times, so the history
    store can be wired to real measurements next.
-8. **The dynamic program is exact for a chain, not for a branching DAG.**
-   `AdaptivePlanner.plan()` now keeps a cumulative cost per (segment, engine)
-   and reconstructs one optimal path, so it is no longer greedy — a workload
-   where the locally cheapest first choice loses overall is planned correctly
-   and `TestPlanningIsGloballyOptimal` proves it against a brute-force
-   enumeration. But the state is "the engine of the previous segment", which
-   describes a chain. A join gives a segment several predecessors, and no
-   single previous engine represents that. Extending the state to a *set* of
-   engines is the next step, and it is not written.
+8. **The optimiser handles a branching DAG exactly, but the search is
+   exhaustive.** `AdaptivePlanner.plan()` builds the real segment dependency
+   graph via `segment_predecessors` and charges a crossing for *every*
+   segment feeding each one, so a two-input join is billed for both inputs
+   rather than the one that happened to be numbered before it. The previous
+   single-"previous engine" table made a plan that straddled engines cost
+   exactly the same as one that never moved any — the crossings were counted
+   nowhere. Assignment selection is exhaustive over the product of candidate
+   sets, which is exact but exponential; above 20,000 combinations it falls
+   back to a per-segment local choice. A DP over engine *sets* would make
+   that bound much larger and is the next step.
 9. **A segment is priced as a sum of its operations, not a fused query.**
    `CostModel.segment_cost` now sums every operation in a segment, each at the
    size it actually sees. That is deliberately *not* a fused estimate: the

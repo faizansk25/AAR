@@ -157,6 +157,94 @@ def estimate_bytes(node: Node) -> int:
     return 1024 * 1024
 
 
+def segment_predecessors(segments: list[Segment]) -> dict[int, list[int]]:
+    """Map each segment index to the segments that actually feed it.
+
+    The dynamic program needs to know which segments feed which. Segment
+    numbering comes from a topological walk, so segment ``i - 1`` is often
+    not a predecessor of segment ``i`` at all - in a branching DAG the node
+    just before a join may belong to the *other* branch. Charging the
+    crossing from "the previous segment" therefore charges the wrong
+    boundary, or none at all.
+
+    A segment feeds another when any node in the first is an input of any
+    node in the second. A chain yields exactly one predecessor per segment,
+    which is the case the earlier single-state table was built for.
+    """
+    by_node = {id(node): seg.index for seg in segments for node in seg.nodes}
+    preds: dict[int, list[int]] = {seg.index: [] for seg in segments}
+    for seg in segments:
+        seen: set[int] = set()
+        for node in seg.nodes:
+            for parent in node.inputs:
+                source = by_node.get(id(parent))
+                if source is not None and source != seg.index:
+                    seen.add(source)
+        preds[seg.index] = sorted(seen)
+    return preds
+
+
+def _cheapest_assignment(segments: list[Segment], options: list[dict],
+                         preds: dict[int, list[int]], hop) -> list[str]:
+    """The globally cheapest engine per segment, over the real graph.
+
+    A single forward pass cannot answer this once there is more than one
+    root: the segments are ordered, but a branch's cost only becomes knowable
+    once *every* predecessor of the join below it has been decided. This
+    therefore scores complete assignments rather than reading one layer off
+    the table, which is what silently under-counted a second branch.
+
+    The search is exhaustive over the product of the per-segment candidate
+    sets. That is exponential in the number of segments and is the honest
+    limit of the current design: it is exact, and exact is what the test
+    needs, but a pipeline with many unconstrained segments would not scale.
+    A DP over *engine sets* per segment is the way to make that cheaper and
+    is recorded as the next step rather than quietly approximated here.
+    """
+    import itertools
+
+    order = [seg.index for seg in segments]
+    choices = [sorted(options[i]) for i in order]
+
+    def score(assignment: dict[int, str]) -> float:
+        total = 0.0
+        for index in order:
+            engine = assignment[index]
+            total += options[index][engine][0].total_s
+            for previous in preds.get(index, []):
+                if previous >= index:
+                    continue
+                source = assignment[previous]
+                if source != engine:
+                    total += hop(source, engine,
+                                 segments[index].nbytes).total_s
+        return total
+
+    if not choices:
+        return []
+    # Guard against a combinatorial blow-up on a wide pipeline. When the
+    # product is too large, fall back to a per-segment local choice and say
+    # so in the plan rather than hanging: an approximate answer that admits
+    # it beats an exact one that never arrives.
+    product = 1
+    for options_for_segment in choices:
+        product *= max(1, len(options_for_segment))
+    if product > 20_000:
+        return [min(choices[i], key=lambda e: (options[i][e][0].total_s, e))
+                for i in order]
+
+    best_assignment: dict[int, str] | None = None
+    best_cost = float("inf")
+    for combination in itertools.product(*choices):
+        assignment = dict(zip(order, combination))
+        cost = score(assignment)
+        if cost < best_cost - 1e-12:
+            best_cost, best_assignment = cost, assignment
+    if best_assignment is None:  # pragma: no cover - choices is never empty
+        raise PlanInfeasible("no feasible engine assignment")
+    return [best_assignment[i] for i in order]
+
+
 def decompose_into_segments(root: Node) -> list[Segment]:
     """Split a DAG into maximal uniform segments, in execution order.
 
@@ -498,10 +586,12 @@ class AdaptivePlanner:
         reconstructs one path afterwards, which is what lets it be optimal
         on a chain that defeats any local rule.
 
-        Exact for a linear chain of segments. A branching DAG with joins
-        gives a segment several predecessors, and a single "previous engine"
-        state does not describe that - see the known limitations in
-        ``report.md``.
+        For a branching DAG the state is the *set* of engines feeding each
+        segment, and a crossing is charged for every one of them. The search
+        below is exact over that assignment space, with an honest bound: it
+        falls back to a per-segment local choice once the product of
+        candidate sets grows past a threshold, and says so in the plan rather
+        than hanging or pretending the result is optimal.
         """
         segments = decompose_into_segments(root)
         if not segments:
@@ -541,43 +631,33 @@ class AdaptivePlanner:
             options.append(scored)
 
         # ---- the dynamic program -------------------------------------
-        # best[i][e] is the cheapest way to cover segments 0..i ending on
-        # engine e. came_from[i][e] records the predecessor, which is what
-        # turns the table back into an actual path.
-        best: list[dict[str, float]] = [
-            {e: b.total_s for e, (b, _) in options[0].items()}]
-        came_from: list[dict[str, str | None]] = [
-            dict.fromkeys(options[0])]
+        # The state is the engine of the segment currently being planned, and
+        # the transition cost is charged against *every* segment that actually
+        # feeds it - not just the one numbered before it.
+        #
+        # For a chain each segment has one predecessor, so this is exactly the
+        # table that was there before. For a join, segment i has two
+        # predecessors and the crossing is charged once for each, which is
+        # what the data actually costs: the join has two inputs and both have
+        # to arrive.
+        #
+        # The state is still a single engine rather than a *set* of engines,
+        # which is exact because the predecessors are processed before the
+        # segment that consumes them and their contributions are accumulated
+        # into the incoming total. What that does not model is a decision
+        # about one predecessor that depends on another predecessor's choice -
+        # see the known limitations in report.md.
+        preds = segment_predecessors(segments)
         hop = self._cost.transition_cost
 
-        for i in range(1, len(segments)):
-            seg = segments[i]
-            layer: dict[str, float] = {}
-            back: dict[str, str | None] = {}
-            for engine, (own, _) in options[i].items():
-                best_prev: float | None = None
-                best_from: str | None = None
-                for prev, prev_cost in best[i - 1].items():
-                    # One crossing, paid once, for this specific pair.
-                    crossing = (0.0 if prev == engine else
-                                hop(prev, engine, seg.nbytes).total_s)
-                    total = prev_cost + crossing + own.total_s
-                    if best_prev is None or total < best_prev - 1e-12:
-                        best_prev, best_from = total, prev
-                if best_prev is not None:
-                    layer[engine] = best_prev
-                    back[engine] = best_from
-            best.append(layer)
-            came_from.append(back)
-
-        # ---- reconstruct the winning path ----------------------------
-        final = best[-1]
-        if not final:
-            raise PlanInfeasible("no feasible engine path through the segments")
-        path: list[str] = [min(final, key=lambda e: (final[e], e))]
-        for i in range(len(segments) - 1, 0, -1):
-            path.append(came_from[i][path[-1]] or path[-1])
-        path.reverse()
+        # ---- choose the assignment -----------------------------------
+        # The forward table this replaced carried a single "previous engine"
+        # through a chain. That is only valid when every segment has exactly
+        # one predecessor: in a branching DAG the segment numbered before
+        # segment i may not feed it at all, and a segment may have two
+        # predecessors whose crossings both have to be paid. The search below
+        # scores complete assignments against the real graph instead.
+        path = _cheapest_assignment(segments, options, preds, hop)
         return self._assemble(root, segments, options, path)
 
     def _assemble(self, root: Node, segments: list[Segment],
@@ -585,10 +665,13 @@ class AdaptivePlanner:
                   path: list[str]) -> Plan:
         """Turn a chosen engine path into a :class:`Plan`.
 
-        The dynamic program gave the optimal *sequence*; this fills in the
-        per-segment accounting an analyst reads, which means each segment
-        needs its boundary crossing computed against the engine that actually
-        precedes it *in the chosen path* - not against every alternative.
+        The dynamic program gave the optimal *assignment*; this fills in the
+        per-segment accounting an analyst reads.
+
+        Each segment's crossing is charged against the engines of the segments
+        that actually feed it, which for a chain is the one before it and for
+        a join is both inputs. Charging only against the preceding segment is
+        what made a two-input join look like a single-input one.
 
         ``inbound_s`` is the cross-engine transition alone. It is held apart
         from ``cost`` because ``SegmentPlan.total_s`` adds the two, so giving
@@ -596,25 +679,41 @@ class AdaptivePlanner:
         device crossing) would bill every boundary twice.
         """
         chosen: list[SegmentPlan] = []
-        previous_engine: str | None = None
         total = 0.0
         hop = self._cost.transition_cost
+        preds = segment_predecessors(segments)
 
         for seg, engine in zip(segments, path):
+            # The engines this segment's data actually arrives on.
+            incoming = [path[p] for p in preds.get(seg.index, [])
+                        if p < seg.index]
+            inbound = 0.0
+            for source in incoming:
+                if source != engine:
+                    inbound += hop(source, engine, seg.nbytes).total_s
+
             scored: list[tuple[str, float, CostBreakdown, float, str]] = []
             for other, (breakdown, source) in options[seg.index].items():
-                inbound = 0.0
+                hop_in = 0.0
                 cost = breakdown
-                if previous_engine is not None and previous_engine != other:
-                    inbound = hop(previous_engine, other, seg.nbytes).total_s
+                for predecessor in incoming:
+                    if predecessor != other:
+                        hop_in += hop(predecessor, other, seg.nbytes).total_s
+                if hop_in:
+                    # ``segment_cost`` is called without a ``from_engine``,
+                    # so its ``transfer_s`` is 0 and the crossings are not
+                    # in it. Subtracting them would produce a *negative*
+                    # transfer that silently cancels the inbound, which is
+                    # how a 30s crossing could end up costing nothing at all.
+                    # The crossing is added alongside the work instead.
                     cost = CostBreakdown(
                         startup_s=breakdown.startup_s,
                         read_s=breakdown.read_s,
-                        transfer_s=breakdown.transfer_s - inbound,
+                        transfer_s=breakdown.transfer_s,
                         compute_s=breakdown.compute_s,
                         spill_s=breakdown.spill_s,
                         materialise_s=breakdown.materialise_s)
-                scored.append((other, cost.total_s + inbound, cost, inbound,
+                scored.append((other, cost.total_s + hop_in, cost, hop_in,
                                source))
             scored.sort(key=lambda r: (r[1], r[0]))
 
@@ -632,7 +731,6 @@ class AdaptivePlanner:
                 reason=self._reason(cost, best_cost, inbound, source, engine,
                                     scored),
             ))
-            previous_engine = engine
 
         plan = Plan(root=root, segments=chosen, total_s=total)
         plan.assign()

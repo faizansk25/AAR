@@ -32,11 +32,12 @@ def implemented_engine_ids() -> set[str]:
 
 from .planner import (  # noqa: E402,F401
     AdaptivePlanner, NodeTypeAffinity, Plan, Segment, SegmentPlan,
-    decompose_into_segments, estimate_bytes, pushdown_report, self_device,
+    decompose_into_segments, estimate_bytes, pushdown_report,
+    segment_predecessors, self_device,
 )
 
 __all__ = [
     "AdaptivePlanner", "NodeTypeAffinity", "Plan", "Segment", "SegmentPlan",
     "decompose_into_segments", "estimate_bytes", "self_device",
-    "implemented_engine_ids", "pushdown_report",
+    "implemented_engine_ids", "pushdown_report", "segment_predecessors",
 ]

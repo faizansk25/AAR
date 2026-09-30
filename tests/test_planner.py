@@ -247,6 +247,186 @@ class TestSegmentPlanning:
         assert "total" in text
         assert "segment" in text
 
+class TestBranchingDagIsOptimisedCorrectly:
+    """The DP's state is "the engine of the previous segment".
+
+    That is right for a chain and wrong for a branch. In a DAG the segment
+    numbered just before segment *i* may not be one of its *predecessors* at
+    all, and segment *i* may have two of them. The current table charges one
+    crossing, from whichever segment happened to be numbered before, and
+    charges nothing for the other input.
+
+    A join with two inputs on different engines has to pay for both
+    crossings. Paying for one is exactly the number that makes the planner
+    prefer a plan it should not.
+
+        scan1 -> filter1 --.
+                        join -> write
+        scan2 -> filter2 --'
+    """
+
+    SWITCH = 30.0
+
+    def _planner(self, pinned: dict[int, str] | None = None):
+        """Two engines, a fixed hop, and 1s of work per segment, so the
+        only thing that varies is how many crossings are charged.
+
+        ``pinned`` maps a segment index to the only engine it may use. That
+        is how a straddle is forced: a pinned segment cannot share an engine
+        with its neighbours, so a join downstream genuinely has two inputs
+        arriving from different places. Pinning the IR node's
+        ``assigned_engine`` does not work, because the planner assigns engines
+        itself and overwrites it.
+        """
+        from aar.capability import CapabilityRegistry
+        from aar.cost import CostBreakdown, CostModel
+
+        switch = self.SWITCH
+        pins = dict(pinned or {})
+
+        class _FakeCost(CostModel):
+            def segment_cost(self, segment, engine_id, from_engine=None,
+                             residency=None):
+                return CostBreakdown(compute_s=1.0), "calibration"
+
+            def node_cost(self, node, engine_id, nbytes, from_engine=None,
+                          residency=None):
+                return CostBreakdown(compute_s=1.0), "calibration"
+
+            def transition_cost(self, from_engine, to_engine, nbytes):
+                if from_engine == to_engine:
+                    return CostBreakdown()
+                return CostBreakdown(transfer_s=switch)
+
+        planner = AdaptivePlanner(
+            cost_model=_FakeCost(calibration=None,
+                                 registry=CapabilityRegistry()),
+            registry=CapabilityRegistry(), require_available=False)
+        if pins:
+            # A subclass, because ``AdaptivePlanner`` uses ``__slots__`` and
+            # therefore refuses attribute assignment. Overriding the method
+            # is also the honest way to express the constraint: it *is* a
+            # restriction on which engines a segment may use.
+            base_candidates = planner.candidate_engines
+
+            class _Pinned(type(planner)):  # type: ignore[misc]
+                def candidate_engines(self, segment):
+                    allowed = base_candidates(segment)
+                    forced = pins.get(segment.index)
+                    if forced:
+                        narrowed = [e for e in allowed if e == forced]
+                        return narrowed or [forced]
+                    return allowed
+
+            planner = _Pinned(planner._cost, planner._registry,
+                              require_available=False)
+        return planner
+
+    def _branching_pipeline(self, right_engine: str | None = None):
+        """scan/filter on each side, joined, then written.
+
+        ``right_engine`` pins the right branch to one engine, which is how a
+        straddle is forced: the two branches cannot then share an engine, so
+        the join genuinely has two inputs arriving from different places.
+        """
+        from aar.ir import BinOp, Col, JoinType, Lit, Node, NodeType, ScanSpec
+
+        def branch(name: str) -> Node:
+            scan = Node(NodeType.SCAN_CSV, inputs=[],
+                        scan=ScanSpec(kind="csv", path=f"{name}.csv"))
+            scan.estimated_bytes = 1_000_000
+            filt = Node(NodeType.FILTER, inputs=[scan],
+                        predicate=BinOp(Col("k"), "=", Lit(1)))
+            filt.estimated_bytes = 1_000_000
+            return filt
+
+        right = branch("right")
+        if right_engine:
+            # Pin it: every node on that branch is forced to one engine, so
+            # the join cannot have both inputs arrive from the same place.
+            for node in right.walk():
+                node.assigned_engine = right_engine
+        join = Node(NodeType.JOIN, inputs=[branch("left"), right],
+                    key_left=("k",), join_type=JoinType.INNER)
+        join.estimated_bytes = 2_000_000
+        return Node(NodeType.WRITE, inputs=[join], target="out.csv",
+                    write_format="csv")
+
+    def _join_segment(self, plan):
+        return next(sp for sp in plan.segments
+                    if any("Join" in t for t in sp.segment.op_types))
+
+    def test_a_join_pays_for_both_of_its_inputs(self):
+        """The core defect: one crossing counted where there are two.
+
+        The left branch is pinned to ``arrow`` and the right branch to
+        ``duckdb``, so the join cannot avoid a straddle: whichever engine it
+        picks, one of its two inputs has to cross. It must then pay for
+        exactly that one crossing, and the plan must show it.
+
+        Before the fix the table carried a single "previous engine" through
+        the chain, so a plan that moved data between engines at every step
+        cost the same as one that never moved any - 6.0s either way, with
+        the crossings counted nowhere.
+        """
+        planner = self._planner(pinned={0: "arrow", 1: "arrow",
+                                        2: "duckdb", 3: "duckdb"})
+        plan = planner.plan(self._branching_pipeline())
+        join_seg = self._join_segment(plan)
+
+        engines = {sp.segment.index: sp.engine for sp in plan.segments}
+        assert engines[1] == "arrow" and engines[3] == "duckdb", (
+            f"branches are not straddled: {engines}")
+
+        # The join sits on one side, so exactly one of its two inputs has to
+        # cross. Charging for one is correct; charging for two would be as
+        # wrong as charging for none.
+        assert join_seg.inbound_s == pytest.approx(self.SWITCH, rel=1e-6), (
+            f"join on {join_seg.engine} with inputs on arrow and duckdb "
+            f"charged {join_seg.inbound_s:.1f}s, expected {self.SWITCH:.1f}s")
+
+    def test_the_plan_is_not_cheaper_than_its_true_cost(self):
+        """A straddle must cost more than agreeing on one engine.
+
+        Everything on one engine pays nothing; a straddle pays for each
+        branch that has to reach across. Before the fix both cost 6.0s, so
+        the plan that moved the most data looked free.
+        """
+        straddled = self._planner(pinned={0: "arrow", 1: "arrow",
+                                          2: "duckdb", 3: "duckdb"})
+        together = self._planner()
+        root = self._branching_pipeline()
+        a = straddled.plan(root)
+        b = together.plan(root)
+
+        assert set(a.engines) == {"arrow", "duckdb"}, (
+            f"expected a straddle, got {a.engines}")
+        assert set(b.engines) == {"arrow"}, f"expected one engine: {b.engines}"
+        assert a.total_s > b.total_s, (
+            f"straddling plan {a.engines} costs {a.total_s:.1f}s but the "
+            f"single-engine plan {b.engines} costs {b.total_s:.1f}s")
+        # One crossing, at the join, for the branch that has to reach across.
+        assert self._join_segment(a).inbound_s == pytest.approx(
+            self.SWITCH, rel=1e-6)
+
+    def test_a_chain_is_unaffected_by_the_dag_change(self):
+        """A fix that only handles joins is not a fix."""
+        from aar.ir import Node, NodeType
+
+        def labelled(label, previous=None):
+            node = Node(NodeType.MATERIALIZE,
+                        inputs=[previous] if previous else [])
+            node.id = f"seg-{label}-deadbeef"
+            node.estimated_bytes = 1_000_000
+            return node
+
+        plan = self._planner().plan(labelled("S2", labelled("S1")))
+        assert len(plan.segments) >= 2
+        hops = sum(1 for a, b in zip(plan.engines, plan.engines[1:])
+                   if a != b)
+        assert hops <= 1, f"chain paid {hops} crossings: {plan.engines}"
+
+
 class TestPlanningIsGloballyOptimal:
     """The planner must minimise total cost, not each segment greedily.
 
