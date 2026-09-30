@@ -4,8 +4,56 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 787 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 788 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 21 — the Round 20 fix was itself incomplete
+
+The editor reported `app.js:378 — Declaration or statement expected`, and
+the file had 378 lines. Round 20 had repaired `setPanel` at line 211, but that
+edit **inserted the corrected lines and left the original expression's tail
+behind at the end of the file**:
+
+```js
+boot();
+
+    `<p class="empty">${esc(t("empty.result"))}</p>`;
+}
+```
+
+So Round 20's repair did not work — and its own tests passed on the broken
+file. Two failures of process, not of product code:
+
+- I verified the function I had edited without checking the end of the file
+  I had edited.
+- The Round 20 guard looked for a *dangling operator*, which cannot see a
+  complete-looking fragment sitting where no statement may begin.
+
+#### The guard that does catch it
+
+Braces cannot simply be counted — `${...}` inside template literals contains
+them legitimately, which is why a naive count reads −1 on a **good** file.
+Template literals are blanked first, then the remaining real code must
+balance.
+
+Verified by substituting the broken file back in and running the test:
+
+```
+fixed file  : 375 lines  -> 38 passed
+broken file : 378 lines  -> FAILED test_the_client_brace_balance...
+```
+
+#### One attempt worth recording
+
+My first version of this check flagged *every line in the file* — it ignored
+indentation, so it treated nested statements as top-level orphans. It passed
+nothing and would have been noise in CI. A guard that cries wolf is worse
+than no guard, so it was discarded and replaced rather than tuned.
+
+779 passed, 9 skipped, 0 failed; ruff clean. `app.js` now ends at `boot();`
+with no trailing fragment.
 
 ---
 

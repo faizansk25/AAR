@@ -335,6 +335,33 @@ class TestAccessibilityClaims:
 
         assert source.count("(") == source.count(")"), "unbalanced parentheses"
 
+    def test_the_client_brace_balance_ignores_template_literals(self):
+        """A stray ``}`` after the last declaration breaks the whole file.
+
+        Repairing the truncation above left the original expression's tail at
+        the end of ``app.js`` - a template literal and a closing brace with
+        nothing to attach to. The editor reported "Declaration or statement
+        expected" and the script stopped parsing, so the UI was inert again.
+
+        Braces cannot simply be counted: ``${...}`` inside a template literal
+        contains them legitimately, which is why a naive count reads -1 on a
+        perfectly good file. So template literals are blanked first, and what
+        remains is real code whose braces must balance.
+        """
+        import re
+
+        source = self._client_source()
+        # Remove backtick-delimited literals, including `${...}` expressions.
+        # ``re.DOTALL`` must be compiled into the pattern; passing ``flags``
+        # to ``Pattern.sub`` is a TypeError.
+        literal = re.compile(r"`(?:[^`\\]|\\.)*`", re.DOTALL)
+        without_literals = literal.sub('""', source)
+        opens = without_literals.count("{")
+        closes = without_literals.count("}")
+        assert opens == closes, (
+            f"braces are unbalanced outside template literals ({opens} open, "
+            f"{closes} close) - the file will not parse")
+
     def test_the_click_handlers_the_ui_promises_are_wired(self):
         """The wiring must exist, since a parse failure removes it all."""
         source = self._client_source()

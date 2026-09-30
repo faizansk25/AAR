@@ -373,6 +373,3 @@ async function boot() {
 }
 
 boot();
-
-    `<p class="empty">${esc(t("empty.result"))}</p>`;
-}
