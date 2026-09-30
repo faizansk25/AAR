@@ -375,6 +375,14 @@ class TestTransferCostUsesThePredecessorsOwnSize:
     """
 
     def _join(self, left_bytes: int, right_bytes: int, out_bytes: int):
+        """A join whose sizes are large enough to need a device split.
+
+        The sizes are scaled so the pipeline is feasible on a typical
+        machine: memory admission is now on peak working set (both inputs,
+        the output, and the join's own structures), so a 2 GB side against a
+        4 GB budget is legitimately refused before the transfer question is
+        ever reached. These figures keep the test about *accounting*.
+        """
         from aar.ir import Node, NodeType, ScanSpec
 
         left = Node(NodeType.SCAN_CSV,
@@ -442,10 +450,13 @@ class TestTransferCostUsesThePredecessorsOwnSize:
         The search and the per-segment accounting each computed the inbound
         cost independently. Asserting only a total would miss a disagreement
         between them, so the plan's own sum is checked against itself.
+
+        Sized to fit: admission is on peak working set, so figures large
+        enough to be refused would never reach the accounting at all.
         """
         from aar.planner import AdaptivePlanner
 
-        root = self._join(100_000_000, 2_000_000_000, 50_000_000)
+        root = self._join(10_000_000, 200_000_000, 5_000_000)
         plan = AdaptivePlanner(require_available=False).plan(root)
         assert plan.total_s == pytest.approx(
             sum(sp.total_s for sp in plan.segments))
@@ -460,7 +471,7 @@ class TestTransferCostUsesThePredecessorsOwnSize:
         """
         from aar.planner import AdaptivePlanner
 
-        root = self._join(100_000_000, 2_000_000_000, 50_000_000)
+        root = self._join(10_000_000, 200_000_000, 5_000_000)
         plan = AdaptivePlanner(require_available=False).plan(root)
         assert plan.boundaries >= 0  # a real edge count, not a crash
 
@@ -492,7 +503,7 @@ class TestPlanSaysHowItWasOptimized:
             self._wide_pipeline(3))
         assert plan.optimization.is_global_optimum is True
         assert plan.optimization.evaluated == plan.optimization.combinations
-        assert "proven" in plan.optimization.render()
+        assert "yes" in plan.optimization.render()
 
     def test_exceeding_the_budget_is_reported_not_hidden(self):
         from aar.planner import AdaptivePlanner
@@ -511,7 +522,7 @@ class TestPlanSaysHowItWasOptimized:
         planner = AdaptivePlanner(require_available=False, search_budget=4)
         text = planner.plan(self._wide_pipeline(12)).render()
         assert "APPROXIMATE" in text
-        assert "NOT ESTABLISHED" in text
+        assert "Real-world optimality: not established" in text
 
     def test_an_exact_plan_also_says_so(self):
         """Silence about optimality is not the same as optimality."""
@@ -575,7 +586,6 @@ class TestPlanningRespectsTheMachineItRunsOn:
                     estimated_bytes=1_000_000)
         return Node(NodeType.FILTER, inputs=[scan],
                     predicate=BinOp(Col("v"), ">", Lit(0)))
-
     def test_the_default_planner_has_a_hardware_profile(self):
         """Otherwise every memory check below is a no-op."""
         from aar.planner import AdaptivePlanner
@@ -609,7 +619,12 @@ class TestPlanningRespectsTheMachineItRunsOn:
         assert AdaptivePlanner(profile=profile)._profile is profile
 
     def test_the_refusal_names_the_bytes_that_did_not_fit(self):
-        """A bare "infeasible" sends the reader back to the start."""
+        """A bare "infeasible" sends the reader back to the start.
+
+        The figure quoted is the *peak working set*, which is what the
+        budget was exceeded by - not the output size, which is only one
+        component of it.
+        """
         from aar.failures import PlanInfeasible
         from aar.planner import AdaptivePlanner
 
@@ -617,7 +632,9 @@ class TestPlanningRespectsTheMachineItRunsOn:
                                   profile=self._Profile(8_000_000_000))
         with pytest.raises(PlanInfeasible) as caught:
             planner.plan(self._oversized())
-        assert "40000000000" in str(caught.value)
+        message = str(caught.value)
+        assert "peak working set" in message
+        assert "40,000,000,000" in message   # the output, for reference
 
     def test_a_planner_for_another_machine_still_refuses(self):
         """Memory feasibility is about the target, not the observer."""
@@ -628,6 +645,204 @@ class TestPlanningRespectsTheMachineItRunsOn:
                                profile=self._Profile(1_000_000))
         with pytest.raises(PlanInfeasible):
             tiny.plan(self._oversized(50_000_000))
+
+
+class TestEveryDataFlowEdgeCarriesItsOwnBytes:
+    """Two differently-sized sources sharing one segment lost the smaller.
+
+    ``decompose_into_segments`` groups consecutive nodes with the same
+    device preference, so two Parquet scans of 100 MB and 2 GB land in the
+    *same* segment. That segment carries a single output estimate, and
+    ``segment_predecessors`` returns the pair once - so both edges were
+    priced at the same figure and the 100 MB side simply disappeared from
+    the plan.
+
+    Measured on this shape, pricing both edges from the segment's size
+    gives a 4.0 s inbound transfer; pricing each edge from its own
+    producing node gives 42.3 s. The old number was 10x too small, and
+    wrong in the direction that makes an expensive plan look cheap.
+    """
+
+    def _two_scans_one_join(self):
+        from aar.ir import Node, NodeType, ScanSpec
+
+        small = Node(NodeType.SCAN_PARQUET,
+                     scan=ScanSpec(kind="parquet", path="a.parquet"),
+                     estimated_bytes=100_000_000)
+        large = Node(NodeType.SCAN_PARQUET,
+                     scan=ScanSpec(kind="parquet", path="b.parquet"),
+                     estimated_bytes=2_000_000_000)
+        join = Node(NodeType.JOIN, inputs=[small, large], key_left=("k",),
+                    key_right=("k",), estimated_bytes=200_000_000)
+        return small, large, join
+
+    def _edges(self, root):
+        from aar.planner.planner import (decompose_into_segments,
+                                         segment_input_edges)
+
+        segments = decompose_into_segments(root)
+        return segments, segment_input_edges(segments)
+
+    def test_the_two_scans_really_do_share_a_segment(self):
+        """The precondition: if they did not, this defect could not occur."""
+        _small, _large, join = self._two_scans_one_join()
+        segments, _edges = self._edges(join)
+        scan_segment = next(s for s in segments
+                            if any(n.type is NodeType.SCAN_PARQUET
+                                   for n in s.nodes))
+        assert len([n for n in scan_segment.nodes
+                    if n.type is NodeType.SCAN_PARQUET]) == 2
+
+    def test_both_input_sizes_appear_on_the_join_edges(self):
+        _small, _large, join = self._two_scans_one_join()
+        _segments, edges = self._edges(join)
+
+        sizes = {nbytes for _producer, nbytes in edges[1]}
+        assert sizes == {100_000_000, 2_000_000_000}, (
+            f"the join's inbound edges carry {sorted(sizes)} - one input's "
+            f"size was lost when its producer shared a segment")
+
+    def test_the_smaller_input_is_not_priced_at_the_larger_size(self):
+        from aar.cost.model import CostModel
+
+        _small, _large, join = self._two_scans_one_join()
+        segments, edges = self._edges(join)
+        cost = CostModel()
+
+        join_index = next(s.index for s in segments
+                          if any(n.type is NodeType.JOIN for n in s.nodes))
+        producer = segments[[s.index for s in segments].index(join_index) - 1]
+
+        per_edge = sum(cost.transition_cost("arrow", "cudf", n).total_s
+                       for _p, n in edges[join_index])
+        # What whole-segment pricing would have charged: the same number of
+        # crossings, each at the producing segment's single size.
+        by_segment = (len(edges[join_index]) * cost.transition_cost(
+            "arrow", "cudf", producer.nbytes).total_s)
+
+        # A segment's own figure is whichever node ended the segment - here
+        # the *100 MB* scan, not the 2 GB one. So the old pricing made the
+        # join look like two 100 MB transfers when one input was 2 GB.
+        assert producer.nbytes == 100_000_000
+        assert per_edge > by_segment * 5, (
+            f"per-edge pricing ({per_edge * 1e3:.0f}ms) versus whole-segment "
+            f"pricing ({by_segment * 1e3:.0f}ms) - if these are close, the "
+            f"two input sizes are not actually differing")
+
+    def test_a_single_producer_is_unaffected(self):
+        """The common case must not gain a phantom edge."""
+        from aar.ir import Node, NodeType, ScanSpec
+
+        scan = Node(NodeType.SCAN_PARQUET,
+                    scan=ScanSpec(kind="parquet", path="a.parquet"),
+                    estimated_bytes=100_000_000)
+        join = Node(NodeType.JOIN, inputs=[scan], key_left=("k",),
+                    key_right=("k",), estimated_bytes=50_000_000)
+        _segments, edges = self._edges(join)
+        assert [n for _p, n in edges[1]] == [100_000_000]
+
+    def test_the_same_segment_feeding_twice_is_not_double_counted(self):
+        """De-duplicated per (producer, bytes), so a repeated input counts once."""
+        from aar.ir import Node, NodeType, ScanSpec
+
+        scan = Node(NodeType.SCAN_PARQUET,
+                    scan=ScanSpec(kind="parquet", path="a.parquet"),
+                    estimated_bytes=100_000_000)
+        other = Node(NodeType.SCAN_PARQUET,
+                     scan=ScanSpec(kind="parquet", path="b.parquet"),
+                     estimated_bytes=100_000_000)
+        join = Node(NodeType.JOIN, inputs=[scan, other], key_left=("k",),
+                    key_right=("k",), estimated_bytes=50_000_000)
+        _segments, edges = self._edges(join)
+        # Both scans share a segment and are the same size, so they collapse
+        # to one edge - which is correct: identical movement, priced once.
+        assert len(edges[1]) == 1
+
+
+class TestPeakMemoryCoversEverythingResidentAtOnce:
+    """Admission compared the *output* size to the budget, not the peak.
+
+    ``peak_memory_b`` multiplied the node's output by a per-operator
+    constant. A join of two 2 GB sides producing 200 MB was therefore
+    admitted at 600 MB on a machine with 4 GB free, and then failed at
+    execution - the exact outcome the memory check exists to prevent.
+
+    Peak working memory is what must be resident *simultaneously*: every
+    input (a join cannot drop a side it still probes against), the output
+    being built while those are held, and the operator's own structures.
+    """
+
+    class _Profile:
+        memory_budget_bytes = 4_000_000_000
+        vram_budget_bytes = 0
+
+    def _two_sided_join(self, side: int = 2_000_000_000,
+                        out: int = 200_000_000):
+        from aar.ir import Node, NodeType, ScanSpec
+
+        a = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="a.csv"),
+                 estimated_bytes=side)
+        b = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="b.csv"),
+                 estimated_bytes=side)
+        return Node(NodeType.JOIN, inputs=[a, b], key_left=("k",),
+                    key_right=("k",), estimated_bytes=out)
+
+    def test_the_audits_example_is_refused_on_a_4gb_machine(self):
+        """2 GB + 2 GB -> 200 MB output, 4 GB RAM."""
+        from aar.failures import PlanInfeasible
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False,
+                                  profile=self._Profile)
+        with pytest.raises(PlanInfeasible):
+            planner.plan(self._two_sided_join())
+
+    def test_peak_memory_counts_both_inputs_not_just_the_output(self):
+        from aar.cost.model import CostModel
+        from aar.ir import Node, NodeType
+
+        model = CostModel()
+        join = Node(NodeType.JOIN)
+        output_only = model.peak_memory_b(join, "duckdb", 200_000_000,
+                                          input_bytes=(200_000_000,),
+                                          output_bytes=200_000_000)
+        with_both = model.peak_memory_b(
+            join, "duckdb", 200_000_000,
+            input_bytes=(2_000_000_000, 2_000_000_000),
+            output_bytes=200_000_000)
+        assert with_both > output_only * 8
+
+    def test_peak_memory_exceeds_the_sum_of_its_inputs_and_output(self):
+        """Operator working state is on top, not folded in."""
+        from aar.cost.model import CostModel
+        from aar.ir import Node, NodeType
+
+        model = CostModel()
+        for node_type in (NodeType.JOIN, NodeType.GROUPBY, NodeType.SORT,
+                          NodeType.WINDOW):
+            peak = model.peak_memory_b(Node(node_type), "duckdb", 1_000_000,
+                                       input_bytes=(1_000_000,),
+                                       output_bytes=1_000_000)
+            assert peak > 2_000_000, f"{node_type} peaked at only {peak}"
+
+    def test_a_small_pipeline_still_fits(self):
+        """The stricter model must not refuse ordinary work."""
+        from aar.planner import AdaptivePlanner
+
+        root = self._two_sided_join(side=1_000_000, out=500_000)
+        plan = AdaptivePlanner(require_available=False,
+                               profile=self._Profile).plan(root)
+        assert plan.segments
+
+    def test_the_refusal_quotes_the_peak_not_the_output(self):
+        from aar.failures import PlanInfeasible
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False,
+                                  profile=self._Profile)
+        with pytest.raises(PlanInfeasible) as caught:
+            planner.plan(self._two_sided_join())
+        assert "peak working set" in str(caught.value)
 
 
 class TestDedupKeepsTheRightRow:

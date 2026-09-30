@@ -598,22 +598,56 @@ class CostModel:
         return CostBreakdown(transfer_s=transfer, materialise_s=serialise)
 
 
-    def peak_memory_b(self, node: Node, engine_id: str, nbytes: int) -> int:
-        """Estimated peak memory for this node on this engine.
+    def peak_memory_b(self, node: Node, engine_id: str, nbytes: int,
+                      input_bytes: tuple[int, ...] = (),
+                      output_bytes: int | None = None) -> int:
+        """Estimated **peak working memory** for this node on this engine.
 
-        Rough by design: a join holds both sides plus output, a group-by
-        holds a hash table, and a filter holds output only. The planner uses
-        this for feasibility, not for reporting.
+        The previous version multiplied the *output* size by a constant per
+        operator. That is memory admission, not memory modelling: a join
+        whose output is 200 MB while its two inputs are 2 GB each was
+        admitted at 600 MB on a machine with 4 GB free, and would then fail
+        at execution - which is the one outcome the check exists to prevent.
+
+        Peak memory is the sum of what must be resident *simultaneously*:
+
+        * every input, because a join cannot drop a side it still has to
+          probe against;
+        * the output, which is being built while the inputs are held;
+        * operator-specific working state - a hash table for a join or a
+          group-by, sort scratch for a sort, the partition copy a window
+          function keeps per group;
+        * a materialisation allowance, because these are separate buffers
+          rather than one contiguous allocation.
+
+        ``input_bytes`` and ``output_bytes`` let the caller supply what it
+        already knows from the plan's own edges, so the arithmetic uses the
+        sizes actually flowing rather than the segment's single figure.
         """
         spec = self._registry.spec(engine_id)
-        multiplier = {
-            NodeType.JOIN: 3.0, NodeType.GROUPBY: 2.5, NodeType.AGGREGATE: 2.0,
-            NodeType.SORT: 2.0, NodeType.WINDOW: 2.0, NodeType.UNION: 2.0,
-            NodeType.DEDUPLICATE: 1.8,
-        }.get(node.type, 1.2)
-        total = int(nbytes * multiplier)
+        inputs = input_bytes or (nbytes,)
+        out_bytes = nbytes if output_bytes is None else output_bytes
+
+        # What has to be alive at the same moment, before any operator
+        # overhead: the inputs being read and the output being produced.
+        resident = sum(inputs) + out_bytes
+
+        # Operator working state, as a fraction of the data it operates on.
+        # A join builds a hash/probe structure over its build side; a
+        # group-by holds one entry per key; a sort needs a scratch buffer
+        # roughly the size of what it is ordering; a window function keeps a
+        # partition plus its frame at once.
+        working = {
+            NodeType.JOIN: 1.0, NodeType.GROUPBY: 0.75, NodeType.AGGREGATE: 0.5,
+            NodeType.SORT: 1.0, NodeType.WINDOW: 1.25, NodeType.UNION: 0.2,
+            NodeType.DEDUPLICATE: 0.9,
+        }.get(node.type, 0.25)
+
+        total = int(resident * (1.0 + working))
         if spec.device is Device.GPU:
-            return int(total * 1.15)   # device allocations fragment
+            # Device allocations fragment, and a device pool cannot return
+            # memory as eagerly as the host allocator.
+            return int(total * 1.15)
         return total
 
 

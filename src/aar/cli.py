@@ -284,6 +284,14 @@ def _cmd_run(args: argparse.Namespace) -> int:
     from .failures import AARError
 
     service = PipelineService()
+
+    # The policy is validated before anything is planned or measured. A
+    # missing policy file is a more fundamental error than a plan that does
+    # not fit, and planning first reported the memory failure instead -
+    # sending the user to resize their machine when the real problem was a
+    # typo in a path. Absent rules deny, so this must fail loudly and early.
+    policy = _load_policy(getattr(args, "policy", None))
+
     root, plan = _plan_for(args.pipeline)
     if args.explain and not args.json:
         print(plan.render())
@@ -293,7 +301,6 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # PipelineService.prepare. Profiling again now would be a second read of
     # the same sources for a result the plan has already been built from.
 
-    policy = _load_policy(getattr(args, "policy", None))
     subject = None
     if policy is not None:
         from .governance import Subject

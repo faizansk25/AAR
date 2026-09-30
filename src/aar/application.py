@@ -150,11 +150,18 @@ class PipelineService:
         """
         from .runtime import Executor
 
+        # Load and validate the policy *before* planning. A policy path that
+        # does not exist is a more fundamental error than a plan that does
+        # not fit, and planning first reported the memory failure instead -
+        # sending the user to resize their machine when the real problem was
+        # a typo in a path. Absent rules deny, so this must fail loudly
+        # before anything is measured or scheduled.
+        policy = self._load_policy(policy_path)
+        subject = self._subject(role, actor)
+
         root = self.load(path)
         predicted = self.profile_sources(root) if profile else {}
         plan = self.plan(root)
-        policy = self._load_policy(policy_path)
-        subject = self._subject(role, actor)
         with Executor(policy=policy, subject=subject,
                       history=self._history) as executor:
             result = executor.execute(plan)

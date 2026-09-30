@@ -4,8 +4,95 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 767 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 777 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 18 — CI could not run; per-edge bytes; real peak memory
+
+#### 1. CI was failing on all six jobs, and it was my fault
+
+```
+python -m ruff check src tests
+No module named ruff
+```
+
+The workflow installed `.[dev]`, and the `dev` extra did not include `ruff`.
+Every job died at the lint step, which meant the lint gate *hid* whether the
+tests pass on Linux, macOS and Windows — the one thing the workflow existed
+to answer. `ruff` and `build` are now in `dev`. All three CI steps verified
+locally before pushing.
+
+#### 2. Two same-device sources in one segment lost one input's size
+
+The audit's prediction was exact, and worse than described. Two Parquet
+scans — 100 MB and 2 GB — share a device preference, so
+`decompose_into_segments` puts them in **one segment**, which carries a
+single output figure. Measured: the segment reported **100 MB**, so the
+**2 GB side was the one that vanished** — the plan priced a join of a 100 MB
+and a 2 GB input as two 100 MB transfers.
+
+`segment_input_edges` now returns `(producer_segment, bytes)` per *data-flow
+edge*, sized from the **producing node**, so both inputs appear:
+
+```
+segment 1 inbound edges: [(0, '100,000,000'), (0, '2,000,000,000')]
+```
+
+Transfer cost on that shape: **4.0 s by segment pricing, 42.3 s per edge** —
+the old figure was 10× low, and wrong in the direction that makes an
+expensive plan look cheap.
+
+#### 3. Memory admission was still only admission, not planning
+
+`peak_memory_b` multiplied the **output** size by a per-operator constant. On
+the audit's example — two 2 GB sides, 200 MB output, 4 GB RAM:
+
+```
+old (output x3) : 0.60 GB  -> ADMITTED, then fails at execution
+new (true peak) : 8.40 GB  -> correctly REFUSED
+```
+
+Peak memory is now the sum of what must be resident *simultaneously*: every
+input (a join cannot drop a side it still probes against), the output being
+built while those are held, and the operator's own structures. The planner
+feeds it the same per-edge sizes the optimizer uses.
+
+#### 4. Two corrections to my own previous summary
+
+- **`search_budget` has nothing to do with memory.** I suggested it as a
+  response to a memory rejection. It is a separate constraint: a larger
+  budget examines more combinations of *already-feasible* engines and cannot
+  make any operation require less memory. The real responses are a different
+  strategy, batching, spilling, or more resources.
+- **A memory rejection is not proof of a hardware limit.** The estimate can
+  be wrong, and refusing a workload that would have run is a false negative.
+  This is exactly why validation against measured execution comes before
+  any optimizer work.
+
+#### 5. Wording
+
+`Global optimality: proven` is replaced by:
+
+> Optimal within the current estimated cost model: yes. Real-world
+> optimality: not established — the cost model, the workload sizes and the
+> segmentation are all estimates.
+
+An exhaustive search proves a minimum among the assignments the *current
+estimates* price. It says nothing about elapsed time on the real machine.
+
+#### An ordering bug the stricter memory check exposed
+
+Enabling real peak-memory checks made `aar run --policy missing.json` report
+a memory failure instead of the missing policy file — sending the user to
+resize their machine when the actual problem was a typo in a path. The policy
+is now loaded and validated **before** anything is planned or measured, in
+both the CLI and `PipelineService.run`. Absent rules deny, so this must fail
+loudly and early.
+
+**777 passed, 7 skipped, 0 failed; ruff clean.** NYC taxi Parquet unchanged:
+3,627,882 rows / 55,682,369 bytes.
 
 ---
 

@@ -193,7 +193,8 @@ DEFAULT_SEARCH_BUDGET = 20_000
 
 def _cheapest_assignment(segments: list[Segment], options: list[dict],
                          preds: dict[int, list[int]], hop,
-                         budget: int = DEFAULT_SEARCH_BUDGET
+                         budget: int = DEFAULT_SEARCH_BUDGET,
+                         edges: dict[int, list[tuple[int, int]]] | None = None
                          ) -> tuple[list[str], "OptimizationReport"]:
     """The globally cheapest engine per segment, over the real graph.
 
@@ -212,28 +213,32 @@ def _cheapest_assignment(segments: list[Segment], options: list[dict],
 
     order = [seg.index for seg in segments]
     choices = [sorted(options[i]) for i in order]
+    # Per-edge sizes when supplied, falling back to the predecessor
+    # segment's own size. The fallback keeps a single-input chain exact; it
+    # is only wrong when two differently-sized producers share a segment,
+    # which is why the caller passes real edges.
+    inbound_edges = edges if edges is not None else {
+        index: [(p, segments[p].nbytes) for p in preds.get(index, [])]
+        for index in order}
 
     def score(assignment: dict[int, str]) -> float:
         total = 0.0
         for index in order:
             engine = assignment[index]
             total += options[index][engine][0].total_s
-            for previous in preds.get(index, []):
+            for previous, nbytes in inbound_edges.get(index, []):
                 if previous >= index:
                     continue
                 source = assignment[previous]
                 if source != engine:
-                    # The bytes crossing this edge are the *predecessor's*
-                    # output, not this segment's. A join with a 100 MB side
-                    # and a 2 GB side produces 50 MB; charging the join's own
-                    # 50 MB for both edges under-counts the movement by the
-                    # ratio between the input and the output - measured at
-                    # 2x for a 100 MB input, and unboundedly wrong as the
-                    # input grows. It also hides the large side entirely,
-                    # so the plan sees a cheap join where the expensive one
-                    # is.
-                    total += hop(source, engine,
-                                 segments[previous].nbytes).total_s
+                    # The bytes crossing this edge are the *producing node's*
+                    # output. Using the destination's own size was wrong
+                    # twice over: a 100 MB input feeding a 50 MB join was
+                    # charged 50 MB, and two scans sharing a segment
+                    # collapsed to one figure, so the smaller side vanished
+                    # (measured: a 100 MB and a 2 GB Parquet feeding one
+                    # join both priced at the segment's 2 GB).
+                    total += hop(source, engine, nbytes).total_s
         return total
 
     if not choices:
@@ -305,10 +310,16 @@ class OptimizationReport:
         if self.is_global_optimum:
             return (f"Optimization: exact, {self.evaluated:,} of "
                     f"{self.combinations:,} assignments evaluated "
-                    f"(budget {self.budget:,}). Global optimality: proven.")
+                    f"(budget {self.budget:,}). "
+                    f"Optimal within the current estimated cost model: yes. "
+                    f"Real-world optimality: not established - the cost "
+                    f"model, the workload sizes and the segmentation are all "
+                    f"estimates.")
         return (f"Optimization: APPROXIMATE. {self.reason} Evaluated "
                 f"{self.evaluated:,} of {self.combinations:,} assignments "
-                f"(budget {self.budget:,}). Global optimality: NOT ESTABLISHED.")
+                f"(budget {self.budget:,}). Optimal within the current "
+                f"estimated cost model: no. Real-world optimality: not "
+                f"established.")
 
     def to_dict(self) -> dict:
         return {
@@ -370,6 +381,44 @@ def self_device(node: Node) -> Device:
     prefs = NodeTypeAffinity.PREFERRED.get(node.type)
     return prefs[0] if prefs else Device.CPU
 
+
+
+def segment_input_edges(segments: list[Segment]
+                         ) -> dict[int, list[tuple[int, int]]]:
+    """For each segment, the ``(producer_segment, bytes)`` on each inbound edge.
+
+    A segment has **one** output estimate, taken from its last node, but a
+    join can have several inputs of very different sizes arriving into it.
+    Two Parquet scans - 100 MB and 2 GB - land in the *same* segment when
+    they share a device preference, and the segment then reports the larger
+    one (or whichever the last node produced) for both edges. Measured: the
+    100 MB side disappeared entirely.
+
+    So the size that crosses an edge is taken from the *producing node*
+    instead of the producing segment: ``estimate_bytes`` of the specific
+    node whose output flows across. Both sides of a join are then visible,
+    and the cost of a crossing depends on what actually moves rather than on
+    whatever the containing segment happened to end up holding.
+
+    Edges are de-duplicated by ``(producer segment, bytes)`` because a
+    segment that feeds a join twice contributes the same movement twice,
+    not once per internal node.
+    """
+    by_node = {id(node): seg.index for seg in segments for node in seg.nodes}
+    edges: dict[int, list[tuple[int, int]]] = {seg.index: [] for seg in segments}
+    for seg in segments:
+        seen: set[tuple[int, int]] = set()
+        for node in seg.nodes:
+            for parent in node.inputs:
+                source = by_node.get(id(parent))
+                if source is None or source == seg.index:
+                    continue
+                pair = (source, estimate_bytes(parent))
+                if pair in seen:
+                    continue
+                seen.add(pair)
+                edges[seg.index].append(pair)
+    return edges
 
 
 # ------------------------------------------------------------------ plans
@@ -495,7 +544,9 @@ class Plan:
     sources_used: dict[str, str] = field(default_factory=dict)
     #: Whether the engine search was exhaustive, and if not, why. A plan
     #: that does not carry this looks identical whether it is the cheapest
-    #: possible plan or a per-segment guess.
+    #: possible plan *under the cost model* or a per-segment guess. Even an
+    #: exhaustive search only proves a minimum among the assignments the
+    #: current estimates price - it says nothing about real elapsed time.
     optimization: "OptimizationReport" = field(
         default_factory=OptimizationReport)
 
@@ -703,6 +754,14 @@ class AdaptivePlanner:
         except Exception:  # noqa: BLE001 - hardware detection is best-effort
             return None
 
+    def _peak_for(self, seg: Segment,
+                  edges: dict[int, list[tuple[int, int]]]) -> int:
+        """Peak working memory for a segment, for the rejection message."""
+        sizes = tuple(nbytes for _p, nbytes in edges.get(seg.index, []))
+        return self._cost.peak_memory_b(
+            seg.nodes[-1], "duckdb", seg.nbytes,
+            input_bytes=sizes or (seg.nbytes,), output_bytes=seg.nbytes)
+
     # --------------------------------------------------------------- planning
     def plan(self, root: Node) -> Plan:
         """Produce a physical plan for ``root``, annotating the nodes.
@@ -746,8 +805,24 @@ class AdaptivePlanner:
                     segment=seg.index, nodes=seg.node_ids)
 
             scored: dict[str, tuple[CostBreakdown, str]] = {}
+            # Every edge into this segment, and therefore every input that
+            # has to be resident at the same time as its output. A join's two
+            # sides are two entries here; a chain contributes one.
+            inbound_sizes = tuple(nbytes for _p, nbytes
+                                  in segment_input_edges(segments).get(
+                                      seg.index, []))
             for engine in candidates:
-                if not self._fits_memory(engine, seg.nbytes):
+                # Admission is on *peak working memory* - the inputs plus the
+                # output plus the operator's own structures - not on the
+                # output alone. The old check compared the segment's output
+                # size to the budget, so a join of two 2 GB sides producing
+                # 200 MB was admitted at 600 MB on a 4 GB machine and then
+                # failed at execution.
+                peak = self._cost.peak_memory_b(
+                    seg.nodes[-1], engine, seg.nbytes,
+                    input_bytes=inbound_sizes or (seg.nbytes,),
+                    output_bytes=seg.nbytes)
+                if not self._fits_memory(engine, peak):
                     continue
                 # ``segment_cost`` sums every operation in the segment, each
                 # priced at the size it actually sees. Calling ``node_cost``
@@ -760,7 +835,10 @@ class AdaptivePlanner:
             if not scored:
                 raise PlanInfeasible(
                     f"every engine for segment {seg.index} exceeds the "
-                    f"memory budget ({seg.nbytes} bytes)",
+                    f"memory budget (peak working set "
+                    f"{self._peak_for(seg, segment_input_edges(segments))} "
+                    f"bytes; inputs {', '.join(format(n, ',') for n in inbound_sizes) or 'n/a'} "
+                    f"-> output {format(seg.nbytes, ',')})",
                     segment=seg.index, candidates=candidates)
             options.append(scored)
 
@@ -791,21 +869,24 @@ class AdaptivePlanner:
         # segment i may not feed it at all, and a segment may have two
         # predecessors whose crossings both have to be paid. The search below
         # scores complete assignments against the real graph instead.
+        edges = segment_input_edges(segments)
         path, report = _cheapest_assignment(
             segments, options, preds, hop,
-            budget=getattr(self, "_search_budget", DEFAULT_SEARCH_BUDGET))
+            budget=getattr(self, "_search_budget", DEFAULT_SEARCH_BUDGET),
+            edges=edges)
         return self._assemble(root, segments, options, path,
-                              optimization=report)
+                              optimization=report, edges=edges)
 
     def _assemble(self, root: Node, segments: list[Segment],
                   options: list[dict[str, tuple[CostBreakdown, str]]],
                   path: list[str],
-                  optimization: "OptimizationReport | None" = None
+                  optimization: "OptimizationReport | None" = None,
+                  edges: dict[int, list[tuple[int, int]]] | None = None
                   ) -> Plan:
         """Turn a chosen engine path into a :class:`Plan`.
 
-        The dynamic program gave the optimal *assignment*; this fills in the
-        per-segment accounting an analyst reads.
+        The search gave the chosen *assignment*; this fills in the per-segment
+        accounting an analyst reads.
 
         Each segment's crossing is charged against the engines of the segments
         that actually feed it, which for a chain is the one before it and for
@@ -820,32 +901,35 @@ class AdaptivePlanner:
         chosen: list[SegmentPlan] = []
         total = 0.0
         hop = self._cost.transition_cost
-        preds = segment_predecessors(segments)
+        # The per-edge sizes the search used: which segment produced the
+        # data, and how many bytes it is. ``segment_predecessors`` is no
+        # longer consulted here - it collapses several producers into one
+        # entry and loses their individual sizes, which is the defect these
+        # edges replace.
+        edge_map = edges if edges is not None else segment_input_edges(segments)
 
         for seg, engine in zip(segments, path):
-            # The engines this segment's data actually arrives on, paired with
-            # the segment that produced each: a crossing costs the bytes the
-            # *predecessor* emitted, not what this segment will emit. A join
-            # over a 100 MB and a 2 GB side produces 50 MB, and pricing both
-            # edges at 50 MB hides the 2 GB entirely. The pairing also keeps
-            # the figure below consistent with the one the search optimised,
-            # which used the same rule.
-            incoming = [(path[p], p) for p in preds.get(seg.index, [])
+            # The engines this segment's data arrives on, each paired with the
+            # bytes that actually cross that edge. The bytes come from the
+            # *producing node*, not the producing segment: two Parquet scans
+            # sharing a segment report one size, and the smaller side of a
+            # join would disappear. The same rule is used by the search, so
+            # the number optimised and the number shown cannot differ.
+            edges_for_seg = edge_map.get(seg.index, [])
+            incoming = [(path[p], nbytes) for p, nbytes in edges_for_seg
                         if p < seg.index]
             inbound = 0.0
-            for source, origin in incoming:
+            for source, nbytes in incoming:
                 if source != engine:
-                    inbound += hop(source, engine,
-                                  segments[origin].nbytes).total_s
+                    inbound += hop(source, engine, nbytes).total_s
 
             scored: list[tuple[str, float, CostBreakdown, float, str]] = []
             for other, (breakdown, source) in options[seg.index].items():
                 hop_in = 0.0
                 cost = breakdown
-                for predecessor, origin in incoming:
+                for predecessor, nbytes in incoming:
                     if predecessor != other:
-                        hop_in += hop(predecessor, other,
-                                      segments[origin].nbytes).total_s
+                        hop_in += hop(predecessor, other, nbytes).total_s
                 if hop_in:
                     # ``segment_cost`` is called without a ``from_engine``,
                     # so its ``transfer_s`` is 0 and the crossings are not
