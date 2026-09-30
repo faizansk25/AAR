@@ -318,8 +318,10 @@ class OptimizationReport:
         return (f"Optimization: APPROXIMATE. {self.reason} Evaluated "
                 f"{self.evaluated:,} of {self.combinations:,} assignments "
                 f"(budget {self.budget:,}). Optimal within the current "
-                f"estimated cost model: no. Real-world optimality: not "
-                f"established.")
+                f"estimated cost model: NOT ESTABLISHED - the search did "
+                f"not examine every assignment, so it cannot say whether it "
+                f"found the cheapest. It may have done so anyway. "
+                f"Real-world optimality: not established.")
 
     def to_dict(self) -> dict:
         return {
@@ -390,34 +392,38 @@ def segment_input_edges(segments: list[Segment]
     A segment has **one** output estimate, taken from its last node, but a
     join can have several inputs of very different sizes arriving into it.
     Two Parquet scans - 100 MB and 2 GB - land in the *same* segment when
-    they share a device preference, and the segment then reports the larger
-    one (or whichever the last node produced) for both edges. Measured: the
-    100 MB side disappeared entirely.
+    they share a device preference, and the segment then reports one figure
+    for both edges. Measured: the smaller side disappeared entirely.
 
-    So the size that crosses an edge is taken from the *producing node*
-    instead of the producing segment: ``estimate_bytes`` of the specific
-    node whose output flows across. Both sides of a join are then visible,
-    and the cost of a crossing depends on what actually moves rather than on
-    whatever the containing segment happened to end up holding.
+    So the size crossing an edge is taken from the *producing node* rather
+    than the producing segment.
 
-    Edges are de-duplicated by ``(producer segment, bytes)`` because a
-    segment that feeds a join twice contributes the same movement twice,
-    not once per internal node.
+    Edges are identified by the **producing node**, not by
+    ``(segment, bytes)``. Keying on the pair collapsed two distinct inputs
+    that happened to share a segment *and* a size: two separate 100 MB
+    Parquet scans feeding one join produced the key ``(0, 100000000)``
+    twice, the second was discarded, and the join was charged 100 MB for
+    200 MB of movement - a 50% under-count. A data-flow edge is a
+    (producer, consumer, slot) triple; any coarser key merges edges that are
+    genuinely separate transfers.
     """
     by_node = {id(node): seg.index for seg in segments for node in seg.nodes}
     edges: dict[int, list[tuple[int, int]]] = {seg.index: [] for seg in segments}
     for seg in segments:
-        seen: set[tuple[int, int]] = set()
+        seen: set[int] = set()
         for node in seg.nodes:
-            for parent in node.inputs:
+            for slot, parent in enumerate(node.inputs):
                 source = by_node.get(id(parent))
                 if source is None or source == seg.index:
                     continue
-                pair = (source, estimate_bytes(parent))
-                if pair in seen:
+                # ``id(parent)`` alone is the identity of one specific
+                # producing node, so a segment feeding a join from two
+                # different nodes contributes two edges even when the sizes
+                # match.
+                if id(parent) in seen:
                     continue
-                seen.add(pair)
-                edges[seg.index].append(pair)
+                seen.add(id(parent))
+                edges[seg.index].append((source, estimate_bytes(parent)))
     return edges
 
 
@@ -432,6 +438,12 @@ class SegmentPlan:
     cost: CostBreakdown
     #: Seconds charged to move data *into* this segment.
     inbound_s: float
+    #: Peak working memory for this segment on the chosen engine, computed
+    #: once during candidate selection and *the same number* admission used.
+    #: It used to be ``segment.nbytes * 1.2`` here, so the plan displayed a
+    #: figure several times smaller than the one that had just decided the
+    #: segment fits - a join admitted at 8.4 GB while reporting 240 MB.
+    peak_memory_b: int = 0
     candidates: list[tuple[str, float]] = field(default_factory=list)
     reason: str = ""
 
@@ -604,9 +616,24 @@ class Plan:
         The planner's output *is* the node's physical state, so the executor
         has nothing left to decide and the analyst can read the decision off
         the plan itself.
+
+        The reported peak memory is the figure **admission used**, not a
+        second and cheaper estimate. It used to be ``nbytes * 1.2`` here,
+        which reported a join admitted at 8.4 GB as needing 240 MB - so a
+        user reading the plan saw a number the planner had never checked.
         """
+        from ..cost.model import CostModel
+
+        model = CostModel()
         for sp in self.segments:
-            peak = int(sp.segment.nbytes * 1.2)
+            peak = sp.peak_memory_b
+            if not peak:
+                edges = segment_input_edges([sp.segment])
+                sizes = tuple(n for _p, n in edges.get(sp.segment.index, []))
+                peak = model.peak_memory_b(
+                    sp.segment.nodes[-1], sp.engine, sp.segment.nbytes,
+                    input_bytes=sizes or (sp.segment.nbytes,),
+                    output_bytes=sp.segment.nbytes)
             for node in sp.segment.nodes:
                 node.assigned_engine = sp.engine
                 node.segment_id = sp.segment.index
@@ -901,6 +928,7 @@ class AdaptivePlanner:
         chosen: list[SegmentPlan] = []
         total = 0.0
         hop = self._cost.transition_cost
+        model = self._cost
         # The per-edge sizes the search used: which segment produced the
         # data, and how many bytes it is. ``segment_predecessors`` is no
         # longer consulted here - it collapses several producers into one
@@ -918,6 +946,10 @@ class AdaptivePlanner:
             edges_for_seg = edge_map.get(seg.index, [])
             incoming = [(path[p], nbytes) for p, nbytes in edges_for_seg
                         if p < seg.index]
+            # Only the inbound sizes: what must be resident alongside this
+            # segment's output, and what admission compared to the budget.
+            inbound_sizes = tuple(nbytes for _p, nbytes in edges_for_seg
+                                  if _p < seg.index)
             inbound = 0.0
             for source, nbytes in incoming:
                 if source != engine:
@@ -958,6 +990,13 @@ class AdaptivePlanner:
                 segment=seg, engine=engine,
                 device=self._registry.spec(engine).device,
                 cost=cost, inbound_s=inbound,
+                # The peak admission compared against the budget, carried
+                # through unchanged so the plan reports the number that was
+                # actually checked rather than recomputing a smaller one.
+                peak_memory_b=model.peak_memory_b(
+                    seg.nodes[-1], engine, seg.nbytes,
+                    input_bytes=inbound_sizes or (seg.nbytes,),
+                    output_bytes=seg.nbytes),
                 candidates=[(e, t) for e, t, *_ in scored],
                 reason=self._reason(cost, best_cost, inbound, source, engine,
                                     scored),

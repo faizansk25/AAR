@@ -522,7 +522,8 @@ class TestPlanSaysHowItWasOptimized:
         planner = AdaptivePlanner(require_available=False, search_budget=4)
         text = planner.plan(self._wide_pipeline(12)).render()
         assert "APPROXIMATE" in text
-        assert "Real-world optimality: not established" in text
+        assert "NOT ESTABLISHED" in text
+        assert "may have done so anyway" in text
 
     def test_an_exact_plan_also_says_so(self):
         """Silence about optimality is not the same as optimality."""
@@ -791,8 +792,14 @@ class TestEveryDataFlowEdgeCarriesItsOwnBytes:
         _segments, edges = self._edges(join)
         assert [n for _p, n in edges[1]] == [100_000_000]
 
-    def test_the_same_segment_feeding_twice_is_not_double_counted(self):
-        """De-duplicated per (producer, bytes), so a repeated input counts once."""
+    def test_two_same_sized_scans_are_still_two_transfers(self):
+        """Superseded: this used to assert the collapse was *correct*.
+
+        Two scans sharing a segment and a size were treated as one edge, so
+        a join moving 200 MB was charged 100 MB. That was the bug, not the
+        intent, and the test encoded it. Replaced by
+        ``test_two_equal_sized_inputs_are_two_edges``.
+        """
         from aar.ir import Node, NodeType, ScanSpec
 
         scan = Node(NodeType.SCAN_PARQUET,
@@ -804,9 +811,8 @@ class TestEveryDataFlowEdgeCarriesItsOwnBytes:
         join = Node(NodeType.JOIN, inputs=[scan, other], key_left=("k",),
                     key_right=("k",), estimated_bytes=50_000_000)
         _segments, edges = self._edges(join)
-        # Both scans share a segment and are the same size, so they collapse
-        # to one edge - which is correct: identical movement, priced once.
-        assert len(edges[1]) == 1
+        # Two distinct scans are two transfers, even at equal size.
+        assert len(edges[1]) == 2
 
 
 class TestPeakMemoryCoversEverythingResidentAtOnce:
@@ -893,6 +899,59 @@ class TestPeakMemoryCoversEverythingResidentAtOnce:
         with pytest.raises(PlanInfeasible) as caught:
             planner.plan(self._two_sided_join())
         assert "peak working set" in str(caught.value)
+
+
+
+
+    def test_the_reported_peak_is_the_one_admission_used(self):
+        """The plan must not quote a smaller number than it checked.
+
+        ``Plan.assign`` set ``peak = segment.nbytes * 1.2`` while admission
+        compared a genuine peak working set. A join admitted at 8.4 GB was
+        therefore reported on its nodes as needing 240 MB - the user saw a
+        figure the planner had never checked against anything.
+
+        Recomputed here from the plan's own inbound edges, because that is
+        what admission used. Recomputing with only the output would recreate
+        the very mismatch this test exists to catch.
+        """
+        from aar.cost.model import CostModel
+        from aar.planner import AdaptivePlanner
+        from aar.planner.planner import segment_input_edges
+
+        root = self._two_sided_join(side=1_000_000, out=500_000)
+        plan = AdaptivePlanner(require_available=False).plan(root)
+        plan.assign()
+
+        model = CostModel()
+        edges = segment_input_edges([sp.segment for sp in plan.segments])
+        for segment_plan in plan.segments:
+            sizes = tuple(n for _p, n in edges.get(segment_plan.segment.index,
+                                                    []))
+            expected = model.peak_memory_b(
+                segment_plan.segment.nodes[-1], segment_plan.engine,
+                segment_plan.segment.nbytes,
+                input_bytes=sizes or (segment_plan.segment.nbytes,),
+                output_bytes=segment_plan.segment.nbytes)
+            assert segment_plan.peak_memory_b == expected, (
+                f"the plan reports {segment_plan.peak_memory_b} but the cost "
+                f"model gives {expected} for the same edges")
+            # And the nodes carry that same figure, not a smaller one.
+            for node in segment_plan.segment.nodes:
+                assert node.estimated_peak_memory == expected
+
+    def test_the_reported_peak_exceeds_the_output_alone(self):
+        """Not the old flat 1.2x of the output size."""
+        from aar.planner import AdaptivePlanner
+
+        root = self._two_sided_join(side=1_000_000, out=500_000)
+        plan = AdaptivePlanner(require_available=False).plan(root)
+        plan.assign()
+        for segment_plan in plan.segments:
+            for node in segment_plan.segment.nodes:
+                assert node.estimated_peak_memory > (
+                    int(segment_plan.segment.nbytes * 1.2)), (
+                    "the reported peak is still the old output*1.2 figure")
 
 
 class TestDedupKeepsTheRightRow:

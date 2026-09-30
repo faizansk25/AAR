@@ -54,7 +54,17 @@ sql       = ["psycopg[binary]>=3.1", "pymongo>=4.6"]
 # drivers are CUDA 12; there is a separate cu11 extra for older hosts.
 gpu       = ["cudf-cu12>=24.4", "pynvml>=11.5"]
 gpu-cu11  = ["cudf-cu11>=24.4", "pynvml>=11.5"]
-dev       = ["pytest>=7.4", "pyarrow>=14", "openpyxl>=3.1", "duckdb>=0.10", "polars>=1.0", "ruff>=0.5", "build>=1.0"]
+# Every package the test suite can import belongs here, not only the ones the
+# library strictly needs. CI failed on all six jobs because `dev` lacked
+# packages the tests import: `mongomock` for the Mongo connector, `pandas` for
+# the pandas engine. A test that skips because a dependency is absent is a
+# test nobody ran, and on a developer machine - where `[all]` is normally
+# installed - that absence is invisible.
+#
+# `ruff` and `build` are here because CI runs both. The first CI run failed at
+# the lint step with "No module named ruff": the workflow called a linter the
+# `dev` extra did not install. A lint gate that is not installed is not a gate.
+dev       = ["pytest>=7.4", "pyarrow>=14", "openpyxl>=3.1", "duckdb>=0.10", "polars>=1.0", "pandas>=2.0", "mongomock>=4.0", "ruff>=0.5", "build>=1.0"]
 # Everything except the GPU stack, which needs a matching CUDA and is
 # deliberately opt-in: pulling cudf on a CPU-only host fails at install
 # time rather than degrading, which would break
