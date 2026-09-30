@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 622 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 623 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -472,7 +472,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**622 tests: 622 passing, 8 skipped, 0 failing.** Every skip states the
+**623 tests: 623 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously. `README.md` states the same
 number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
 the two ever disagree again — a stale count is the cheapest way to lose a

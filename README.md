@@ -84,7 +84,7 @@ library alone. Engines are opt-in extras:
 ## Verify
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q             # 622 tests
+.\.venv\Scripts\python.exe -m pytest -q             # 623 tests
 .\.venv\Scripts\python.exe tools\check_syntax.py    # parse every module
 .\.venv\Scripts\python.exe tools\smoke_run.py       # build a plan, run it, check the numbers
 .\.venv\Scripts\python.exe tools\manual_test.py     # guided tour, by hand

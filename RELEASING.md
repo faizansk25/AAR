@@ -8,6 +8,34 @@ uploading, that the wheel was missing a data file.
 
 ---
 
+## Do not publish yet
+
+**This guide is written down and deliberately not followed.** AAR is at
+`0.0.1` and stays there until the system is finished, and "finished" is
+decided by `report.md`, not by whether a build happens to pass.
+
+A passing build is necessary and not sufficient. The current gaps that
+block publication:
+
+- **GPU execution is unverified from the repository.** `data/gpu/` has the
+  CPU baseline and run 1; the run that is cited for cuDF end-to-end has no
+  committed artifact.
+- **The PostgreSQL, MySQL and MongoDB connectors have never spoken to a
+  live server.** Dialects and pushdown are written and unit-tested; the
+  integration is unproven.
+- **There is no data profiler.** Cardinality is declared, not measured, so
+  the cost model is choosing engines on estimates it has not checked.
+- **The scheduler does no real resource management** — no thread counts, no
+  memory ceilings, no worker concurrency.
+- **Nine of nineteen specified layers are built.**
+
+Publishing `aar-analytics` is a one-way door: once someone depends on
+`0.0.1`, the API they built against is a promise. The gates below are for
+*when that is intended*, so they are ready rather than improvised under
+pressure. Do not start step 1 until the list above is empty.
+
+---
+
 ## 0. The name is not `aar`, and that is deliberate
 
 Three names, and only one of them has to be unique:

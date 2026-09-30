@@ -12,5 +12,12 @@ registry and logged - never silently swallowed.
 
 from __future__ import annotations
 
-__version__ = "0.1.0"
+# 0.0.1 is deliberate and is not a "pre-alpha is coming" placeholder. The
+# specification is not finished: GPU and distributed execution are unverified
+# from the repository, the PostgreSQL/MySQL/MongoDB connectors have never
+# spoken to a live server, there is no data profiler, and the scheduler does
+# no real resource management. Nine of nineteen layers are built. A higher
+# number would invite someone to depend on that, so the version says what the
+# work actually is until the rest of the system exists.
+__version__ = "0.0.1"
 __all__ = ["__version__"]

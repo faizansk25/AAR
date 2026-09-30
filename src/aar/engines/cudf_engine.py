@@ -16,9 +16,10 @@ boundary, not per node.
 **What this is and is not.** It is real code against the real RAPIDS API.
 It has not been executed on a GPU *on the development machine*, because that
 machine has no CUDA device - the GPU evidence, including what a T4 run did
-and did not establish, is in `data/gpu/README.md`. (An earlier version of
-this docstring pointed at a "report.md section 8.2" that does not exist;
-`data/gpu/README.md` is the document that actually carries the evidence.)
+and did not establish, is in `data/gpu/README.md`. (This docstring used to
+point at a numbered section of report.md that does not exist; that is the
+class of dangling reference the docstring-reference test in test_cli.py
+exists to catch, and it named this file.)
 Writing it does not calibrate
 it, and nothing here is a performance claim. What the tests *do* establish
 on a CPU-only host is that the Arrow/cuDF boundary, the device-residency
