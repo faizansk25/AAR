@@ -4,8 +4,65 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 777 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 785 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 19 — the CI failures, and why the test count kept moving
+
+#### The reported symptoms had one root cause each
+
+1. **Missing `ruff`** (Round 18) — fixed; CI then advanced past lint and
+   failed inside pytest instead.
+2. **Missing `pandas` / `mongomock`** — `.[dev]` did not list packages the
+   tests import. Local environments had them via `[all]`, so the gap was
+   invisible here and fatal in CI. Added, with a comment on why a *test*
+   dependency belongs in a test extra.
+3. **The README count was wrong and nobody had noticed.** The guard matched
+   node ids with `^tests[/\\].*::[^\s]+$`, which requires a method name.
+   Pytest prints **class-level** lines for `unittest.TestCase` classes with
+   no `::method` suffix, so **31 Workbench tests were invisible to the
+   guard**. The README understated by 4 and every environment disagreed by a
+   different amount — which is why "just update the README" kept producing a
+   number that failed on the next machine. The pattern is now anchored on the
+   `tests/` prefix, and the count is the real one: **785**.
+
+#### Rehearsing CI instead of predicting it
+
+Created a throwaway venv, installed exactly `.[dev]`, and ran all three
+workflow steps:
+
+```
+lint:     All checks passed!
+syntax:   0 file(s) with syntax errors
+tests:    776 passed, 9 skipped  (exit 0)
+```
+
+That reproduced CI's dependency set rather than this machine's, and it is
+what turned "should pass" into "does pass". The probe is gitignored
+(`.gitignore:12`) and deleted after use.
+
+#### Workflow changes
+
+- `concurrency` keys on workflow **and** ref, so a newer run supersedes an
+  older one. Previously every push queued another six-job matrix; stale runs
+  kept failing long after the fix landed, and each sent an email.
+- Comments record why `fail-fast: false` stays (one failing platform must not
+  cancel the evidence about the other two) and why the matrix matches
+  `classifiers`.
+- The guard's failure message now explains that an environment-dependent
+  count means the dependency set moved, rather than only "fix the README".
+
+**776 passed, 9 skipped, 0 failed** in both the conda `aar` environment and
+a clean `.[dev]` install. NYC taxi Parquet unchanged: 3,627,882 rows /
+55,682,369 bytes.
+
+#### Still unverified
+
+Python 3.12 and the Linux/macOS platforms have not been executed here — only
+3.11 on Windows. The matrix is unchanged in content, so a 3.12-specific
+failure would be new information, not a regression from this round.
 
 ---
 
