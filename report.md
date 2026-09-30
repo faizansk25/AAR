@@ -4,8 +4,66 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 785 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 787 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 20 — the Workbench UI was inert, and had been since it was written
+
+#### "Not selecting any element" was a syntax error, not a styling bug
+
+`app.js` line 211 read:
+
+```js
+body.innerHTML = CACHE[name] ||
+```
+
+…with nothing after it. That is an unterminated expression, so the browser
+discarded the **entire script** — `wire()` never ran, and not one listener was
+ever bound. Every click was inert: tabs, Run, Explain, sort headers, paging.
+
+It was committed in `12f4d42` ("Workbench data grid…") and present in
+`9b58813` before it, so this was never a regression from any recent work.
+It shipped because **every Workbench test exercises the HTTP layer** — the
+server, the JSON endpoints, the static files existing on disk. Nothing asked
+whether the browser could *parse* the client.
+
+Two tests now guard it, and I verified the first one **fires on the old
+file** and is silent on the fixed one:
+
+```
+OLD (truncated): dangling=[(211, 'body.innerHTML = CACHE[name] ||')]
+NEW (fixed):     dangling=[]
+```
+
+The repaired line also restores intended behaviour: an uncached panel shows
+a placeholder rather than stale content.
+
+#### Directory and cache hygiene
+
+Removed, all gitignored and none of it tracked:
+
+- 18 `__pycache__` directories, 140 `.pyc` files
+- `.pytest_cache/`, `.ruff_cache/`, `dist/`
+- **`X.parquet` — 3 rows, named `X`, referenced by nothing in the repo.**
+  Committed accidentally in `e1e95fd`. It was tracked, so removing it is a
+  real change to the repository rather than a local tidy-up.
+- `.venv/` (ignored, 0 tracked files — nothing to remove from git)
+
+`git gc --prune=now` compacted the object store to **0 loose objects**;
+`git fsck` reports only dangling blobs from old revisions, and the full
+history is intact.
+
+**778 passed, 9 skipped, 0 failed; ruff clean.** `app.js` served at 13,004
+bytes with the repaired `setPanel`. NYC taxi Parquet untouched.
+
+#### Still outstanding
+
+Persistent predicted-vs-actual measurements (elapsed time, peak memory, bytes
+transferred) keyed by engine, hardware fingerprint, operation and input
+sizes — the evidence needed before the cost model or the optimizer can be
+improved on anything but intuition.
 
 ---
 

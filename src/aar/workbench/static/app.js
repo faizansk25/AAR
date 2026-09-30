@@ -208,7 +208,15 @@ function setPanel(name) {
     body.innerHTML = `<p class="empty">${esc(t("help.shortcuts"))}</p>`;
     return;
   }
+  /* A panel with nothing cached yet still needs to say so. This line was
+     truncated mid-expression, which is a *syntax* error rather than a
+     rendering one - the whole script failed to parse, so no handler was
+     ever bound and nothing in the UI responded to a click. A placeholder
+     is also what an analyst needs: "nothing cached" and "panel broken"
+     must not look the same. */
   body.innerHTML = CACHE[name] ||
+    `<p class="empty">${esc(t("empty.result"))}</p>`;
+}
 
 async function refresh() {
   try {

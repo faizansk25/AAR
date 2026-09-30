@@ -282,6 +282,71 @@ class TestAccessibilityClaims:
         for name in ("index.html", "app.js", "app.css"):
             assert os.path.isfile(os.path.join(STATIC, name)), name
 
+    @staticmethod
+    def _client_source() -> str:
+        """The Workbench client script, read once for the checks below."""
+        with open(os.path.join(STATIC, "app.js"), encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_the_client_script_is_syntactically_complete(self):
+        """A truncated statement makes the whole UI inert.
+
+        ``setPanel`` ended mid-expression at ``CACHE[name] ||`` with nothing
+        after it. That is a *syntax* error, so the browser discarded the
+        entire script: ``wire()`` never ran, no listener was ever bound, and
+        the symptom was "nothing in the UI responds to a click" rather than
+        anything a reader could act on.
+
+        Every existing Workbench test passed while this was true, because
+        they all exercise the HTTP layer and never the client's ability to
+        parse. So this asserts the structural properties that a truncation
+        violates: no function left open, and no line ending in an operator
+        that has nothing to continue it.
+        """
+        source = self._client_source()
+        lines = source.splitlines()
+
+        import re
+
+        unterminated = []
+        for index, line in enumerate(lines):
+            if not re.match(r"^(async )?function \w+\(", line):
+                continue
+            cursor = index + 1
+            while cursor < len(lines) and not lines[cursor].startswith("}"):
+                cursor += 1
+            if cursor >= len(lines):
+                unterminated.append(line.strip())
+        assert not unterminated, (
+            f"these functions never close: {unterminated}")
+
+        dangling = [
+            (index + 1, line.strip())
+            for index, line in enumerate(lines)
+            if re.search(r"(\|\||&&|\+)\s*$", line.rstrip())
+            and index + 1 < len(lines)
+            and (not lines[index + 1].strip()
+                 or re.match(r"^(function|async|const|let|for|if)\b",
+                             lines[index + 1].strip()))
+        ]
+        assert not dangling, (
+            f"these lines end in an operator with nothing to continue them: "
+            f"{dangling}")
+
+        assert source.count("(") == source.count(")"), "unbalanced parentheses"
+
+    def test_the_click_handlers_the_ui_promises_are_wired(self):
+        """The wiring must exist, since a parse failure removes it all."""
+        source = self._client_source()
+        for needed in (
+            'addEventListener("click"',
+            "function wire(",
+            "wire();",
+            'addEventListener("keydown"',
+            "data-sort",
+        ):
+            assert needed in source, f"the UI lost {needed!r}"
+
     def test_a_rows_request_for_nothing_is_a_clean_error(self, server):
         """A stale token must say so, not raise."""
         payload = json.dumps({"token": "r-nope", "offset": 0,
