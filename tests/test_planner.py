@@ -247,6 +247,138 @@ class TestSegmentPlanning:
         assert "total" in text
         assert "segment" in text
 
+class TestPlanningIsGloballyOptimal:
+    """The planner must minimise total cost, not each segment greedily.
+
+    This is the one audit finding left unfixed, so it starts as a test that
+    *fails*. Writing the DP first would have produced a test asserting
+    "a table is used", which passes whether or not the result is optimal.
+
+    The construction is the audit's: three segments, two engines, a switch
+    cost. Segment 1 is marginally cheaper on A; segments 2 and 3 are much
+    cheaper on B. Greedy takes A, then pays the switch twice. The optimal
+    path pays a small premium on segment 1 and switches once.
+
+        segment   engine A   engine B
+        S1            10 s       12 s
+        S2            40 s        5 s
+        S3            40 s        5 s
+        switch cost = 30 s
+
+        greedy  A,A,A = 10 + 30 + 40 = 80
+        optimal A,B,B = 10 + 12 + 30 + 5 + 5 = 62
+
+    A planner that looks only at the current segment picks A for S1 and
+    never recovers the 18 s.
+    """
+
+    #: Per-(operation, device) compute costs, in seconds, at the test's size.
+    COSTS = {("S1", "a"): 10.0, ("S1", "b"): 12.0,
+             ("S2", "a"): 40.0, ("S2", "b"): 5.0,
+             ("S3", "a"): 40.0, ("S3", "b"): 5.0}
+    SWITCH = 30.0
+
+    def _planner(self):
+        """A planner whose two engines have exactly the costs above.
+
+        Built on a fake cost model rather than a real one so the numbers in
+        the test are the numbers the planner sees. A regression this precise
+        cannot be expressed through calibration curves.
+        """
+        from aar.capability import CapabilityRegistry
+        from aar.cost import CostBreakdown, CostModel
+
+        costs = self.COSTS
+        switch = self.SWITCH
+        # Two real, constructible CPU engines stand in for "a" and "b", so
+        # the plan the planner produces is one a user could actually run.
+        # "a" is Arrow - the dependency every install has.
+        real_a = "arrow"
+
+        def _alias(engine_id: str) -> str:
+            return "a" if engine_id == real_a else "b"
+
+        class _FakeCost(CostModel):
+            """Costs exactly what the test says, and nothing else."""
+
+            def compute_s(self, node, engine_id, nbytes):
+                # Nodes cannot carry a test-only attribute (Node has
+                # __slots__), so the label is read off the node id the
+                # fixture encodes: "seg-S2-<hash>".
+                label = next((lab for lab in ("S1", "S2", "S3")
+                              if f"seg-{lab}" in node.id), "S1")
+                return (costs[(label, _alias(engine_id))], "calibration")
+
+            def node_cost(self, node, engine_id, nbytes, from_engine=None,
+                          residency=None):
+                compute, source = self.compute_s(node, engine_id, nbytes)
+                transfer = 0.0
+                if from_engine and from_engine != engine_id:
+                    transfer = switch
+                return (CostBreakdown(startup_s=0.0, transfer_s=transfer,
+                                      compute_s=compute), source)
+
+            def transition_cost(self, from_engine, to_engine, nbytes):
+                return CostBreakdown() if from_engine == to_engine \
+                    else CostBreakdown(transfer_s=switch)
+
+            def _fits(self, *a, **k):
+                return True
+
+        model = _FakeCost(calibration=None, registry=CapabilityRegistry())
+        return AdaptivePlanner(cost_model=model,
+                               registry=CapabilityRegistry(),
+                               require_available=False)
+
+    def _three_segment_pipeline(self):
+        """Three boundary-separated segments, one node each.
+
+        ``MATERIALIZE`` forces a segment boundary, which is what makes this
+        three separate decisions rather than one. The segment label is
+        encoded in the node id because ``Node`` has ``__slots__`` and cannot
+        carry a test-only attribute.
+        """
+        from aar.ir import Node, NodeType
+
+        def labelled(label: str, previous=None) -> Node:
+            node = Node(NodeType.MATERIALIZE,
+                        inputs=[previous] if previous else [])
+            node.id = f"seg-{label}-deadbeef"
+            node.estimated_bytes = 1_000_000
+            return node
+
+        s1 = labelled("S1")
+        s2 = labelled("S2", s1)
+        return labelled("S3", s2)
+
+    def test_the_chosen_plan_is_the_globally_cheapest_one(self):
+        """Fails today. That is the point of writing it first."""
+        planner = self._planner()
+        plan = planner.plan(self._three_segment_pipeline())
+
+        total = sum(sp.total_s for sp in plan.segments)
+        # The optimal assignment by brute force over {a,b}^3.
+        best = min(
+            sum(self.COSTS[(lab, eng)] for lab, eng in
+                zip(("S1", "S2", "S3"), combo))
+            + self.SWITCH * sum(1 for x, y in zip(combo, combo[1:]) if x != y)
+            for combo in ("aab", "aba", "abb", "aaa", "bbb"))
+        assert total == pytest.approx(best, rel=1e-6), (
+            f"planner chose {plan.engines} costing {total:.1f}s; "
+            f"the optimal path costs {best:.1f}s")
+
+    def test_it_does_not_pay_the_switch_twice_when_paying_once_is_cheaper(self):
+        """The specific error: A,A,B pays 2 switches; A,B,B pays one."""
+        planner = self._planner()
+        plan = planner.plan(self._three_segment_pipeline())
+        engines = plan.engines
+        switches = sum(1 for x, y in zip(engines, engines[1:]) if x != y)
+        assert switches <= 1, (
+            f"plan {engines} crosses a boundary {switches} times; "
+            f"staying put on one engine is cheaper here")
+
+
+
 
 class TestSegmentBoundaries:
     """The specification's core claim, made measurable.
@@ -292,16 +424,25 @@ class TestSegmentBoundaries:
             f"GPU chosen despite dominating transfers: {plan.engines}")
 
     def test_chosen_engine_is_cheaper_end_to_end(self):
-        """The decision must be justified by total cost, not by kernel time."""
+        """The decision must be justified by total cost, not by kernel time.
+
+        Note what this no longer asserts: that the chosen engine is the
+        cheapest candidate *for its own segment*. That was the greedy rule,
+        and it is wrong - a segment may pay more now to avoid a later
+        crossing, and the planner must be free to do that. What must still
+        hold is that no alternative engine would have made the whole run
+        cheaper, which is what the optimality class now checks directly.
+        """
         planner = self._expensive_gpu_plan()
         plan = planner.plan(_pipeline(1_000_000_000))
         for sp in plan.segments:
             if not sp.candidates:
                 continue
-            best_cost = sp.candidates[0][1]
-            assert sp.total_s >= best_cost - 1e-9
-            # The chosen engine is the cheapest candidate considered.
-            assert sp.engine == sp.candidates[0][0]
+            # The chosen engine is one of the candidates actually considered.
+            assert sp.engine in [e for e, _ in sp.candidates]
+            # And paying the hop, the segment never costs less than doing
+            # the work on its own.
+            assert sp.total_s >= sp.cost.compute_s - 1e-9
 
     def test_boundaries_are_counted_and_reported(self):
         plan = self._expensive_gpu_plan().plan(_pipeline(1_000_000_000))

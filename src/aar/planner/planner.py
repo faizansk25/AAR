@@ -474,16 +474,35 @@ class AdaptivePlanner:
 
     # --------------------------------------------------------------- planning
     def plan(self, root: Node) -> Plan:
-        """Produce a physical plan for ``root``, annotating the nodes."""
+        """Produce a physical plan for ``root``, annotating the nodes.
+
+        A dynamic program over segments, not a greedy walk. The state is the
+        engine chosen for the segment just planned; the value is the best
+        *cumulative* cost of reaching that engine having covered every earlier
+        segment. Choosing the locally cheapest engine is wrong whenever a
+        slightly more expensive choice now saves a boundary crossing later -
+        with S1 costing 10 s on A and 12 s on B, S2 and S3 costing 40 s and
+        5 s, and a 30 s switch, greedy takes A at S1 and pays 80 s where
+        62 s was available.
+
+        The table keeps every continuation alive to the last segment and
+        reconstructs one path afterwards, which is what lets it be optimal
+        on a chain that defeats any local rule.
+
+        Exact for a linear chain of segments. A branching DAG with joins
+        gives a segment several predecessors, and a single "previous engine"
+        state does not describe that - see the known limitations in
+        ``report.md``.
+        """
         segments = decompose_into_segments(root)
         if not segments:
             raise PlanInfeasible("pipeline has no executable nodes")
 
-        chosen: list[SegmentPlan] = []
-        previous_engine: str | None = None
-        previous_device: Device | None = None
-        total = 0.0
-
+        # Per segment, per engine: what the work costs on its own. The
+        # boundary crossing is deliberately NOT included here, because it
+        # depends on which engine ran before, and the table below folds it
+        # in once per candidate predecessor.
+        options: list[dict[str, tuple[CostBreakdown, str]]] = []
         for seg in segments:
             candidates = self.candidate_engines(seg)
             if not candidates:
@@ -493,60 +512,114 @@ class AdaptivePlanner:
                     f"{self._rejection_summary(seg)}",
                     segment=seg.index, nodes=seg.node_ids)
 
-            scored: list[tuple[str, float, CostBreakdown, float, str]] = []
+            scored: dict[str, tuple[CostBreakdown, str]] = {}
             for engine in candidates:
                 if not self._fits_memory(engine, seg.nbytes):
                     continue
-                # ``node_cost`` already includes the inbound transition when
-                # ``from_engine`` differs, so adding ``transition_cost`` here
-                # as well charged every hop twice.
-                #
-                # ``inbound_s`` must be the *cross-engine* transition alone.
-                # It is stored separately from ``cost`` because
-                # ``SegmentPlan.total_s`` adds the two together - so handing it
-                # the whole ``transfer_s`` (which already includes the hop, plus
-                # any device crossing) would reintroduce the same double count
-                # one field over.
                 breakdown, source = self._cost.node_cost(
-                    seg.nodes[-1], engine, seg.nbytes,
-                    from_engine=previous_engine,
-                    residency=previous_device)
-                inbound = 0.0
-                if previous_engine and previous_engine != engine:
-                    inbound = self._cost.transition_cost(
-                        previous_engine, engine, seg.nbytes).total_s
-                    # Charge the hop once, here, and stop the cost model
-                    # charging it again inside the breakdown.
-                    breakdown = CostBreakdown(
-                        startup_s=breakdown.startup_s,
-                        read_s=breakdown.read_s,
-                        transfer_s=breakdown.transfer_s - inbound,
-                        compute_s=breakdown.compute_s,
-                        spill_s=breakdown.spill_s,
-                        materialise_s=breakdown.materialise_s)
-                scored.append((engine, breakdown.total_s + inbound,
-                               breakdown, inbound, source))
+                    seg.nodes[-1], engine, seg.nbytes)
+                scored[engine] = (breakdown, source)
 
             if not scored:
                 raise PlanInfeasible(
                     f"every engine for segment {seg.index} exceeds the "
                     f"memory budget ({seg.nbytes} bytes)",
                     segment=seg.index, candidates=candidates)
+            options.append(scored)
 
+        # ---- the dynamic program -------------------------------------
+        # best[i][e] is the cheapest way to cover segments 0..i ending on
+        # engine e. came_from[i][e] records the predecessor, which is what
+        # turns the table back into an actual path.
+        best: list[dict[str, float]] = [
+            {e: b.total_s for e, (b, _) in options[0].items()}]
+        came_from: list[dict[str, str | None]] = [
+            dict.fromkeys(options[0])]
+        hop = self._cost.transition_cost
+
+        for i in range(1, len(segments)):
+            seg = segments[i]
+            layer: dict[str, float] = {}
+            back: dict[str, str | None] = {}
+            for engine, (own, _) in options[i].items():
+                best_prev: float | None = None
+                best_from: str | None = None
+                for prev, prev_cost in best[i - 1].items():
+                    # One crossing, paid once, for this specific pair.
+                    crossing = (0.0 if prev == engine else
+                                hop(prev, engine, seg.nbytes).total_s)
+                    total = prev_cost + crossing + own.total_s
+                    if best_prev is None or total < best_prev - 1e-12:
+                        best_prev, best_from = total, prev
+                if best_prev is not None:
+                    layer[engine] = best_prev
+                    back[engine] = best_from
+            best.append(layer)
+            came_from.append(back)
+
+        # ---- reconstruct the winning path ----------------------------
+        final = best[-1]
+        if not final:
+            raise PlanInfeasible("no feasible engine path through the segments")
+        path: list[str] = [min(final, key=lambda e: (final[e], e))]
+        for i in range(len(segments) - 1, 0, -1):
+            path.append(came_from[i][path[-1]] or path[-1])
+        path.reverse()
+        return self._assemble(root, segments, options, path)
+
+    def _assemble(self, root: Node, segments: list[Segment],
+                  options: list[dict[str, tuple[CostBreakdown, str]]],
+                  path: list[str]) -> Plan:
+        """Turn a chosen engine path into a :class:`Plan`.
+
+        The dynamic program gave the optimal *sequence*; this fills in the
+        per-segment accounting an analyst reads, which means each segment
+        needs its boundary crossing computed against the engine that actually
+        precedes it *in the chosen path* - not against every alternative.
+
+        ``inbound_s`` is the cross-engine transition alone. It is held apart
+        from ``cost`` because ``SegmentPlan.total_s`` adds the two, so giving
+        it the whole ``transfer_s`` (which already contains the hop, plus any
+        device crossing) would bill every boundary twice.
+        """
+        chosen: list[SegmentPlan] = []
+        previous_engine: str | None = None
+        total = 0.0
+        hop = self._cost.transition_cost
+
+        for seg, engine in zip(segments, path):
+            scored: list[tuple[str, float, CostBreakdown, float, str]] = []
+            for other, (breakdown, source) in options[seg.index].items():
+                inbound = 0.0
+                cost = breakdown
+                if previous_engine is not None and previous_engine != other:
+                    inbound = hop(previous_engine, other, seg.nbytes).total_s
+                    cost = CostBreakdown(
+                        startup_s=breakdown.startup_s,
+                        read_s=breakdown.read_s,
+                        transfer_s=breakdown.transfer_s - inbound,
+                        compute_s=breakdown.compute_s,
+                        spill_s=breakdown.spill_s,
+                        materialise_s=breakdown.materialise_s)
+                scored.append((other, cost.total_s + inbound, cost, inbound,
+                               source))
             scored.sort(key=lambda r: (r[1], r[0]))
-            engine, best, cost, inbound, source = scored[0]
-            total += best * (1.0 + self._margin)
+
+            # The DP chose this engine; the sorted list is for display, so
+            # look the choice up rather than assuming it sorted first.
+            match = next(r for r in scored if r[0] == engine)
+            _, best_cost, cost, inbound, source = match
+            total += best_cost * (1.0 + self._margin)
 
             chosen.append(SegmentPlan(
                 segment=seg, engine=engine,
                 device=self._registry.spec(engine).device,
                 cost=cost, inbound_s=inbound,
                 candidates=[(e, t) for e, t, *_ in scored],
-                reason=self._reason(cost, best, inbound, source, engine,
+                reason=self._reason(cost, best_cost, inbound, source, engine,
                                     scored),
             ))
             previous_engine = engine
-            previous_device = self._registry.spec(engine).device
 
         plan = Plan(root=root, segments=chosen, total_s=total)
         plan.assign()

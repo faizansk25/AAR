@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 652 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 654 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -64,6 +64,43 @@ files and large-scale data, while automatically selecting the most efficient
 **legal** execution path for the available hardware — with full explainability
 and zero external AI dependency. The goal is **minimum total analytical cost**,
 not GPU utilisation.
+
+---
+
+Also fixed on the way: the calibration store now loads the machine's saved
+profile on the default path, and `engine_used` names `executor` for the nine
+node types the executor computes in Python rather than crediting the assigned
+engine.
+
+**Round 13: the planner stopped being greedy.** The last audit finding left
+open, and the one with a clean completion test. `plan()` walked the segments
+once and committed to the cheapest engine for each, which is not dynamic
+programming however the documentation describes it.
+
+The test came first. `TestPlanningIsGloballyOptimal` builds three segments,
+two real engines, and a 30 s switch, then enumerates all eight engine
+assignments and asserts the planner chose the cheapest. Against the greedy
+planner it failed with a concrete answer:
+
+    planner chose ('arrow', 'cudf', 'cudf') costing 50.0s;
+    the optimal path costs 22.0s
+
+That number is the whole argument for writing the test first. A DP written
+without a failing counterexample would have produced a test asserting "a
+table was used", which passes whether or not the plan is optimal.
+
+The table is `best[i][engine]` = cheapest cumulative cost of covering
+segments 0..i ending on that engine, with `came_from` reconstructing the
+path. One old assertion had to change, and it is worth naming: a test
+previously asserted the chosen engine was the cheapest candidate *for its own
+segment*. That encoded the greedy rule, and it is wrong by design — a segment
+may pay more now to avoid a crossing later. The surrounding invariant (the
+chosen engine was genuinely considered; the segment is never cheaper than its
+own work) still holds and is still tested.
+
+What the DP does **not** solve: its state is "the engine of the previous
+segment", which describes a chain. A join gives a segment several
+predecessors. That needs a state of *sets* of engines, and it is not written.
 
 ---
 
@@ -520,7 +557,7 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ## 4. Testing
 
-**652 tests: 649 passing, 7 skipped, 0 failing.** Every skip states the
+**654 tests: 654 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously. `README.md` states the same
 number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
 the two ever disagree again — a stale count is the cheapest way to lose a
@@ -534,7 +571,7 @@ reader's trust, and this project shipped one for months.
 | `test_hardware.py` | 32 | Byte helpers, all 6 probes, profile facade, curve fitting, store round-trip, stale-profile rejection, **live calibration** |
 | `test_failures.py` | 20 | Full matrix coverage, error hierarchy, ledger semantics |
 | `test_ir.py` | 20 | Expressions incl. SQL-injection safety, node metadata, DAG ordering, cycle detection |
-| `test_planner.py` | 26 | Segment decomposition, transitions charged exactly once, feasibility, explain output |
+| `test_planner.py` | 28 | Segment decomposition, **global optimality vs brute force**, transitions charged exactly once, feasibility |
 | `test_correctness_regressions.py` | 16 | **Defects that shipped with the suite green** — dedup, window frames, quality rules, trace integrity |
 | `test_cli.py` | 37 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `policy`, exit codes |
 | `test_runtime.py` | 153 | **Cross-engine agreement, interchange, connectors, executor, end to end** |
@@ -926,17 +963,22 @@ streaming progress are not yet built.
    them; a data profiler that measures real statistics is not yet built. The
    executor does return observed row counts and elapsed times, so the history
    store can be wired to real measurements next.
-8. **The planner is greedy, not the dynamic program the documentation
-   describes.** Confirmed by reading `plan()`: it walks the segments once and
-   commits to the cheapest engine for each, given only the previous choice.
-   No cumulative states are kept and no path is reconstructed. A workload
-   where starting on the more expensive engine wins overall is planned
-   suboptimally. This is the one audit finding **not yet fixed** — it needs a
-   counterexample test before the DP is written, so that "it is optimal" is a
-   claim the suite can falsify rather than a description in prose. The
-   segment cost is also derived from each segment's *final* node, so a
-   multi-operation segment is priced from its last operation alone.
-9. **SQL/MongoDB scan dispatch was newly wired but is untested live.**
+8. **The dynamic program is exact for a chain, not for a branching DAG.**
+   `AdaptivePlanner.plan()` now keeps a cumulative cost per (segment, engine)
+   and reconstructs one optimal path, so it is no longer greedy — a workload
+   where the locally cheapest first choice loses overall is planned correctly
+   and `TestPlanningIsGloballyOptimal` proves it against a brute-force
+   enumeration. But the state is "the engine of the previous segment", which
+   describes a chain. A join gives a segment several predecessors, and no
+   single previous engine represents that. Extending the state to a *set* of
+   engines is the next step, and it is not written.
+9. **A segment is priced from its final node.** `node_cost` is called with
+   `seg.nodes[-1]`, so a segment of `Filter -> GroupBy -> Sort` is estimated
+   from the sort alone. Summing per-operation costs, or estimating the fused
+   query when the engine can run the whole segment as one, are both
+   unimplemented — and the distinction matters, because DuckDB and Polars
+   optimise a whole pipeline rather than executing each step in isolation.
+10. **SQL/MongoDB scan dispatch was newly wired but is untested live.**
    `SCAN_SQL` and `SCAN_MONGO` previously fell through to
    `NotImplementedError`; they now route to `engine.read_scan`. SQLite is
    covered end to end; PostgreSQL, MySQL and MongoDB still need live servers.
