@@ -525,8 +525,12 @@ class AdaptivePlanner:
             for engine in candidates:
                 if not self._fits_memory(engine, seg.nbytes):
                     continue
-                breakdown, source = self._cost.node_cost(
-                    seg.nodes[-1], engine, seg.nbytes)
+                # ``segment_cost`` sums every operation in the segment, each
+                # priced at the size it actually sees. Calling ``node_cost``
+                # on ``nodes[-1]`` instead would price a Filter->GroupBy->Sort
+                # segment from the sort alone, under-counting the work by
+                # however much the earlier operations cost.
+                breakdown, source = self._cost.segment_cost(seg, engine)
                 scored[engine] = (breakdown, source)
 
             if not scored:

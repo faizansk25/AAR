@@ -7,13 +7,13 @@ arithmetic, not be asserted, and it does.
 """
 
 from .model import (  # noqa: F401
-    CostBreakdown, CostModel, DEFAULT_PRIORS, ExecutionHistory,
-    ExecutionRecord, Priors, TransferProfile, default_cost_model,
-    node_operation,
+    CostBreakdown, CostModel, DEFAULT_PRIORS, EstimationError, EstimationLog,
+    ExecutionHistory, ExecutionRecord, Priors, TransferProfile,
+    default_cost_model, node_operation,
 )
 
 __all__ = [
-    "CostBreakdown", "CostModel", "DEFAULT_PRIORS", "ExecutionHistory",
-    "ExecutionRecord", "Priors", "TransferProfile", "default_cost_model",
-    "node_operation",
+    "CostBreakdown", "CostModel", "DEFAULT_PRIORS", "EstimationError",
+    "EstimationLog", "ExecutionHistory", "ExecutionRecord", "Priors",
+    "TransferProfile", "default_cost_model", "node_operation",
 ]

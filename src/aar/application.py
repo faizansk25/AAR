@@ -21,8 +21,10 @@ an exit code, because only that front end knows what its caller expects.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+
+from .cost import EstimationLog
 
 __all__ = ["PipelineService", "RunReport"]
 
@@ -34,6 +36,8 @@ class RunReport:
     plan: Any
     result: Any
     root: Any
+    #: What the profiler measured before planning, keyed by node type.
+    profiles: dict = field(default_factory=dict)
 
 
 class PipelineService:
@@ -49,6 +53,11 @@ class PipelineService:
                  history: Any | None = None) -> None:
         self._planner = planner
         self._history = history
+        #: Prediction-vs-actual errors from the most recent profiled run, or
+        #: ``None`` when nothing was profiled. Public because a caller that
+        #: wants to know whether the numbers were any good has to be able to
+        #: ask, and a private attribute would just move the guessing.
+        self.estimation_log: Any | None = None
 
     def _make_planner(self) -> Any:
         if self._planner is not None:
@@ -111,19 +120,56 @@ class PipelineService:
         sample - and a source that cannot be measured is left alone, with
         the plan falling back to the declared estimate. It never fails a run
         because a file was unreadable.
+
+        Afterwards the predicted row count for each profiled source is
+        compared with the rows the scan actually produced, and the gap is
+        recorded. That comparison is the only thing that can catch a
+        profiler which is confidently wrong.
         """
         from .runtime import Executor
 
         root = self.load(path)
-        if profile:
-            self.profile_sources(root)
+        predicted = self.profile_sources(root) if profile else {}
         plan = self.plan(root)
         policy = self._load_policy(policy_path)
         subject = self._subject(role, actor)
         with Executor(policy=policy, subject=subject,
                       history=self._history) as executor:
             result = executor.execute(plan)
-        return RunReport(plan=plan, result=result, root=root)
+        report = RunReport(plan=plan, result=result, root=root,
+                           profiles=predicted)
+        self.score_estimates(root, result)
+        return report
+
+    def score_estimates(self, root: Any, result: Any) -> list:
+        """Compare each profiled source with what the run actually read.
+
+        The executor records ``rows_out`` per node and the profiler recorded
+        what it expected, so the two can be compared directly. Errors are
+        labelled by node id, which is unique within a run; a stable
+        identifier across runs would be needed to accumulate history, and
+        inventing one that could silently collide would be worse than
+        keeping this per-run.
+
+        Takes ``root`` and ``result`` rather than a :class:`RunReport` so a
+        caller that already planned and executed separately - the CLI, which
+        prints the plan before running it - can still score the estimates.
+        """
+        log = EstimationLog()
+        for node in root.walk():
+            profile = getattr(node, "aar_profile", None)
+            if profile is None:
+                continue
+            outcome = next((o for o in result.outcomes
+                            if o.node_id == node.id), None)
+            if outcome is None:
+                continue
+            log.add(label=f"{node.type.value}:{node.id}",
+                    predicted=profile.rows, actual=outcome.rows_out,
+                    source=profile.source)
+        if log.errors():
+            self.estimation_log = log
+        return log.errors()
 
     def profile_sources(self, root: Any) -> dict:
         """Measure every source a pipeline reads, and attach the results.

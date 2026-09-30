@@ -188,7 +188,7 @@ about itself.
 With conda active:
 
 ```powershell
-python -m pytest -q                   # 678 tests
+python -m pytest -q                   # 692 tests
 python tools\check_syntax.py          # parse every module
 python tools\smoke_run.py             # build a plan, run it, check the numbers
 python tools\manual_test.py           # guided tour, by hand

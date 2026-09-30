@@ -248,17 +248,45 @@ def _load_policy(path: str | None):
         raise SystemExit(_EXIT_USER_ERROR) from exc
 
 
+def _print_accuracy(service: Any) -> None:
+    """Report how far the plan's estimates were from reality.
+
+    Printed by default, not behind a flag. The whole point of measuring the
+    error is that somebody sees it; a number recorded in an object and never
+    displayed is a number nobody acts on. A run with nothing profiled says
+    nothing rather than claiming perfect accuracy.
+    """
+    log = getattr(service, "estimation_log", None)
+    if log is None or not len(log):
+        return
+    print(log.render())
+    print()
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
-    """Plan and execute a pipeline, reporting what actually happened."""
+    """Plan and execute a pipeline, reporting what actually happened.
+
+    Routed through :class:`PipelineService` rather than doing its own load,
+    plan and execute. That is not tidiness: doing it here separately is how
+    the Workbench's copy drifted into calling a method that never existed,
+    and it is also why the data profiler would otherwise be applied by the
+    GUI and not by the command line. One path, one behaviour.
+    """
     import json
 
+    from .application import PipelineService
     from .failures import AARError
-    from .runtime import Executor
 
+    service = PipelineService()
     root, plan = _plan_for(args.pipeline)
     if args.explain and not args.json:
         print(plan.render())
         print()
+
+    # Profile before planning, exactly as PipelineService.run does, so the
+    # plan that is displayed and the plan that is executed are the same one.
+    if not args.json:
+        service.profile_sources(root)
 
     policy = _load_policy(getattr(args, "policy", None))
     subject = None
@@ -269,6 +297,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         subject = Subject(name=getattr(args, "actor", "cli") or "cli",
                           roles=roles)
 
+    from .runtime import Executor
     with Executor(policy=policy, subject=subject) as executor:
         try:
             result = executor.execute(plan)
@@ -286,6 +315,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 traceback.print_exc()
             return 1
 
+    service.score_estimates(root, result)
 
     if args.json:
         print(json.dumps({
@@ -307,6 +337,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     if not args.quiet:
         print(result.render())
         print()
+    _print_accuracy(service)
     _print_preview(result, args.head)
     if not result.ok:
         print("\nCompleted with unresolved degradations; see above.",

@@ -27,6 +27,7 @@ Three further commitments:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 from ..capability import CapabilityRegistry, Device
 from ..hardware.calibrate import CalibrationStore
@@ -34,7 +35,8 @@ from ..ir.nodes import Node, NodeType
 
 __all__ = [
     "CostBreakdown", "TransferProfile", "CostModel", "Priors",
-    "node_operation", "default_cost_model",
+    "node_operation", "default_cost_model", "EstimationError",
+    "EstimationLog",
 ]
 
 #: Node type -> the calibration operation that measures its compute cost.
@@ -75,6 +77,40 @@ def node_operation(node: Node) -> str:
     operation.
     """
     return _OP_FOR_NODE.get(node.type, "scan")
+
+
+def _node_bytes(node: Node) -> int:
+    """The size this node's *output* is expected to be.
+
+    A measured profile wins over a declared estimate, matching the precedence
+    the planner uses. Returns 0 when nothing is known, so a caller can fall
+    back without having to test for ``None``.
+    """
+    profile = getattr(node, "aar_profile", None)
+    if profile is not None and getattr(profile, "nbytes", 0):
+        return int(profile.nbytes)
+    declared = getattr(node, "estimated_bytes", None)
+    return int(declared) if declared else 0
+
+
+def _combine_sources(sources: set[str]) -> str:
+    """One provenance string for a cost summed from several estimates.
+
+    If any part came from history the whole thing is history-informed, and
+    if any part was a prior the whole thing is only as good as that prior.
+    Collapsing to a single word keeps the promise that a plan can be told
+    apart from a guess.
+    """
+    if "history" in sources:
+        return "history"
+    if "prior" in sources:
+        return "prior" if sources == {"prior"} else "mixed(prior)"
+    if "calibration(penalised)" in sources:
+        return ("calibration(penalised)" if sources == {"calibration(penalised)"}
+                else "mixed(calibration, penalised)")
+    if "calibration" in sources:
+        return "calibration"
+    return "unknown"
 
 
 # ------------------------------------------------------------------ priors
@@ -376,6 +412,67 @@ class CostModel:
         return 0.0
 
 
+    def segment_cost(self, segment: Any, engine_id: str,
+                     from_engine: str | None = None,
+                     residency: Device | None = None
+                     ) -> tuple[CostBreakdown, str]:
+        """Cost of a whole segment on one engine, plus a readable detail line.
+
+        The per-operation cost is a **sum**, not a fused estimate, and that is
+        a statement about the runtime rather than about optimising potential.
+        The executor dispatches one node at a time - ``_dispatch`` calls
+        ``engine.filter``, then ``engine.group_by``, then ``engine.sort`` - so
+        each operation really does pay its own kernel time. Pricing the
+        segment as one optimised query would credit a fusion that never
+        happens, which is the same error as reporting a GPU that never ran.
+
+        Each operation is priced at the size *it* sees, not at the segment's
+        output size. A group-by reducing a gigabyte to a thousand rows makes
+        the sort after it cheap; billing both the same gigabyte would
+        over-price the tail and mis-rank engines on it.
+
+        Startup, read, spill, materialisation and the boundary crossing are
+        charged **once** for the segment. The engine is built once and the
+        data crosses the bus once; only ``compute_s`` is per-operation,
+        because that is the only genuinely repeated cost.
+        """
+        nodes: list[Node] = list(getattr(segment, "nodes", ()) or (segment,))
+        if not nodes:
+            return CostBreakdown(), "empty segment"
+
+        compute_total = 0.0
+        sources: set[str] = set()
+        parts: list[str] = []
+        for node in nodes:
+            nbytes = (_node_bytes(node)
+                      or int(getattr(segment, "nbytes", 0) or 0))
+            seconds, source = self.compute_s(node, engine_id, nbytes)
+            compute_total += seconds
+            sources.add(source)
+            parts.append(f"{node_operation(node)} {seconds * 1e3:.1f}ms")
+
+        # The last node carries the segment's overall read, its
+        # materialisation and the inbound crossing; the preceding operations
+        # are already represented by their own compute.
+        tail, tail_source = self.node_cost(
+            nodes[-1], engine_id,
+            int(getattr(segment, "nbytes", 0) or 0),
+            from_engine=from_engine, residency=residency)
+        sources.add(tail_source)
+
+        breakdown = CostBreakdown(
+            startup_s=tail.startup_s,
+            read_s=tail.read_s,
+            transfer_s=tail.transfer_s,
+            compute_s=compute_total,
+            spill_s=tail.spill_s,
+            materialise_s=tail.materialise_s,
+        )
+        source = _combine_sources(sources)
+        detail = (f"{len(nodes)} ops [{' + '.join(parts)}] "
+                  f"(compute from {source})")
+        return breakdown, detail
+
     def node_cost(
         self,
         node: Node,
@@ -548,6 +645,122 @@ class ExecutionRecord:
     peak_memory: int = 0
     bytes_transferred: int = 0
     success: bool = True
+
+
+# ------------------------------------------------------ estimation accuracy
+class EstimationError:
+    """How far one prediction was from what actually happened.
+
+    The profiler and the cost model both produce numbers that nobody
+    checked. Recording the gap between a predicted row count and the
+    observed one is the only way a systematically wrong estimate gets
+    noticed - and a profiler that is confidently wrong is worse than one
+    that admits it was guessing, because everything downstream inherits the
+    error.
+    """
+
+    __slots__ = ("label", "predicted", "actual", "source")
+
+    def __init__(self, label: str, predicted: int, actual: int,
+                 source: str = "") -> None:
+        self.label = label
+        self.predicted = int(predicted)
+        self.actual = int(actual)
+        self.source = source
+
+    @property
+    def absolute_error(self) -> int:
+        return abs(self.predicted - self.actual)
+
+    @property
+    def ratio(self) -> float:
+        """Predicted / actual. 2.0 means we predicted twice too many."""
+        return (self.predicted / self.actual) if self.actual else float("inf")
+
+    @property
+    def relative_error(self) -> float:
+        """|predicted - actual| / actual, or infinity for an empty actual."""
+        if not self.actual:
+            return float("inf")
+        return self.absolute_error / self.actual
+
+    def render(self) -> str:
+        direction = ("over" if self.predicted > self.actual else
+                     "under" if self.predicted < self.actual else "exact")
+        return (f"{self.label}: predicted {self.predicted:,} "
+                f"({self.source or 'unknown'}), actual {self.actual:,} "
+                f"-> {direction} by {self.relative_error:.0%}")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"label": self.label, "predicted": self.predicted,
+                "actual": self.actual, "source": self.source,
+                "relative_error": self.relative_error}
+
+
+class EstimationLog:
+    """Collects :class:`EstimationError` objects across runs.
+
+    In memory for now, which is the honest scope: it answers "was the last
+    plan's estimate any good?", which is the question that decides whether
+    a prediction should be trusted at all. Persisting it so a *future* run
+    can be planned better is a larger design - it needs a stable semantic
+    identifier for a source, not a node id that changes per build.
+    """
+
+    __slots__ = ("_errors", "_worst")
+
+    def __init__(self, worst_threshold: float = 0.5) -> None:
+        self._errors: list[EstimationError] = []
+        self._worst = worst_threshold
+
+    def add(self, label: str, predicted: int, actual: int,
+            source: str = "") -> EstimationError:
+        error = EstimationError(label, predicted, actual, source)
+        self._errors.append(error)
+        return error
+
+    def errors(self) -> list[EstimationError]:
+        return list(self._errors)
+
+    def by_label(self, label: str) -> list[EstimationError]:
+        return [e for e in self._errors if e.label == label]
+
+    @property
+    def offenders(self) -> list[EstimationError]:
+        """Estimates that missed by more than the threshold."""
+        return [e for e in self._errors if e.relative_error > self._worst]
+
+    @property
+    def worst_relative_error(self) -> float:
+        return max((e.relative_error for e in self._errors), default=0.0)
+
+    def mean_relative_error(self) -> float:
+        finite = [e.relative_error for e in self._errors
+                  if e.relative_error != float("inf")]
+        return sum(finite) / len(finite) if finite else 0.0
+
+    def __len__(self) -> int:
+        return len(self._errors)
+
+    def render(self) -> str:
+        if not self._errors:
+            return ("No estimation errors recorded: nothing was predicted "
+                    "against a measured result yet.")
+        lines = ["ESTIMATION ACCURACY", ""]
+        for error in self._errors:
+            lines.append("  " + error.render())
+        lines.append("")
+        lines.append(f"  mean error {self.mean_relative_error():.1%}, "
+                     f"worst {self.worst_relative_error:.1%}, "
+                     f"{len(self.offenders)} of {len(self._errors)} outside "
+                     f"{self._worst:.0%}")
+        return "\n".join(lines)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"errors": [e.to_dict() for e in self._errors],
+                "mean_relative_error": self.mean_relative_error(),
+                "worst_relative_error": self.worst_relative_error(),
+                "offenders": len(self.offenders)}
 
 
 class ExecutionHistory:

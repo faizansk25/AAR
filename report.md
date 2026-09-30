@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 678 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 692 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -599,11 +599,60 @@ actually observed, so a systematically wrong profiler would not be caught by
 the system itself. The executor already records real output row counts, so
 the comparison is a matter of wiring rather than invention.
 
+**Now closed (round 14).** `EstimationLog` records the gap between each
+profiled source's predicted rows and the rows the scan actually produced, and
+`aar run` prints it by default. A deliberately wrong profiler — one claiming
+ten times the rows that exist — is caught by
+`test_a_wrong_profiler_is_caught`, which is the property that matters: the
+error is invisible in the profile itself and only appears against reality.
+Verified live:
+
+```
+ESTIMATION ACCURACY
+
+  ScanParquet:op_b16d0ba004fc: predicted 50,000 (parquet-metadata),
+  actual 50,000 -> exact by 0%
+
+  mean error 0.0%, worst 0.0%, 0 of 1 outside 50%
+```
+
+Still per-run rather than accumulated: errors are labelled by node id, which
+changes every build. A stable *semantic* identifier for a source — path plus
+size plus mtime, say — would be needed to carry error across runs, and
+inventing one that could silently collide would be worse than keeping this
+honestly scoped to a single run.
+
+### 3.9 Segment costing — `CostModel.segment_cost`
+
+The planner priced every segment from `seg.nodes[-1]`, so a
+`Filter -> GroupBy -> Sort` segment was estimated from the sort alone. A
+filter discarding 99% of rows and a group-by reducing to a thousand groups
+both cost real time, and neither appeared in the number the engine was
+chosen with.
+
+- **A sum of per-operation costs, not a fused estimate** — and that is a
+  claim about the runtime, not about optimising potential. The executor
+  dispatches one node at a time (`_dispatch` calls `engine.filter`, then
+  `engine.group_by`, then `engine.sort`), so each operation really does pay
+  its own kernel time. Pricing a segment as one optimised query would credit
+  a fusion that never happens — the same error as reporting a GPU that never
+  ran. If fusion is ever implemented, the estimate must change with it.
+- **Each operation is priced at the size it actually sees.** A group-by
+  reducing a gigabyte to a thousand rows makes the sort after it cheap;
+  billing both the same gigabyte over-prices the tail and mis-ranks engines
+  on it. Measured: 500k, 400k and 300k bytes cost 825ms, 690ms and 555ms.
+- **Startup, read, spill, materialisation and the boundary crossing are
+  charged once per segment**, not per node. The engine is built once and the
+  data crosses the bus once; only `compute_s` repeats.
+- **Provenance survives the sum.** A segment cost partly from history and
+  partly from priors reports as mixed, so a plan cannot quietly launder a
+  guess through an average.
+
 ---
 
 ## 4. Testing
 
-**678 tests: 678 passing, 8 skipped, 0 failing.** Every skip states the
+**692 tests: 692 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously. `README.md` states the same
 number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
 the two ever disagree again — a stale count is the cheapest way to lose a
@@ -1019,12 +1068,19 @@ streaming progress are not yet built.
    describes a chain. A join gives a segment several predecessors, and no
    single previous engine represents that. Extending the state to a *set* of
    engines is the next step, and it is not written.
-9. **A segment is priced from its final node.** `node_cost` is called with
-   `seg.nodes[-1]`, so a segment of `Filter -> GroupBy -> Sort` is estimated
-   from the sort alone. Summing per-operation costs, or estimating the fused
-   query when the engine can run the whole segment as one, are both
-   unimplemented — and the distinction matters, because DuckDB and Polars
-   optimise a whole pipeline rather than executing each step in isolation.
+9. **A segment is priced as a sum of its operations, not a fused query.**
+   `CostModel.segment_cost` now sums every operation in a segment, each at the
+   size it actually sees. That is deliberately *not* a fused estimate: the
+   executor dispatches one node at a time, so there is no fusion to credit.
+   If per-segment fusion is ever implemented in the executor, the cost model
+   must change with it — a fused estimate against an unfused runtime is the
+   same class of error as reporting an engine that never ran.
+10. **Estimation error is per-run, not accumulated.** `EstimationLog` compares
+   each profiled source against the rows the scan really produced, and
+   `aar run` prints it. But errors are keyed by node id, which changes on
+   every build, so a systematically wrong profiler would have to be caught on
+   each run rather than remembered. A stable semantic identifier is the
+   missing piece.
 10. **SQL/MongoDB scan dispatch was newly wired but is untested live.**
    `SCAN_SQL` and `SCAN_MONGO` previously fell through to
    `NotImplementedError`; they now route to `engine.read_scan`. SQLite is

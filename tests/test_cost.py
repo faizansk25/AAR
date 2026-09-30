@@ -93,6 +93,246 @@ class TestSerialisationUnits:
         assert 10 * per_byte > per_byte
 
 
+class TestEstimationErrorIsMeasured:
+    """A prediction nobody checks is a prediction nobody should trust."""
+
+    def test_relative_error_is_the_gap_over_the_actual(self):
+        from aar.cost import EstimationError
+
+        assert EstimationError("s", 100, 100).relative_error == 0.0
+        assert EstimationError("s", 200, 100).relative_error == pytest.approx(1.0)
+        assert EstimationError("s", 50, 100).relative_error == pytest.approx(0.5)
+
+    def test_predicting_rows_for_an_empty_result_is_infinite_error(self):
+        """The worst case must not quietly read as 'close enough'."""
+        from aar.cost import EstimationError
+
+        error = EstimationError("s", 1_000, 0)
+        assert error.relative_error == float("inf")
+        assert error.ratio == float("inf")
+
+    def test_the_direction_of_the_miss_is_said_out_loud(self):
+        from aar.cost import EstimationError
+
+        assert "over" in EstimationError("s", 200, 100).render()
+        assert "under" in EstimationError("s", 50, 100).render()
+        assert "exact" in EstimationError("s", 100, 100).render()
+
+    def test_a_log_finds_the_offenders(self):
+        from aar.cost import EstimationLog
+
+        log = EstimationLog()
+        log.add("a", 100, 100, "parquet-metadata")
+        log.add("b", 10_000, 100, "sampled")
+        assert len(log) == 2
+        assert [e.label for e in log.offenders] == ["b"]
+
+    def test_an_empty_log_says_so_rather_than_reporting_zero_error(self):
+        """No data must not be reported as perfect accuracy."""
+        from aar.cost import EstimationLog
+
+        assert "No estimation errors" in EstimationLog().render()
+
+    def test_render_works_with_entries_in_it(self):
+        """``render`` is the only way an analyst sees any of this.
+
+        A property called as a method made every populated ``render()`` raise
+        ``TypeError``, so the report could only ever be produced when it was
+        empty - and an empty one says there is nothing to report. The
+        headline number was unreachable in exactly the case it existed for.
+        """
+        from aar.cost import EstimationLog
+
+        log = EstimationLog()
+        log.add("a", 120, 100, "sampled")
+        text = log.render()
+        assert "ESTIMATION ACCURACY" in text
+        assert "mean error" in text
+        assert "worst" in text
+        assert "120" in text and "100" in text
+
+
+class TestTheProfilerIsScoredAgainstReality:
+    """The end-to-end loop: predict, run, compare."""
+
+    def _pipeline(self, directory, csv_text: str):
+        src = directory / "in.csv"
+        src.write_text(csv_text, encoding="utf-8")
+        path = directory / "p.py"
+        path.write_text(
+            "from aar.sdk import csv, write_csv\n\n"
+            "def build():\n"
+            "    return write_csv(csv(r%r), r%r)\n"
+            % (str(src), str(directory / "out.csv")),
+            encoding="utf-8")
+        return path
+
+    def test_a_correct_profiler_reports_a_small_error(self, tmp_path):
+        from aar.application import PipelineService
+
+        path = self._pipeline(tmp_path, "v\n1\n2\n3\n4\n5\n")
+        service = PipelineService()
+        service.run(str(path))
+        assert service.estimation_log is not None, (
+            "a profiled run must record how accurate the profile was")
+        errors = service.estimation_log.errors()
+        assert errors, "no estimation error was recorded for a profiled run"
+        assert service.estimation_log.worst_relative_error < 0.5, (
+            service.estimation_log.render())
+
+    def test_a_wrong_profiler_is_caught(self, tmp_path, monkeypatch):
+        """The point of the loop: a confidently wrong estimate is visible.
+
+        The profiler claims ten times the rows there are. Nothing about that
+        is detectable from the profile alone - it is internally consistent,
+        correctly typed, and confidently reported. Only comparing it with
+        what the scan actually read reveals it.
+        """
+        from aar.application import PipelineService
+        from aar.stats import DataProfiler
+
+        real = DataProfiler.profile_csv
+
+        def ten_times_too_many(self, path):
+            profile = real(self, path)
+            profile.rows *= 10
+            return profile
+
+        monkeypatch.setattr(DataProfiler, "profile_csv", ten_times_too_many)
+
+        path = self._pipeline(tmp_path, "v\n1\n2\n3\n4\n5\n")
+        service = PipelineService()
+        service.run(str(path))
+        assert service.estimation_log is not None
+        offenders = service.estimation_log.offenders
+        assert offenders, (
+            "a profiler that over-estimated by 10x was not flagged:\n"
+            + service.estimation_log.render())
+        assert offenders[0].relative_error > 5.0
+        assert "over" in offenders[0].render()
+
+    def test_a_run_without_profiling_records_nothing(self, tmp_path):
+        from aar.application import PipelineService
+
+        path = self._pipeline(tmp_path, "v\n1\n2\n3\n")
+        service = PipelineService()
+        service.run(str(path), profile=False)
+        assert service.estimation_log is None
+
+class TestSegmentCostCoversEveryOperation:
+    """A segment priced from its last node is under-priced.
+
+    ``node_cost`` is called with ``seg.nodes[-1]``, so a segment of
+    ``Filter -> GroupBy -> Sort`` is estimated from the sort alone. A filter
+    that discards 99% of the rows and a group-by that reduces to a thousand
+    groups both cost real time, and neither appears in the number the planner
+    chose an engine with.
+
+    The fix must be a *sum* of per-operation costs, not a fused estimate. The
+    executor dispatches one node at a time - ``_dispatch`` calls
+    ``engine.filter``, ``engine.group_by`` and ``engine.sort`` in sequence -
+    so there is no fusion to credit. Pricing the segment as a single
+    optimised query would claim an optimisation the runtime does not perform,
+    which is the same class of error as reporting a GPU that never ran.
+    """
+
+    def _model(self) -> CostModel:
+        """Distinct, large per-op costs, so mis-pricing is unmistakable."""
+        n = 1_000_000
+        store = CalibrationStore()
+        for op, seconds in (("filter", 1.0), ("groupby", 2.0), ("sort", 3.0)):
+            store.add_points([CalibrationPoint(op, "cpu", n, seconds)])
+        return CostModel(calibration=store, registry=CapabilityRegistry(),
+                         priors=Priors(startup_s=0.0))
+
+    def _segment(self):
+        from aar.ir import BinOp, Col, Lit, Node, NodeType, ScanSpec
+        from aar.planner import decompose_into_segments
+
+        scan = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="x.csv"))
+        scan.estimated_bytes = 1_000_000
+        filt = Node(NodeType.FILTER, inputs=[scan],
+                    predicate=BinOp(Col("v"), ">", Lit(1)))
+        filt.estimated_bytes = 500_000
+        proj = Node(NodeType.PROJECT, inputs=[filt], columns=("v", "g"))
+        proj.estimated_bytes = 400_000
+        filt2 = Node(NodeType.FILTER, inputs=[proj],
+                     predicate=BinOp(Col("g"), "!=", Lit("")))
+        filt2.estimated_bytes = 300_000
+        # A scan is a forced segment boundary, so the multi-op segment is the
+        # one *after* it. GroupBy is deliberately absent: its preferred device
+        # is the GPU, which would split the segment and defeat the fixture.
+        segments = decompose_into_segments(filt2)
+        multi = [s for s in segments if len(s.nodes) >= 3]
+        assert multi, (
+            f"fixture produced {[len(s.nodes) for s in segments]} nodes per "
+            f"segment; expected one with three")
+        return multi[0]
+
+    def test_a_multi_operation_segment_costs_more_than_its_last_node(self):
+        model = self._model()
+        segment = self._segment()
+
+        total, _ = model.segment_cost(segment, "arrow")
+        last_only, _ = model.node_cost(segment.nodes[-1], "arrow",
+                                       segment.nbytes)
+        assert total.compute_s > last_only.compute_s * 2, (
+            f"segment priced at {total.compute_s:.3f}s but its final node "
+            f"alone is {last_only.compute_s:.3f}s")
+
+    def test_each_operation_in_the_segment_is_accounted_for(self):
+        model = self._model()
+        segment = self._segment()
+        total, detail = model.segment_cost(segment, "arrow")
+
+        # The segment must cost the sum of its parts, each priced at the
+        # size that operation actually sees (500k, 400k, 300k) rather than
+        # at the whole segment.
+        expected = sum(model.compute_s(n, "arrow", n.estimated_bytes)[0]
+                       for n in segment.nodes)
+        assert total.compute_s == pytest.approx(expected, rel=1e-9)
+        assert detail, "the breakdown must say which operations it costed"
+
+    def test_each_operation_is_priced_at_its_own_size(self):
+        """The tail of a segment is cheaper because less data reaches it.
+
+        A group-by reducing a gigabyte to a thousand rows makes the sort
+        after it cheap. Billing every operation at the segment's output
+        size would over-price the tail and mis-rank engines on it.
+        """
+        model = self._model()
+        segment = self._segment()
+        detail = model.segment_cost(segment, "arrow")[1]
+        sizes = [n.estimated_bytes for n in segment.nodes]
+        assert sizes == sorted(sizes, reverse=True), sizes
+        # The first operation is billed on more data than the last, so it
+        # costs more; the detail has to show both.
+        times = [float(part.split()[1].rstrip("ms"))
+                 for part in detail.split("[")[1].split("]")[0].split(" + ")]
+        assert len(times) == len(segment.nodes)
+        assert times[0] > times[-1], times
+
+    def test_a_single_operation_segment_is_unchanged(self):
+        """One node in, one node priced: no regression on the simple case."""
+        from aar.ir import Node, NodeType, ScanSpec
+        from aar.planner import decompose_into_segments
+
+        model = self._model()
+        scan = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="x.csv"))
+        scan.estimated_bytes = 1_000_000
+        segment = decompose_into_segments(scan)[0]
+        total, _ = model.segment_cost(segment, "arrow")
+        single, _ = model.node_cost(segment.nodes[-1], "arrow",
+                                    segment.nbytes)
+        assert total.compute_s == pytest.approx(single.compute_s, rel=1e-9)
+
+    def test_the_detail_names_the_operations_it_summed(self):
+        model = self._model()
+        _, detail = model.segment_cost(self._segment(), "arrow")
+        assert "filter" in detail
+        assert "3 ops" in detail
+
+
 class TestOperationMapping:
     @pytest.mark.parametrize("node_type,op", [
         (NodeType.GROUPBY, "groupby"),
