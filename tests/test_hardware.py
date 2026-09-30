@@ -28,6 +28,130 @@ class TestByteHelpers:
         assert human_bytes(1_500_000_000) == "1.5GB"
 
 
+class TestDarwinMemoryFallback:
+    """The no-psutil Darwin path, which is otherwise untestable on Linux.
+
+    Two CI macOS jobs failed with PlanInfeasible on pipelines needing only
+    ~40 MB. The cause was here: without psutil, ``probe_memory`` took
+    ``Pages free`` from ``vm_stat`` as the available total. That counter
+    excludes the file cache, so a healthy 7 GB Mac reports a few hundred MB
+    free, and admitting against 80% of that refuses ordinary work.
+
+    Adding psutil to ``[dev]`` would have turned CI green and left every real
+    user on macOS without psutil still hitting it, so the stdlib path is
+    fixed and tested directly against a recorded sample.
+    """
+
+    #: Recorded from a 7 GB Intel Mac, macOS 14, the shape GitHub's ARM
+    #: runner produces as well. Verbatim, including the period after each
+    #: count, which is why the parser strips it.
+    SAMPLE = """\
+Mach Virtual Memory Statistics: (page size of 4096 bytes)
+Pages free:                               142896.
+Pages active:                            396288.
+Pages inactive:                          358912.
+Pages speculative:                        18104.
+Pages throttled:                              0.
+Pages wired down:                        228544.
+Pages purgeable:                          11520.
+"Translation faults":                  88214560.
+Pages copy-on-write:                    1184232.
+Pages zero filled:                     18057344.
+Pages reactivated:                       4421096.
+Pages purged:                            1289416.
+File-backed pages:                       301056.
+Anonymous pages:                        302976.
+Pages stored in compressor:              150528.
+Pages occupied by compressor:            150528.
+Decompressions:                          2150400.
+Compressions:                            5146240.
+Pageins:                                1189872.
+Pageouts:                                 20864.
+Swapins:                                      0.
+Swapouts:                                     0.
+"""
+
+    def test_a_healthy_mac_reports_a_plausible_fraction_of_its_ram(self):
+        available = detect.parse_darwin_vm_stat(self.SAMPLE)
+
+        free_only = 142896 * 4096
+        assert available is not None
+        assert available > free_only * 3, (
+            "available memory must include the reclaimable caches, not just "
+            "untouched pages; this is the bug that failed two CI jobs")
+        # 7 GB machine: the reclaimable pools should land in the high
+        # hundreds of MB, not the tens.
+        assert 200e6 < available < 7e9, available
+
+    def test_it_sums_each_reclaimable_pool_exactly_once(self):
+        # free + inactive + purgeable, no speculative, no file-backed, and
+        # nothing that is in use right now.
+        expected = (142896 + 358912 + 11520) * 4096
+        assert detect.parse_darwin_vm_stat(self.SAMPLE) == expected
+
+    def test_in_use_memory_is_never_counted_as_available(self):
+        """The point of the whole exercise.
+
+        Counting `active` would let the planner admit a workload that then
+        gets OOM-killed, so this pins the exclusion rather than trusting it.
+        """
+        available = detect.parse_darwin_vm_stat(self.SAMPLE)
+        for counter in ("Pages active", "Pages wired down",
+                         "Pages occupied by compressor"):
+            pages = int(
+                [ln for ln in self.SAMPLE.splitlines()
+                 if ln.startswith(counter)][0].split(":")[1].strip().rstrip("."))
+            assert pages * 4096 < available, counter
+
+    def test_unparseable_output_falls_back_rather_than_throwing(self):
+        assert detect.parse_darwin_vm_stat("") is None
+        assert detect.parse_darwin_vm_stat("garbage from a different OS") is None
+
+    def test_the_page_size_is_read_from_the_header(self):
+        scaled = self.SAMPLE.replace("page size of 4096 bytes",
+                                     "page size of 16384 bytes")
+        assert detect.parse_darwin_vm_stat(scaled) == (
+            detect.parse_darwin_vm_stat(self.SAMPLE) * 4)
+
+    def test_a_pipeline_needing_40mb_would_now_be_admitted(self):
+        """The end-to-end symptom, as a regression test.
+
+        Reproduces the shape of the CI failure without needing a Mac.
+
+        The figure that matters is not the one in SAMPLE above. A 7 GB Mac
+        with 142896 free pages still has ~585 MB free, which would admit a
+        40 MB pipeline and hide the bug entirely. The failure needs a machine
+        that is actually *busy* - which every CI runner is, since it is
+        running a build while the tests run. There, ``Pages free`` sits in the
+        low thousands of pages (tens of MB) and admitting against 80% of that
+        refuses ordinary work.
+        """
+        from aar.hardware.detect import MemoryInfo
+
+        # A loaded runner: same machine, caches long since allocated.
+        loaded_free_pages = 6321
+        broken = MemoryInfo(total_bytes=7_000_000_000,
+                            available_bytes=loaded_free_pages * 4096)
+        healthy = MemoryInfo(
+            total_bytes=7_000_000_000,
+            available_bytes=detect.parse_darwin_vm_stat(self.SAMPLE))
+
+        peak = 40_000_000
+        headroom = peak * 1.25  # the planner's admission multiplier
+        assert headroom > broken.available_bytes * 0.8, (
+            "precondition: the old figures really do reject a 40 MB "
+            "pipeline, which is what CI reported")
+        assert headroom <= healthy.available_bytes * 0.8, (
+            "the corrected figures must admit it")
+
+        # And the gap is far larger than a tuning difference could explain.
+        ratio = healthy.available_bytes / broken.available_bytes
+        assert ratio > 50, (
+            f"the old figures understate a busy machine's reclaimable memory "
+            f"by roughly {ratio:.0f}x, which is a wrong formula rather than "
+            f"a margin to be tuned")
+
+
 class TestProbes:
     """Every probe must return a usable object, never raise."""
 

@@ -4,8 +4,76 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 788 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 796 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 22 — two CI gaps, both from guessing instead of measuring
+
+CI came back 4/6: macOS 3.11 and 3.12 failed, Linux and Windows passed. Both
+failures were the same class of mistake I made in Rounds 20 and 21 — a check
+that could not fail — so this round is mostly about the two places I was
+writing a plausible answer rather than a verified one.
+
+#### 1. macOS rejected 40 MB pipelines because it measured the wrong memory
+
+Without `psutil`, `probe_memory` read `Pages free` from `vm_stat` and used it
+as `available_bytes`. That counter is only memory that has *never been
+touched*. On a busy runner it sits in the low thousands of pages, so a 7 GB Mac
+reported ~26 MB available, and admitting against 80% of that refused ordinary
+work.
+
+Adding `psutil` to `[dev]` would have made CI green and left every real macOS
+user without `psutil` still hitting it. The stdlib path is fixed instead, by
+summing the pools the kernel can actually hand out: free, inactive, purgeable.
+`active`, `wired` and compressor pages are excluded on purpose — counting
+in-use memory would let the planner admit a workload that then gets OOM-killed,
+which is the failure this number exists to prevent.
+
+**I got the formula wrong first, and nearly shipped a comment that
+contradicted my own code.** I summed `file-backed` and `speculative` while
+writing a comment saying they double-count. Rather than keep guessing at
+counter semantics, I checked psutil's own macOS implementation: it uses
+`inactive + free`, and it *subtracts* speculative precisely because the
+kernel's `free_count` already contains it. The final formula now matches, so
+the two paths agree instead of drifting apart. Each exclusion is commented
+with its reason.
+
+The test runs on Linux, against a recorded macOS 14 `vm_stat` sample, and
+asserts the exact arithmetic and the in-use exclusions.
+
+**One test assertion was itself wrong before the fix was.** I wrote the
+end-to-end case using the recorded sample's own free-page count, and the
+precondition failed — correctly. 142896 free pages is 585 MB, which *would*
+admit a 40 MB pipeline and hide the bug. The failure needs a machine that is
+actually busy, which every CI runner is. The test now uses a loaded-runner
+figure, and asserts the ~81× ratio it finds rather than the 100× I guessed.
+
+#### 2. The JavaScript gate now asks a parser, not a pattern
+
+Round 20 added a dangling-operator check that passed on a file the browser
+still could not parse. The structural tests inspect *text*; the property that
+matters is whether the text is valid JavaScript. `const x = ;` would pass
+every one of them.
+
+```text
+node --check src/aar/workbench/static/app.js
+```
+
+is now a CI step on all six jobs, and a pytest test that skips when Node is
+absent. The structural tests stay — they give a better failure message than
+a line number, and they run without Node.
+
+A third test feeds Node the exact errors the structural tests miss and
+requires it to reject them. A gate that has only ever seen a good file has
+not been shown to work.
+
+**Node is not installed on this machine, so both Node tests skip locally and
+run in CI.** I have not executed them.
+
+785 passed, 11 skipped, 0 failed; ruff clean. Next: semantic operation
+identity, then persistent predicted-vs-actual measurements.
 
 ---
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
+import subprocess
 import urllib.error
 import urllib.request
 
@@ -299,9 +301,14 @@ class TestAccessibilityClaims:
 
         Every existing Workbench test passed while this was true, because
         they all exercise the HTTP layer and never the client's ability to
-        parse. So this asserts the structural properties that a truncation
-        violates: no function left open, and no line ending in an operator
-        that has nothing to continue it.
+        parse.
+
+        **These are heuristics, not a parse.** They catch the shapes seen so
+        far - a truncated expression, a function left open, an orphaned
+        fragment. They cannot catch ``const x = ;``, which no amount of
+        counting would notice. :meth:`test_node_parses_the_client` is the real
+        gate; this one stays because it runs without Node and its failure
+        messages are far more specific than a line number.
         """
         source = self._client_source()
         lines = source.splitlines()
@@ -334,6 +341,56 @@ class TestAccessibilityClaims:
             f"{dangling}")
 
         assert source.count("(") == source.count(")"), "unbalanced parentheses"
+
+    def test_node_parses_the_client(self):
+        """The acceptance test for "the browser can run this", literally.
+
+        Every Python check in this file inspects *text*. None of them asks
+        whether the text is valid JavaScript, which is the property that
+        actually matters: a syntax error anywhere makes the browser discard
+        the whole script, so the Workbench is not degraded, it is dead, and
+        no HTTP or API assertion notices.
+
+        Two rounds of structural guessing were not enough. Round 20 added a
+        dangling-operator check that passed on a file the browser still could
+        not parse. So the gate is now the actual parser.
+
+        Skipped when Node is absent, since AAR's runtime dependencies are
+        Python-only and a contributor without Node should still be able to
+        run the suite. CI runs this on all six jobs, where Node is always
+        present, so it is enforced rather than merely available.
+        """
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed; structural checks still apply")
+
+        result = subprocess.run(
+            [node, "--check", os.path.join(STATIC, "app.js")],
+            capture_output=True, text=True, timeout=60,
+        )
+        assert result.returncode == 0, (
+            "app.js is not valid JavaScript, so the browser discards it and "
+            f"the Workbench is inert:\n{result.stdout}{result.stderr}")
+
+    def test_node_rejects_the_shape_that_motivated_this(self):
+        """Prove the gate above can actually fail.
+
+        A test that calls `node --check` on a file we know is fine only shows
+        that Node runs. The question worth asking is whether it would notice
+        a broken file, so this feeds Node a script containing precisely the
+        errors the structural tests miss.
+        """
+        node = shutil.which("node")
+        if not node:
+            pytest.skip("node is not installed")
+
+        for broken in ("const x = ;", "function f() {", "if (a) { } }"):
+            result = subprocess.run(
+                [node, "--check", "-"], input=broken,
+                capture_output=True, text=True, timeout=60,
+            )
+            assert result.returncode != 0, (
+                f"node --check accepted invalid JavaScript: {broken!r}")
 
     def test_the_client_brace_balance_ignores_template_literals(self):
         """A stray ``}`` after the last declaration breaks the whole file.

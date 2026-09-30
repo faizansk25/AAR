@@ -67,6 +67,16 @@ jobs:
       - name: Verify every module parses
         run: python tools/check_syntax.py
 
+      # The client is JavaScript, so no Python check can vouch for it. A
+      # syntax error here does not degrade the Workbench, it kills it: the
+      # browser discards the whole script and no listener is ever bound.
+      # Two rounds of Python-side structural checks passed while the file
+      # was still unparseable, which is why this asks the real parser. It
+      # is a separate step so the failure reads "the client is not valid
+      # JavaScript" rather than being buried in the pytest tail.
+      - name: Check the client parses as JavaScript
+        run: node --check src/aar/workbench/static/app.js
+
       # The count assertion inside the suite compares the README against
       # what pytest collects *in this environment*. Installing `.[dev]`
       # rather than a hand-picked list is what keeps that number stable -

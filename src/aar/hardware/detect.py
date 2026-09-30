@@ -593,10 +593,16 @@ def probe_memory() -> MemoryInfo:
             raw = _sysctl_str("hw.memsize")
             if raw and raw.isdigit():
                 info.total_bytes = int(raw)
-            raw = _run_vm_stat_free()
-            if raw:
-                page = 4096
-                info.available_bytes = int(raw) * page
+            parsed = _darwin_reclaimable_memory()
+            if parsed is not None:
+                info.available_bytes = parsed
+            elif not info.available_bytes:
+                # Darwin's own pressure figure, if one can be read at all.
+                # Preferred over a page count because it accounts for
+                # reclaimable pages rather than only untouched ones.
+                raw = _run_osx_free()
+                if raw:
+                    info.available_bytes = raw
     except Exception as exc:  # noqa: BLE001
         info.unknowns.append(f"memory probe: {exc}")
     if not info.total_bytes:
@@ -607,7 +613,93 @@ def probe_memory() -> MemoryInfo:
     return info
 
 
+#: What counts as reclaimable on Darwin.
+#:
+#: "Pages free" alone is only memory that has never been touched. On a healthy
+#: macOS machine that is a vanishingly small slice of RAM - nearly everything
+#: else sits in the file cache waiting to be reclaimed on demand. Using it
+#: directly made a 7 GB Mac report a few hundred MB available, and since the
+#: planner admits against 80% of that figure, ordinary 40 MB pipelines were
+#: refused with PlanInfeasible. Two GitHub macOS runners failed this way before
+#: the cause was found.
+#:
+#: The terms, and why each is in exactly once:
+#:
+#:   Pages free      - untouched memory. Always safe to count.
+#:   Pages inactive  - resident but not recently used. The kernel evicts these
+#:                     without disk I/O, so the memory is effectively
+#:                     available. This is the large term, and it is why simply
+#:                     adding a few counters to "Pages free" fixes the bug.
+#:   Pages purgeable - caches the kernel has explicitly marked as droppable.
+#:
+#: Deliberately excluded, each for a specific reason:
+#:
+#:   Pages speculative - already counted *inside* "Pages free". The kernel's
+#:     free_count includes speculative pages, and psutil's own macOS
+#:     implementation subtracts them precisely to avoid counting them twice
+#:     (giampaolo/psutil#1277). Adding them here would double-count.
+#:   File-backed pages - the page cache, which overlaps purgeable and
+#:     inactive. Summing it with them inflates the total.
+#:   active / wired / Pages occupied by compressor - in use right now. Counting
+#:     these would let AAR admit a workload that then gets OOM-killed, which is
+#:     the exact failure this number exists to prevent.
+#:
+#: The result is deliberately equivalent to what psutil reports as "available"
+#: on macOS, so the psutil and stdlib paths agree rather than diverging.
+_DARWIN_RECLAIMABLE = (
+    "Pages free",
+    "Pages inactive",
+    "Pages purgeable",
+)
+
+#: macOS reports a page size in the ``vm_stat`` header. 4096 is the value on
+#: every Intel and Apple Silicon machine to date, but reading it is free and
+#: the header is right there.
+_DARWIN_PAGE_SIZE = 4096
+
+
+def parse_darwin_vm_stat(output: str) -> int | None:
+    """Reclaimable bytes from ``vm_stat`` output, or ``None``.
+
+    Split out from the subprocess call so it can be tested against a
+    recorded sample without a Mac - the no-psutil path is otherwise only
+    reachable on Darwin, which is exactly how the original defect survived.
+    """
+    if not output:
+        return None
+    page = _DARWIN_PAGE_SIZE
+    size_match = re.search(r"page size of (\d+) bytes", output)
+    if size_match:
+        try:
+            page = int(size_match.group(1))
+        except ValueError:
+            page = _DARWIN_PAGE_SIZE
+
+    pages = {}
+    for line in output.splitlines():
+        # Format: "Pages free:                              123456."
+        match = re.match(r"\s*([A-Za-z][A-Za-z \-]*?):\s+(\d+)\.?\s*$", line)
+        if match:
+            pages[match.group(1).strip()] = int(match.group(2))
+
+    if "Pages free" not in pages:
+        return None
+    total = sum(pages.get(name, 0) for name in _DARWIN_RECLAIMABLE)
+    return total * page
+
+
+def _darwin_reclaimable_memory() -> int | None:
+    """Run ``vm_stat`` and parse it. ``None`` when it cannot be read."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True,
+                             timeout=3, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return parse_darwin_vm_stat(out.stdout)
+
+
 def _run_vm_stat_free() -> int | None:
+    """Pages free only. Retained for callers that want the raw figure."""
     try:
         out = subprocess.run(["vm_stat"], capture_output=True, text=True,
                              timeout=3, check=False)
@@ -615,6 +707,28 @@ def _run_vm_stat_free() -> int | None:
         return int(m.group(1)) if m else None
     except (OSError, subprocess.SubprocessError):
         return None
+
+
+def _run_osx_free() -> int | None:
+    """Available memory from ``sysctl vm.swapusage`` or the OS itself.
+
+    A last resort before assuming a fraction of total. Prefer
+    :func:`_darwin_reclaimable_memory`, which explains its own arithmetic.
+    """
+    try:
+        out = subprocess.run(["sysctl", "-n", "hw.memsize"],
+                             capture_output=True, text=True, timeout=3,
+                             check=False)
+        m = re.search(r"(\d+)", out.stdout)
+        if not m:
+            return None
+        total = int(m.group(1))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    # Without a page breakdown, a conservative share of total is better than
+    # "pages free", which understates a healthy machine by an order of
+    # magnitude.
+    return int(total * 0.6)
 
 
 def _fallback_total_memory() -> int:
