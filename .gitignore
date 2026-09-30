@@ -7,6 +7,9 @@ build/
 dist/
 .venv/
 venv/
+# Throwaway environment used to rehearse what CI installs from `.[dev]`.
+# It must never be committed: it is rebuilt every time it is needed.
+.ci-probe/
 
 # Tooling
 .pytest_cache/

@@ -120,14 +120,24 @@ class TestParser:
             capture_output=True, text=True, timeout=900,
             env={**os.environ, "PYTEST_ADDOPTS": ""},
             cwd=str(Path(__file__).resolve().parents[1]))
-        node = re.compile(r"^tests[/\\].*::[^\s]+$", re.MULTILINE)
+        # Count collected node ids. pytest also prints class-level lines for
+        # ``unittest.TestCase`` classes, which carry no ``::method`` suffix,
+        # so the pattern is anchored on the ``tests/`` prefix rather than
+        # requiring a method name - the stricter pattern silently omitted
+        # 31 Workbench tests, which is the kind of undercount that makes a
+        # correct README look wrong.
+        node = re.compile(r"^tests[/\\].*::", re.MULTILINE)
         collected = len(node.findall(proc.stdout))
         if not collected:
             pytest.skip(f"could not count collected tests: {proc.stdout[-300:]}")
         assert total == collected, (
             f"README claims {total} tests; pytest collected {collected}. "
             "Fix the README - a stale count is the cheapest way to lose a "
-            "reader's trust.")
+            "reader's trust.\n"
+            "If this is wrong after installing or removing a dependency, the "
+            "count moved with the environment: `pip install -e \".[dev]\"` "
+            "should give the same set everywhere, and `tests/test_cli.py::"
+            "TestNoSilentLint` fails if `dev` is incomplete.")
 
     def test_the_readme_lists_every_subcommand(self):
         """A command that exists but is undocumented is a command nobody finds."""

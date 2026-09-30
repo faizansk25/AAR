@@ -14,8 +14,12 @@ on:
 permissions:
   contents: read
 
+# One run per ref, newest wins. Without this every push queues another full
+# six-job matrix, so a burst of commits produces a burst of failure emails
+# for runs whose results nobody will ever read - and the stale ones keep
+# failing long after the fix has landed.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -24,9 +28,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     strategy:
+      # Every combination reports. With fail-fast the first failure cancels
+      # the rest, so one broken platform silently removes the evidence about
+      # the other two.
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        # Matches the versions declared in `classifiers`. Testing a version
+        # the package does not claim to support, or omitting one it does,
+        # are both ways for this matrix to stop meaning anything.
         python-version: ["3.11", "3.12"]
 
     steps:
@@ -37,6 +47,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
+          # Pins the cache to the manifest that defines the dependency set.
+          # Pointing this at a path that does not exist makes setup-python
+          # warn and skip caching, which is slower but not fatal.
           cache-dependency-path: pyproject.toml
 
       - name: Install AAR and its test dependencies
@@ -44,14 +57,20 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
-      # Lint is a separate gate from the tests, and the suite asserts it
-      # too (tests/test_cli.py::TestNoSilentLint), so a lint failure is
-      # caught before the slower matrix even starts.
+      # Lint runs first and on its own, so a lint failure is reported as
+      # "lint failed" rather than as a wall of test output. The suite also
+      # asserts lint (tests/test_cli.py::TestNoSilentLint), so a regression
+      # cannot slip through by skipping this step.
       - name: Lint
         run: python -m ruff check src tests
 
       - name: Verify every module parses
         run: python tools/check_syntax.py
 
+      # The count assertion inside the suite compares the README against
+      # what pytest collects *in this environment*. Installing `.[dev]`
+      # rather than a hand-picked list is what keeps that number stable -
+      # a missing dependency silently reduces the collected count, which
+      # then fails as if the README were stale.
       - name: Run the test suite
         run: python -m pytest tests -q --tb=short
