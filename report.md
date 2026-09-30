@@ -534,9 +534,10 @@ reader's trust, and this project shipped one for months.
 | `test_hardware.py` | 32 | Byte helpers, all 6 probes, profile facade, curve fitting, store round-trip, stale-profile rejection, **live calibration** |
 | `test_failures.py` | 20 | Full matrix coverage, error hierarchy, ledger semantics |
 | `test_ir.py` | 20 | Expressions incl. SQL-injection safety, node metadata, DAG ordering, cycle detection |
-| `test_planner.py` | 24 | Segment DP, transitions charged once, feasibility, explain output |
+| `test_planner.py` | 26 | Segment decomposition, transitions charged exactly once, feasibility, explain output |
+| `test_correctness_regressions.py` | 16 | **Defects that shipped with the suite green** — dedup, window frames, quality rules, trace integrity |
 | `test_cli.py` | 37 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `policy`, exit codes |
-| `test_runtime.py` | 125 | **Cross-engine agreement, interchange, connectors, executor, end to end** |
+| `test_runtime.py` | 153 | **Cross-engine agreement, interchange, connectors, executor, end to end** |
 | `test_governance.py` | 37 | Egress, sensitivity, RLS, CLS, masks, enforcement in a real run |
 | `test_lineage.py` | 28 | **Propagation into derived columns, source→aggregate→policy** |
 
@@ -925,10 +926,32 @@ streaming progress are not yet built.
    them; a data profiler that measures real statistics is not yet built. The
    executor does return observed row counts and elapsed times, so the history
    store can be wired to real measurements next.
-7. **One aggregate per output column.** The IR stores `tuple[Agg, ...]`, but
-   no engine has a representation for a column that is simultaneously a sum
-   and a count. The executor refuses that case with a clear message rather
-   than silently keeping the first aggregate.
+8. **The planner is greedy, not the dynamic program the documentation
+   describes.** Confirmed by reading `plan()`: it walks the segments once and
+   commits to the cheapest engine for each, given only the previous choice.
+   No cumulative states are kept and no path is reconstructed. A workload
+   where starting on the more expensive engine wins overall is planned
+   suboptimally. This is the one audit finding **not yet fixed** — it needs a
+   counterexample test before the DP is written, so that "it is optimal" is a
+   claim the suite can falsify rather than a description in prose. The
+   segment cost is also derived from each segment's *final* node, so a
+   multi-operation segment is priced from its last operation alone.
+9. **SQL/MongoDB scan dispatch was newly wired but is untested live.**
+   `SCAN_SQL` and `SCAN_MONGO` previously fell through to
+   `NotImplementedError`; they now route to `engine.read_scan`. SQLite is
+   covered end to end; PostgreSQL, MySQL and MongoDB still need live servers.
+10. **`SCAN_CONST` is declared but unimplemented.** It appears in the IR, the
+    capability registry and the cost model's operation map, but nothing
+    executes it. Named in `test_correctness_regressions.py` so the gap is
+    visible rather than discovered at run time.
+11. **Calibration still measures Arrow, not engines.** Curves are recorded
+    under the CPU device category regardless of which engine produced them, so
+    a single device-level curve cannot distinguish DuckDB from pandas. Engine
+    specific calibration is not built.
+12. **One aggregate per output column.** The IR stores `tuple[Agg, ...]`, but
+    no engine has a representation for a column that is simultaneously a sum
+    and a count. The executor refuses that case with a clear message rather
+    than silently keeping the first aggregate.
 
 ---
 
