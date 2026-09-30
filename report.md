@@ -4,8 +4,74 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 730 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 737 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 14 — audit follow-up: embedded newlines, and a branch for review
+
+The second audit accepted the Round 13 findings and asked two things: verify
+the profiler's physical resource bounds, and check whether the head+midpoint
+sampling assumption holds. It also recommended pushing to a branch so the
+work could be verified independently.
+
+**Branch `audit/profiler-and-window-fixes` is pushed**, two commits ahead of
+`main` (`c61ff98`):
+
+- `8207264` — bounded profiler, RANK/DENSE_RANK, classification propagation,
+  profile-before-planning, distinct estimator, Parquet row groups, SQLite.
+- `6947e30` — embedded newlines in CSV (below).
+
+`main` is deliberately untouched so the reviewer can diff cleanly.
+
+#### The embedded-newline check found a crash, not just a bias
+
+The audit raised a specific technical point: counting newlines to measure
+record width assumes one newline per record, which is false for quoted
+fields. That is correct, and the consequences were worse than a bad estimate:
+
+1. **The reader raised `ArrowInvalid`** — "CSV parser got out of sync with
+   chunker" — from inside the C++ reader, because `profile_csv` opened the
+   file with default options. A multi-line text export is an ordinary file.
+   The pipeline survived only because `profile_node` catches broadly;
+   nothing *guaranteed* that, and profiling must never be what fails a run
+   over a file that reads fine. Fixed with
+   `ParseOptions(newlines_in_values=True)` — on `ParseOptions`, not
+   `ConvertOptions`, which is an easy place to guess wrong.
+
+2. **The row estimate doubled.** `_per_row_of` divided a block's length by
+   its newline count. On a 1,000-row file with a newline in every row:
+   18,898 bytes over 2,000 newlines = 9.4 bytes/row, so the file was
+   reported as **2,000 rows instead of 1,000**. Record boundaries are now
+   counted by tracking quote state, with `""` treated as an escaped quote
+   that does not end the run. That file now estimates **1,001 against a true
+   1,000 — 0.1% error**.
+
+#### On the two sampling objections
+
+Both are accepted as real limitations, and neither is papered over:
+
+- *Head+midpoint is not universally representative.* True — a file whose
+  record width jumps in its final third is still mis-estimated. This is a
+  property of two-point sampling, not a bug to fix here; the honest
+  mitigation is a larger sample budget, and the profile already reports
+  `exact_rows=False` so a plan never presents the figure as a measurement.
+- *Retained rows vs physical bytes.* The profiler now bounds both
+  independently (`sample_rows` and `max_bytes`), and `_ByteCappedFile`
+  records `bytes_read` so the real cost is observable rather than assumed.
+  A single cardinality estimate is still used everywhere; splitting it into
+  expected/lower/upper bounds is a real improvement and is *not* done yet.
+
+**Full suite: 737 passed, 7 skipped, 0 failed. ruff clean.** The NYC taxi
+Parquet profile is unchanged at 3,627,882 rows / 55,682,369 bytes.
+
+#### Still open, in the order the audit recommends
+
+Transfer accounting and memory feasibility **before** the optimizer — a
+better search over wrong cost estimates still picks the wrong plan. The
+20,000-combination ceiling, scheduler resource controls, the Workbench
+security boundary and persistent estimation history remain untouched.
 
 ---
 
