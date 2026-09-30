@@ -59,6 +59,36 @@ def _install_kernels() -> None:
 class ArrowEngine(Engine):
     """Executes directly against Arrow, with no third-party engine."""
 
+    #: Read block size, shared with the profiler. Large enough that a single
+    #: field cannot straddle two block boundaries: at 8 KB a 200 KB text
+    #: column raised ``ArrowInvalid: straddling object straddles two block
+    #: boundaries`` from the reader, so an ordinary wide column - a
+    #: description, a JSON blob, a base64 field - made execution fail
+    #: outright. 1 MB costs nothing when unused and removes a class of hard
+    #: failures.
+    CSV_BLOCK_SIZE = 1 << 20
+
+    @staticmethod
+    def csv_read_options(delimiter: str | None = None):
+        """``(ParseOptions, ReadOptions)`` shared by CSV profiling and reading.
+
+        ``newlines_in_values`` is required for correctness, not tolerance.
+        CSV permits a quoted field to contain a literal newline - every
+        export of a multi-line text field has one - and without this the
+        parser raises ``ArrowInvalid: got out of sync with chunker`` from
+        inside the C++ reader.
+
+        The profiler enabled it and execution did not, so a file could be
+        measured successfully and then fail on the very same read.
+        """
+        import pyarrow.csv as pacsv
+
+        parse = pacsv.ParseOptions(delimiter=delimiter or ",",
+                                   newlines_in_values=True)
+        read = pacsv.ReadOptions(encoding="utf-8",
+                                 block_size=ArrowEngine.CSV_BLOCK_SIZE)
+        return parse, read
+
     id = "arrow"
     device = Device.CPU
 
@@ -94,11 +124,26 @@ class ArrowEngine(Engine):
 
         A SQLite path needs no server, so this path is exercised against a
         real database in the test suite rather than against a stub.
+
+        The connection is resolved with the *same* helper the profiler uses.
+        It used to read ``spec.path`` directly, which the SQL SDK never
+        sets - it sets ``connection`` - so every ``sdk.sql()`` pipeline
+        silently connected to ``:memory:``, found no table, and failed with
+        an "OperationalError: no such table" that pointed at the database
+        rather than at the field name. One helper, one answer, so a source
+        cannot be profiled against one database and executed against
+        another.
         """
         from ..connectors.sql import sqlite_connector
+        from ..sources import resolve_sql_connection
 
         spec = node.scan
-        connector = sqlite_connector(spec.path or ":memory:")
+        connection = resolve_sql_connection(spec)
+        if not connection:
+            raise SourceUnavailable(
+                "SQL scan has no resolvable connection: set `connection` "
+                "(a DSN or SQLite file) on the scan spec", path="")
+        connector = sqlite_connector(connection)
         try:
             return connector.read(node)
         finally:
@@ -132,8 +177,12 @@ class ArrowEngine(Engine):
 
         if not path or not os.path.exists(path):
             raise SourceUnavailable(f"no such CSV file: {path}", path=str(path))
-        parse = pacsv.ParseOptions(delimiter=delimiter or ",")
-        read = pacsv.ReadOptions(encoding="utf-8")
+        # The shared parse options, not a private copy. The profiler enables
+        # ``newlines_in_values`` so a quoted field containing a newline can
+        # be profiled; if execution did not, the same file would profile
+        # cleanly and then fail at read time, which is the worst way for the
+        # two halves to disagree.
+        parse, read = self.csv_read_options(delimiter)
         table = pacsv.read_csv(path, parse_options=parse, read_options=read)
         if columns:
             table = table.select(list(columns))

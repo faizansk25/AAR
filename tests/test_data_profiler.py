@@ -762,6 +762,312 @@ class TestDistinctUsesTheApproximateAnswer:
         assert 40_000 < big.estimate() < 60_000
 
 
+class TestProfilingAndExecutionAgree:
+    """The profiler and the executor resolved the same spec differently.
+
+    The Arrow engine read ``spec.path`` for a SQL scan and fell back to
+    ``:memory:`` when it was empty - but the SQL SDK sets ``connection`` and
+    never ``path``. Every ``sdk.sql()`` pipeline therefore connected to an
+    empty in-memory database and died with "no such table", an error that
+    blamed the database rather than the field name. The same split existed
+    for CSV: the profiler accepted embedded newlines and the reader did not,
+    so a file could be measured successfully and then fail on the very same
+    read.
+
+    One definition each, in :mod:`aar.sources`, imported by both halves.
+    """
+
+    def _database(self, tmp_path, rows: int = 25):
+        import sqlite3
+
+        path = str(tmp_path / "source.db")
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("CREATE TABLE trips (id INTEGER PRIMARY KEY, v TEXT)")
+            conn.executemany("INSERT INTO trips (v) VALUES (?)",
+                             [(f"row{i}",) for i in range(rows)])
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_a_sql_pipeline_built_by_the_sdk_actually_executes(self, tmp_path):
+        """The headline defect: profile one database, read another."""
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.sdk import pipeline as sdk
+
+        path = self._database(tmp_path, rows=25)
+        out = ArrowEngine().read_scan(sdk.sql(path, table="trips"))
+
+        assert out.num_rows == 25
+        assert "row0" in out.column("v").to_pylist()
+
+    def test_both_halves_resolve_the_same_connection(self, tmp_path):
+        from aar.sdk import pipeline as sdk
+        from aar.sources import resolve_sql_connection, sql_file_path
+
+        path = self._database(tmp_path, rows=5)
+        spec = sdk.sql(path, table="trips").scan
+
+        assert resolve_sql_connection(spec) == path
+        assert sql_file_path(spec.connection) == path
+        # The spec really does carry no ``path`` for the old
+        # ``spec.path or ":memory:"`` expression to read.
+        assert getattr(spec, "path", None) is None
+
+    def test_an_unresolvable_connection_refuses_rather_than_defaulting(self):
+        """Defaulting to ``:memory:`` turns a typo into a wrong answer."""
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.ir import Node, NodeType, ScanSpec
+
+        spec = ScanSpec(kind="sql", table_name="anything")
+        with pytest.raises(Exception) as caught:
+            ArrowEngine().read_scan(Node(NodeType.SCAN_SQL, scan=spec))
+        assert "connection" in str(caught.value).lower()
+
+
+    def test_a_csv_file_that_profiles_also_reads(self, tmp_path):
+        """Embedded newlines: the profiler accepts them, so execution must.
+
+        Same file, both halves, no configuration drift.
+        """
+        import csv as csv_mod
+
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = tmp_path / "multiline.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv_mod.writer(handle)
+            writer.writerow(["v", "note"])
+            for i in range(10):
+                writer.writerow([i, "first\nsecond"])
+
+        assert DataProfiler().profile_csv(str(path)) is not None
+        out = ArrowEngine().read_scan(sdk.csv(str(path)))
+        assert out.num_rows == 10
+        assert "first\nsecond" in out.column("note").to_pylist()
+
+    def test_a_custom_delimiter_is_honoured_by_both_halves(self, tmp_path):
+        import csv as csv_mod
+
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.sources import csv_read_options
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = tmp_path / "semi.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv_mod.writer(handle, delimiter=";")
+            writer.writerow(["a", "b"])
+            for i in range(20):
+                writer.writerow([i, i * 2])
+
+        parse, _read = csv_read_options(";")
+        assert parse.delimiter == ";"
+
+        out = ArrowEngine().read_scan(sdk.csv(str(path), delimiter=";"))
+        assert out.num_rows == 20
+        assert list(out.column_names) == ["a", "b"]
+        assert DataProfiler().profile_csv(str(path)) is not None
+
+    def test_escaped_quotes_survive_both_halves(self, tmp_path):
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = tmp_path / "quoted.csv"
+        # Written in binary LF form: a text-mode write on Windows would
+        # translate the embedded newlines to CRLF, and then the assertion
+        # below would be testing the test's own line endings.
+        path.write_bytes(
+            b'v,note\n'
+            b'1,"she said ""hi"" loudly"\n'
+            b'2,"multi\nline with a quote "" here"\n'
+            b'3,plain\n')
+
+        assert DataProfiler().profile_csv(str(path)) is not None
+        notes = ArrowEngine().read_scan(sdk.csv(str(path))).column(
+            "note").to_pylist()
+        assert 'she said "hi" loudly' in notes
+        # The embedded newline survives as data, not as a record break.
+        assert any(n.startswith("multi") and "\n" in n for n in notes)
+        assert "plain" in notes
+
+    def test_a_record_wider_than_the_read_block_is_one_record(self, tmp_path):
+        """A field far wider than the read block is still a single record.
+
+        The profiler slices a sample, so one huge field must not make it
+        disagree with the reader about where records end.
+        """
+        import csv as csv_mod
+
+        from aar.engines.arrow_engine import ArrowEngine
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = tmp_path / "wide.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv_mod.writer(handle)
+            writer.writerow(["v", "blob"])
+            for i in range(5):
+                writer.writerow([i, "y" * 200_000])
+
+        out = ArrowEngine().read_scan(sdk.csv(str(path)))
+        assert out.num_rows == 5
+        assert len(out.column("blob").to_pylist()[0]) == 200_000
+        # The profiler declines rather than raising. A 200 KB field exceeds
+        # its read block, and it would be wrong for the profiler - which
+        # stops early and must stay bounded - to adopt the engine's 1 MB
+        # block just to parse this: that let one batch deliver 144,960 of
+        # 200,000 rows in an earlier attempt. Declining keeps the declared
+        # estimate, which is labelled as a guess, and the run proceeds.
+        assert DataProfiler(sample_rows=2).profile_csv(str(path)) is None
+
+
+class TestJsonProfilingIsBounded:
+    """``profile_json`` had the same unbounded read as CSV, plus a worse
+    fallback: on any parse failure it measured the file as CSV.
+
+    Measuring a JSON file as delimited text is not a conservative
+    approximation, it is a confidently wrong one - wrong column count, wrong
+    types, wrong row estimate - and the plan is built from all three.
+    """
+
+    def _jsonl(self, tmp_path, rows: int = 200_000) -> str:
+        import json
+
+        path = tmp_path / "big.jsonl"
+        with path.open("w", encoding="utf-8") as handle:
+            for i in range(rows):
+                handle.write(json.dumps({"v": i, "w": "x" * 8}) + "\n")
+        return str(path)
+
+    def test_only_the_configured_rows_are_read(self, tmp_path):
+        import pyarrow.json as pajson
+
+        from aar.stats import DataProfiler
+
+        path = self._jsonl(tmp_path, rows=200_000)
+        seen = {"rows": 0}
+        real_open = pajson.open_json
+
+        class _Counting:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def __iter__(self):
+                for batch in self._inner:
+                    seen["rows"] += batch.num_rows
+                    yield batch
+
+            def __enter__(self):
+                self._inner.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._inner.__exit__(*exc)
+
+        pajson.open_json = lambda *a, **kw: _Counting(real_open(*a, **kw))
+        try:
+            DataProfiler(sample_rows=1_000).profile_json(path)
+        finally:
+            pajson.open_json = real_open
+
+        assert seen["rows"] < 1_500, (
+            f"JSON profiling read {seen['rows']} of 200,000 rows for a "
+            f"1,000-row budget")
+
+    def test_a_malformed_json_file_is_not_measured_as_csv(self, tmp_path):
+        """The old fallback returned plausible nonsense, not an error."""
+        from aar.stats import DataProfiler
+
+        path = tmp_path / "broken.json"
+        path.write_text("{ not json at all ][\n" * 200, encoding="utf-8")
+
+        assert DataProfiler().profile_json(str(path)) is None
+
+    def test_an_unreadable_json_source_returns_none(self, tmp_path):
+        from aar.stats import DataProfiler
+
+        assert DataProfiler().profile_json(str(tmp_path / "missing.json")) is None
+
+    def test_a_real_json_file_is_profiled(self, tmp_path):
+        from aar.stats import DataProfiler
+
+        path = self._jsonl(tmp_path, rows=5_000)
+        profile = DataProfiler(sample_rows=500).profile_json(path)
+        assert profile is not None
+        assert profile.exact_rows is False
+        assert {c.name for c in profile.columns} == {"v", "w"}
+
+
+class TestSqlMemoryIsScaledFromTheSample:
+    """A sampled SQL table reported the sample's bytes as the whole table.
+
+    The row count came from ``COUNT(*)`` and the byte size from the sample,
+    and the two were attached together without correction. A 20,000-row
+    table sampled at 1,000 rows was reported as holding 20,000 rows and
+    32 KB - the size of the thousand rows actually read. A plan built on
+    that reserves a twentieth of the memory the query will need.
+    """
+
+    def _database(self, tmp_path, rows: int = 20_000):
+        import sqlite3
+
+        path = str(tmp_path / "sized.db")
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            conn.executemany("INSERT INTO t (v) VALUES (?)",
+                             [("x" * 20,) for _ in range(rows)])
+            conn.commit()
+        finally:
+            conn.close()
+        return path
+
+    def test_nbytes_is_scaled_to_the_whole_table(self, tmp_path):
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = self._database(tmp_path, rows=20_000)
+        profile = DataProfiler(sample_rows=1_000).profile_node(
+            sdk.sql(path, table="t"))
+
+        assert profile is not None
+        assert profile.rows == 20_000
+        assert profile.sampled_rows == 1_000
+        # The whole-table size is the sample's, scaled by the row ratio.
+        assert profile.nbytes == pytest.approx(
+            profile.sampled_nbytes * 20, rel=0.05)
+
+    def test_the_observed_sample_size_is_kept_separately(self, tmp_path):
+        """A caller must be able to see what was measured vs inferred."""
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = self._database(tmp_path, rows=20_000)
+        profile = DataProfiler(sample_rows=1_000).profile_node(
+            sdk.sql(path, table="t"))
+
+        assert profile.sampled_nbytes is not None
+        assert profile.sampled_nbytes < profile.nbytes
+        assert profile.source == "database-count"
+
+    def test_a_table_smaller_than_the_sample_is_not_scaled(self, tmp_path):
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        path = self._database(tmp_path, rows=100)
+        profile = DataProfiler(sample_rows=1_000).profile_node(
+            sdk.sql(path, table="t"))
+
+        assert profile.rows == 100
+        assert profile.sampled_nbytes is None
+        assert profile.nbytes > 0
+
+
 class TestCardinalityIsBounded:
     """Distinct counting must not become the memory problem it avoids."""
 

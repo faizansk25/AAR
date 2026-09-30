@@ -4,8 +4,74 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 737 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 751 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 15 — profiling and execution now resolve the same source
+
+A third audit raised four findings against `442cb79`. **All four were real**,
+and one was worse than "profile one database, execute against another":
+`ArrowEngine._read_sql` read `spec.path` and fell back to `":memory:"`, but
+the SDK sets `connection` and never `path`. So **every `sdk.sql()` pipeline
+failed outright** with `no such table` — an error that blamed the database
+instead of the field name. Verified before fixing:
+
+```
+spec.connection = C:\...\r.db     spec.path = None
+executed -> SourceUnavailable: sqlite rejected 'SELECT * FROM "t"'
+```
+
+Both halves now call `aar.sources.resolve_sql_connection` / `csv_read_options`.
+After the fix the same pipeline returns 10 real rows.
+
+| Finding | Fix |
+|---|---|
+| SQL execution read the wrong field | shared `resolve_sql_connection`; an unresolvable spec **refuses** rather than defaulting to `:memory:` |
+| JSON profiling unbounded + fell back to CSV | own capped streaming reader; malformed JSON returns `None`, never CSV statistics |
+| SQL size = sample bytes + full row count | `nbytes` scaled by the row ratio; `sampled_nbytes` / `sampled_rows` kept separately |
+| CSV profiled and read with different options | shared parse options; delimiter, embedded newlines, escaped quotes |
+
+#### Writing the tests found two more bugs
+
+The audit's CSV point — profiler and reader disagreeing — was real, and
+testing it end to end surfaced problems neither half had:
+
+- **A field wider than the read block failed execution.** At `block_size=8192`
+  a 200 KB column raised `ArrowInvalid: straddling object straddles two block
+  boundaries`. The engine's block is now 1 MB; measured, 1 MB reads it
+  cleanly and 8 KB does not.
+- **Giving the profiler the engine's block undid the original fix.** One batch
+  then delivered **144,960 of 200,000 rows** for a 500-row budget. The two
+  halves now share *parsing rules* but keep *separate read granularity*: the
+  engine reads a whole file, the profiler stops early and must stay bounded.
+  A file the profiler cannot parse is declined, not raised on.
+- `profile_csv` returned a **zero-row profile** for an unreadable file, which
+  is the one answer a missing measurement must never give. Now `None` — which
+  is what an existing test had been asserting all along at the `profile_node`
+  boundary, and the direct call had quietly disagreed with it.
+
+#### CI
+
+`.github/workflows/ci.yml` runs lint, a syntax check, and the suite on
+Python 3.11/3.12 across Linux, macOS and Windows. Three platforms on purpose:
+every failure fixed in Rounds 13–15 was platform-shaped — line endings, block
+sizes, CRLF inside quoted fields — and a single-platform run would have seen
+none of them. All three steps verified locally before being committed.
+
+**751 passed, 7 skipped, 0 failed; ruff clean.** NYC taxi Parquet unchanged:
+3,627,882 rows / 55,682,369 bytes.
+
+#### Not addressed, and why
+
+The **cardinality uncertainty bounds** the audit asks for are a real gap and
+are *not* implemented: `ColumnProfile` still carries a single point estimate,
+and a saturated half-table sample genuinely cannot separate a unique column
+from a half-distinct one. Adding expected/lower/upper means changing what
+callers consume, so it belongs with the memory-aware planning work rather
+than being bolted onto the profiler. Transfer accounting, peak-memory
+planning and the 20,000-combination ceiling remain open — in that order.
 
 ---
 

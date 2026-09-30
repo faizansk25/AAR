@@ -175,6 +175,13 @@ class TableProfile:
     #: How this was derived: ``parquet-metadata``, ``sampled``, ``measured``,
     #: ``database-stats`` or ``declared``. Never a silent default.
     source: str = "declared"
+    #: Bytes actually observed, when ``nbytes`` was scaled up from a sample
+    #: to the whole table. A 50,000-row sample of a 1,000,000-row table
+    #: gives the table's real size only by multiplication, and a caller
+    #: deciding whether to trust the plan needs to see which it is.
+    sampled_nbytes: int | None = None
+    #: Rows the sample actually held, for the same reason.
+    sampled_rows: int | None = None
 
     @property
     def bytes_per_row(self) -> float:
@@ -362,11 +369,23 @@ class DataProfiler:
         started, which is precisely the failure this method exists to
         prevent. See :meth:`_read_bounded_csv` for the row and byte limits.
         """
-        sample = self._read_bounded_csv(path)
+        try:
+            sample = self._read_bounded_csv(path)
+        except Exception:  # noqa: BLE001 - unreadable is not fatal
+            # PyArrow raises from inside its C++ reader for input the engine
+            # itself accepts at a different block size - a field wider than
+            # this reader's block, for instance. Profiling must not be
+            # stricter than the thing it measures: declining keeps the
+            # caller's declared estimate, a guess that says so, where
+            # raising fails a run over a file that reads perfectly well.
+            sample = None
         if sample is None or not sample.num_rows:
-            return TableProfile(name=str(path), rows=0, nbytes=0,
-                                exact_rows=False, source="sampled")
-
+            # A profile with zero rows is the dangerous answer: it would plan
+            # a trivially cheap pipeline over a file that was never read. The
+            # old code returned one, and a test asserted it. Returning None
+            # says "not measured", and the caller keeps its declared
+            # estimate - a guess that is labelled as a guess.
+            return None
         file_bytes = _file_size(path, 0)
         # Bytes-per-row comes from the *file's own text*, not from the
         # sample's in-memory footprint. `Table.nbytes` counts the Arrow
@@ -385,6 +404,14 @@ class DataProfiler:
 
     def _read_bounded_csv(self, path: str | None):
         """Read at most ``sample_rows`` rows *and* ``max_bytes`` of the file.
+
+        Declines (``None``) rather than raising on a file the reader cannot
+        parse. A field wider than the read block raises ``ArrowInvalid:
+        straddling object straddles two block boundaries`` from inside the
+        C++ reader, and the engine reads such a file happily at its larger
+        block size. Profiling must not be stricter than the thing it
+        measures: the caller keeps its declared estimate - a guess, honestly
+        labelled - rather than the run failing over it.
 
         Three separate limits are needed, because none of them implies the
         others - measured on this machine, pyarrow 25.0.1:
@@ -405,6 +432,8 @@ class DataProfiler:
         """
         import pyarrow as pa
         import pyarrow.csv as pacsv
+
+        from ..sources import csv_read_options
 
         want = self._sample_rows
         budget = self._max_bytes
@@ -428,10 +457,25 @@ class DataProfiler:
             # parser raises ``ArrowInvalid: got out of sync with chunker``
             # from inside the C++ reader. Profiling must never be the thing
             # that fails a run over a file that reads perfectly well.
+            #
+            # Parse options come from the engine so both halves agree on
+            # quoting and newlines, but the block size is deliberately
+            # *not* taken from there. The engine reads a whole file and
+            # needs a large block so one wide field cannot straddle two
+            # blocks; the profiler stops early, and a large block lets a
+            # single batch deliver most of the file - measured: 144,960
+            # rows of 200,000 for a 500-row budget, which is precisely the
+            # unbounded read this module exists to prevent.
+            #
+            # So: shared parsing rules, separate read granularity. A field
+            # wider than the profiler's block is caught by the byte cap and
+            # the plan falls back to the declared size - conservative, and
+            # not a failed run.
+            parse, _engine_read = csv_read_options()
             reader = pacsv.open_csv(
                 capped,
                 read_options=pacsv.ReadOptions(block_size=8192),
-                parse_options=pacsv.ParseOptions(newlines_in_values=True))
+                parse_options=parse)
             for batch in reader:
                 collected.append(batch)
                 rows += batch.num_rows
@@ -443,22 +487,60 @@ class DataProfiler:
         return table.slice(0, want) if table.num_rows > want else table
 
     def profile_json(self, path: str | None) -> TableProfile:
-        """Sample the head of a JSON-lines file."""
-        import pyarrow as pa
-        import pyarrow.json as pajson
+        """Sample the head of a JSON-lines file, under the same byte cap.
 
-        try:
-            with pa.OSFile(path, "rb") as handle:  # type: ignore[arg-type]
-                sample = pajson.read_json(
-                    handle,
-                    read_options=pajson.ReadOptions(
-                        block_size=self._sample_rows * 64))
-        except Exception:  # noqa: BLE001 - fall back to CSV-style sampling
-            return self.profile_csv(path)
+        Two defects fixed here. ``read_json`` was given a ``block_size``
+        and no row budget, exactly the mistake already corrected for CSV -
+        so profiling a large JSON file could read all of it. And on any
+        parse failure it fell through to ``profile_csv``, measuring a JSON
+        file as though it were delimited text. That is not a conservative
+        fallback, it is a wrong answer delivered confidently: the
+        column count, the types, and the row estimate would all be
+        nonsense, and the plan is built from them.
+
+        An unreadable source now returns ``None`` so the caller keeps the
+        declared estimate, which is at least honest about being a guess.
+        """
+        sample = self._read_bounded_json(path)
+        if sample is None or not sample.num_rows:
+            return None
         profile = self.profile_table(sample, name=str(path))
         profile.source = "sampled"
         profile.exact_rows = False
         return profile
+
+    def _read_bounded_json(self, path: str | None):
+        """Read at most ``sample_rows`` JSON records, under ``max_bytes``.
+
+        Uses the same capped-stream trick as CSV: the byte budget is
+        enforced on the stream itself, because ``read_json``'s ``block_size``
+        is granularity rather than a limit - the same trap already paid for
+        once in ``_read_bounded_csv``.
+        """
+        import pyarrow as pa
+        import pyarrow.json as pajson
+
+        want = self._sample_rows
+        if not path or want <= 0 or self._max_bytes <= 0:
+            return None
+        try:
+            with _ByteCappedFile(path, self._max_bytes) as capped:
+                reader = pajson.open_json(
+                    capped,
+                    read_options=pajson.ReadOptions(block_size=8192))
+                collected = []
+                rows = 0
+                for batch in reader:
+                    collected.append(batch)
+                    rows += batch.num_rows
+                    if rows >= want:
+                        break
+        except Exception:  # noqa: BLE001 - an unreadable source is not fatal
+            return None
+        if not collected or not rows:
+            return None
+        table = pa.Table.from_batches(collected)
+        return table.slice(0, want) if table.num_rows > want else table
 
     def profile_excel(self, spec: Any) -> TableProfile:
         """Read a sheet through the Excel connector and profile it.
@@ -545,11 +627,21 @@ class DataProfiler:
         schema = Schema(tuple(
             Field(f.name, arrow_to_canonical(f.type)) for f in arrow.schema))
         table = Table(arrow, schema)
+        total_sample_rows = int(table.num_rows) or 1
         profile = self.profile_table(table, name=label)
         # The row count is exact - the database counted them - while the
-        # per-column statistics came from a bounded sample. Recording the
-        # count as exact and leaving the column figures as estimates is the
-        # honest split.
+        # per-column statistics and the byte size come from a bounded
+        # sample. Those have to be scaled separately, and confusing the two
+        # is the whole bug: the old code took the *sample's* byte count and
+        # attached the *table's* row count to it, so a 1,000,000-row table
+        # measured from a 50,000-row sample reported the sample's 4 MB as
+        # the whole table. A plan built on that would allocate a twentieth
+        # of the memory the query needs.
+        if total_sample_rows and rows > total_sample_rows:
+            scale = rows / total_sample_rows
+            profile.nbytes = int(profile.nbytes * scale)
+            profile.sampled_nbytes = int(table.nbytes)
+            profile.sampled_rows = total_sample_rows
         profile.rows = rows
         profile.source = "database-count"
         profile.exact_rows = True
@@ -921,12 +1013,19 @@ def _sqlite_stat_rows(spec: Any) -> int | None:
     never sets ``path``, so reading only ``path`` meant this always returned
     ``None`` for a scan created through the public API - every SQL pipeline
     silently fell back to reading the whole table just to count its rows.
-    The ``path`` lookup is kept as a fallback, but it is not the only route.
+
+    Resolution goes through :func:`aar.sources.resolve_sql_connection`, the
+    same helper the Arrow engine calls. The engine used to read ``spec.path``
+    and fall back to ``:memory:``, so a pipeline could be profiled against
+    the real database and executed against an empty one. Two consumers, one
+    answer, so they cannot drift apart again.
     """
     table = getattr(spec, "table", None) or getattr(spec, "table_name", None)
     if not table:
         return None
-    path = _sqlite_path_from_connection(getattr(spec, "connection", None)) \
+    from ..sources import sql_file_path
+
+    path = sql_file_path(getattr(spec, "connection", None)) \
         or getattr(spec, "path", None)
     if not path:
         return None
