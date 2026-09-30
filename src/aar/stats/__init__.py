@@ -421,8 +421,17 @@ class DataProfiler:
             # 200,000-row file, then nothing further) and the table is
             # sliced to the budget afterwards, so the *retained* sample is
             # exact even though the reader over-delivers by one batch.
+            #
+            # ``newlines_in_values`` is required, not an optimisation. A
+            # quoted field containing a newline is legal CSV and is what any
+            # export of a multi-line text field produces; without this the
+            # parser raises ``ArrowInvalid: got out of sync with chunker``
+            # from inside the C++ reader. Profiling must never be the thing
+            # that fails a run over a file that reads perfectly well.
             reader = pacsv.open_csv(
-                capped, read_options=pacsv.ReadOptions(block_size=8192))
+                capped,
+                read_options=pacsv.ReadOptions(block_size=8192),
+                parse_options=pacsv.ParseOptions(newlines_in_values=True))
             for batch in reader:
                 collected.append(batch)
                 rows += batch.num_rows
@@ -854,11 +863,43 @@ def _bytes_per_csv_row(path: str | None, block: int) -> float:
 
 
 def _per_row_of(chunk: bytes) -> float:
-    """Bytes per data row in one block, or 0.0 if it holds no full row."""
-    lines = chunk.count(b"\n")
-    if lines < 2:            # header plus at least one data row
+    """Bytes per data row in one block, or 0.0 if it holds no full row.
+
+    **A newline is only a record boundary outside a quoted field.** CSV
+    permits a quoted value to contain a literal newline - any export of a
+    multi-line text field produces one - and counting those as records
+    halves the apparent row width, which doubles the row estimate. Measured
+    on a 1,000-row file whose every row carried an embedded newline:
+    18,898 bytes over 2,000 counted newlines gives 9.4 bytes/row, so the
+    file was reported as holding 2,000 rows instead of 1,000.
+
+    The count therefore tracks quote state and only counts newlines seen
+    while outside quotes. ``""`` is an escaped quote and does not end the
+    quoted run, which is handled by advancing two characters.
+    """
+    records = _count_records(chunk)
+    if records < 1:
         return 0.0
-    return max(1.0, len(chunk) / (lines - 1))
+    return max(1.0, len(chunk) / records)
+
+
+def _count_records(chunk: bytes) -> int:
+    """Newlines in ``chunk`` that fall outside a quoted field."""
+    in_quotes = False
+    index = 0
+    newlines = 0
+    length = len(chunk)
+    while index < length:
+        char = chunk[index]
+        if char == 0x22:            # '"'
+            if in_quotes and index + 1 < length and chunk[index + 1] == 0x22:
+                index += 2          # escaped quote, still inside the value
+                continue
+            in_quotes = not in_quotes
+        elif char == 0x0A and not in_quotes:
+            newlines += 1
+        index += 1
+    return newlines
 
 
 def _file_size(path: str | None, fallback: int) -> int:

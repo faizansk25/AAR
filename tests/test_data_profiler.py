@@ -304,6 +304,133 @@ class TestProfilingIsActuallyBounded:
         assert profile.rows == pytest.approx(300_000, rel=0.10)
 
 
+class TestEmbeddedNewlinesInCsvFields:
+    """A quoted field containing a newline made profiling *crash*.
+
+    ``profile_csv`` opens the file with default PyArrow options, so a value
+    spanning lines raises ``ArrowInvalid: CSV parser got out of sync with
+    chunker``. That exception propagates out of ``profile_node``, which
+    returns ``None``, which is fine - but only because ``profile_node``
+    catches it. Any path that reaches the reader without that guard dies,
+    and a pipeline whose *source* contains an embedded newline is a
+    completely ordinary thing for a user to have.
+
+    The audit flagged this specifically: counting ``\\n`` to measure record
+    width assumes one newline per record, which is false for quoted fields.
+    The width estimate is derived from newline counts in
+    ``_bytes_per_csv_row``, so the same assumption sits in two places.
+    """
+
+    def _csv_with_embedded_newlines(self, tmp_path, rows: int = 1_000) -> str:
+        import csv
+
+        path = tmp_path / "embedded.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["v", "note"])
+            for i in range(rows):
+                # A quoted field holding a real newline - legal CSV, and what
+                # any export of a multi-line text field produces.
+                writer.writerow([i, "first line\nsecond line"])
+        return str(path)
+
+    def test_a_source_with_embedded_newlines_does_not_kill_planning(self, tmp_path):
+        from aar.application import PipelineService
+
+        data = self._csv_with_embedded_newlines(tmp_path)
+        pipeline = tmp_path / "pipe.py"
+        pipeline.write_text(
+            "from aar.sdk import pipeline as p\n"
+            f"src = p.csv(r'{data}')\n"
+            "\n"
+            "def build():\n"
+            "    return p.write_csv(p.filter_(src,"
+            " p.gt(p.col('v'), 0)),"
+            f" r'{tmp_path / 'out.csv'}')\n",
+            encoding="utf-8",
+        )
+
+        report = PipelineService().run(str(pipeline))
+        assert report.plan is not None
+
+    def test_profiling_returns_none_rather_than_raising(self, tmp_path):
+        from aar.sdk import pipeline as sdk
+        from aar.stats import DataProfiler
+
+        data = self._csv_with_embedded_newlines(tmp_path)
+        # Either it reads the file, or it declines cleanly. Raising is not an
+        # option: a source the profiler cannot read must not fail the run.
+        profile = DataProfiler().profile_node(sdk.csv(data))
+        assert profile is None or profile.rows >= 0
+
+    def test_the_reader_is_asked_to_accept_newlines_in_values(self, tmp_path):
+        """The fix is to tell PyArrow the file may contain them.
+
+        Asserted on the options the profiler actually builds, because the
+        failure mode is an exception thrown from inside the C++ reader -
+        invisible to a caller that only inspects the returned profile.
+        """
+        import pyarrow.csv as pacsv
+
+        from aar.stats import DataProfiler
+
+        captured = {}
+        real_open = pacsv.open_csv
+
+        def spy(path, **kwargs):
+            captured.update(kwargs)
+            return real_open(path, **kwargs)
+
+        data = self._csv_with_embedded_newlines(tmp_path, rows=50)
+        pacsv.open_csv = spy
+        try:
+            DataProfiler(sample_rows=20).profile_csv(data)
+        finally:
+            pacsv.open_csv = real_open
+
+        options = captured.get("parse_options")
+        assert options is not None, "the reader was built without options"
+        assert options.newlines_in_values is True, (
+            "newlines_in_values is not enabled, so a quoted field with a "
+            "newline makes the parser raise")
+
+    def test_record_width_is_not_derived_from_newline_counts_alone(self, tmp_path):
+        """A newline inside a quoted field is not a record boundary.
+
+        ``_bytes_per_csv_row`` divides a block's length by its newline
+        count, which over-counts records whenever a value spans lines and so
+        *under*-estimates bytes per row - inflating the row estimate.
+        """
+        import csv
+
+        from aar.stats import _bytes_per_csv_row
+
+        path = tmp_path / "nl_width.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(["v", "note"])
+            for i in range(1_000):
+                writer.writerow([i, "first line\nsecond line"])
+
+        import pyarrow.csv as pacsv
+
+        reader = pacsv.open_csv(path, parse_options=pacsv.ParseOptions(
+            newlines_in_values=True))
+        # Batches, not rows: this file is wider than the byte budget, so the
+        # count is capped by the reader and cannot be compared directly.
+        # The header plus 1,000 records is the truth we care about.
+        assert next(iter(reader)).num_rows >= 1
+
+        width = _bytes_per_csv_row(str(path), 65_536)
+        size = path.stat().st_size
+        estimated = size / width
+        # 1,000 records but 2,000 newlines: a newline-counting estimator
+        # sees half the record width and doubles the row count.
+        assert estimated == pytest.approx(1_000, rel=0.15), (
+            f"estimated {estimated:.0f} rows against a true 1,000 - "
+            f"embedded newlines are being counted as record boundaries")
+
+
 class TestProvenanceIsNeverHidden:
     """A guess must never be able to pose as a measurement."""
 
