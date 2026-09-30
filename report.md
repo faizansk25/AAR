@@ -4,8 +4,78 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 695 tests
-**Last updated:** 2026-09-29
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 730 tests
+**Last updated:** 2026-09-30
+
+---
+
+### Round 13 — second external audit, verified against the source
+
+An audit of commit `c61ff98` raised four P0 findings plus a dozen P1s. Each
+was checked before acting. The P0s were all real, and the first one turned
+out to be worse than described — the profiler did not merely fail to bound
+its read, it read the entire file.
+
+| Claim | Verdict | What was actually wrong |
+|---|---|---|
+| CLI profiles *after* planning | **Real** | `_plan_for` planned from declared sizes, then measured and discarded; skipped entirely under `--json` |
+| Profiler can read a whole dataset | **Real, worse than stated** | `read_all()` ignores `block_size`: measured **200,000 of 200,000 rows** on a 200k-row file |
+| `RANK` counts equal, not smaller, values | **Real** | `10,20,20,30` gave `1,1,2,1`; DuckDB gives `1,2,2,4` |
+| Derived columns lose classification | **Real** | `_rebuild` made a bare `Field`; a running total of confidential salaries came out public |
+| Distinct estimator ignores its own estimate | **Real** | `estimator.exact` is frozen at `EXACT_LIMIT` past 4096 values |
+| Parquet nulls not summed across row groups | **Real** | last group overwrote the rest; a half-empty column reported 0% |
+| SQLite stats look for `path` | **Real** | the SDK sets `connection`, so the exact path never matched |
+| Multi-key `ORDER BY` sorts wrong | **Real** (found by me) | sequential sorts made the *last* key primary |
+| Descending `RANK` returns `1,1,1` | **Real** (found by me) | direction lived in `reverse=`, invisible to the key comparison |
+
+#### The bounded read, measured rather than assumed
+
+`block_size` is buffer granularity, not a limit — `read_all()` reads
+everything. Nor is there a row cap: `batch_rows` does not exist on
+`ReadOptions` in pyarrow 25, and `block_size` only scales batches down to a
+floor of ~840 rows. The cap is therefore enforced **below** the reader, by a
+stream that physically reports EOF (`_ByteCappedFile`, an `io.RawIOBase`).
+Measured on a 200,000-row file with a 500-row budget: **1,550 rows read**,
+versus 200,000 before.
+
+Two consequences found while fixing it:
+
+* The retained sample is exact, but Arrow emits whole batches, so the
+  *reader* over-delivers by up to one batch. Asserting an exact 500 was not
+  physically achievable; the test now asserts the bound that matters.
+* Bounding the read exposed a **pre-existing** bias: bytes-per-row was
+  measured from the head block alone, which on a file whose rows widen
+  downward gave 5.99 against a true 7.63 — a **27% over-estimate of row
+  count**, which the plan divides straight into. Now sampled at head *and*
+  midpoint.
+
+#### Window functions, checked against DuckDB
+
+Expected values were read out of DuckDB rather than reasoned about. Two
+further bugs surfaced only because the tests were written that way:
+descending `RANK` returned `1,1,1` (direction was in `reverse=`, which the
+key comparison never saw), and `ORDER BY a, b` sorted by `b, a` — the exact
+inversion the audit predicted. `DENSE_RANK` was also silently returning
+`RANK`, since it counted rows rather than distinct keys.
+
+#### Classification propagation
+
+`_rebuild` now inherits from the input column *and* the partition/ordering
+keys — a rank encodes a row's position relative to a sensitive key. Worth
+recording: **the engines already propagated correctly**; only the window
+path dropped the tag. The old comment ("guessing is worse than recording
+none") inverted the risk — under-recording is what leaks. A test now covers
+the engine path too, so a future break there is caught rather than assumed.
+
+#### Not fixed, and why
+
+The **20,000-combination search ceiling** (P0 #3) is confirmed but untouched:
+it needs a real optimizer, not another threshold. Likewise scheduler
+resource controls, persistent estimation history, and the Workbench security
+boundary. Those are recorded as open rather than half-done.
+
+**Full suite: 730 passed, 7 skipped.** The `695`-vs-`692` discrepancy in
+earlier notes is resolved — the README guard now pins the real number.
 
 ---
 

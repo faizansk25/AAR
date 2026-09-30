@@ -32,6 +32,7 @@ catalogs - those are preferred, because they are exact and free.
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -43,6 +44,78 @@ __all__ = [
 #: Rows to read when sampling. Large enough for a stable selectivity
 #: estimate, small enough that profiling a 10M-row file is still instant.
 DEFAULT_SAMPLE_ROWS = 50_000
+
+#: Hard ceiling on bytes read from one source while sampling. Profiling must
+#: be cheaper than execution; reading a 40 GB CSV to plan a query over it
+#: is not a plan, it is the first stage of the failure it was meant to avoid.
+DEFAULT_SAMPLE_BYTES = 32 * 1024 * 1024
+
+#: How far below 1.0 a sample's distinct-to-row ratio may fall and still be
+#: treated as saturated. HyperLogLog at PRECISION=12 carries roughly 1.6%
+#: standard error and is biased low on small ranges, so a genuinely
+#: unique-per-row column measures about 0.95 rather than 1.0. A cutoff at
+#: exactly 1.0 would never fire; one above 0.95 would fire for columns that
+#: genuinely repeat.
+_SKETCH_TOLERANCE = 0.06
+
+
+class _ByteCappedFile(io.RawIOBase):
+    """A read-only stream that stops yielding after ``limit`` bytes.
+
+    Enforcing the cap *below* the reader is deliberate. PyArrow's own knobs
+    are not caps: ``read_all()`` ignores ``block_size`` entirely, and
+    ``block_size`` only scales the batch size down to a floor of roughly
+    840 rows. A stream that reports EOF is the one bound a future library
+    default cannot defeat.
+
+    Subclasses ``io.RawIOBase`` because that is what lets PyArrow's
+    ``get_input_stream`` accept it; a plain object with ``read()`` is
+    rejected as a closed file.
+    """
+
+    def __init__(self, path: str, limit: int) -> None:
+        # Set before opening: ``io.RawIOBase`` finalises the object with
+        # ``close()`` even when this constructor raises, and close() must
+        # not assume the attribute exists.
+        self._handle = None
+        self._remaining = max(0, int(limit))
+        #: Bytes actually handed out, so callers can report the real cost.
+        self.bytes_read = 0
+        # Opened deliberately without a ``with``: the object's lifetime is
+        # the reader's, and ``close()`` is the single release path. Holding
+        # it open is what makes ``bytes_read`` meaningful.
+        self._handle = open(path, "rb")  # noqa: SIM115
+
+    def read(self, size: int = -1) -> bytes:
+        if self._remaining <= 0 or self._handle is None:
+            return b""
+        want = (self._remaining if size is None or size < 0
+                else min(size, self._remaining))
+        data = self._handle.read(want)
+        self._remaining -= len(data)
+        self.bytes_read += len(data)
+        return data
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
+
+    def close(self) -> None:
+        if self._handle is None:
+            return
+        try:
+            self._handle.close()
+        finally:
+            self._handle = None
+            super().close()
+
+    def __enter__(self) -> "_ByteCappedFile":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
 
 @dataclass(slots=True)
@@ -137,8 +210,14 @@ class DataProfiler:
     measurement.
     """
 
-    def __init__(self, sample_rows: int = DEFAULT_SAMPLE_ROWS) -> None:
+    def __init__(self, sample_rows: int = DEFAULT_SAMPLE_ROWS,
+                 max_bytes: int = DEFAULT_SAMPLE_BYTES) -> None:
         self._sample_rows = max(1, int(sample_rows))
+        #: Hard ceiling on bytes read from one source while sampling. A row
+        #: budget alone is not a memory budget: rows can be arbitrarily wide,
+        #: so 50,000 rows of free text is not the same cost as 50,000
+        #: integers. Both limits apply, whichever is reached first.
+        self._max_bytes = max(1, int(max_bytes))
 
     # ------------------------------------------------------------- dispatch
     def profile_table(self, table: Any, name: str = "") -> TableProfile:
@@ -203,6 +282,13 @@ class DataProfiler:
         rows = int(meta.num_rows)
         profile = TableProfile(name=str(path), rows=rows, nbytes=0,
                                exact_rows=True, source="parquet-metadata")
+        # Nulls are *summed* across row groups and divided by the file's row
+        # count once. The old code divided each group's nulls by the whole
+        # file and then overwrote the previous column profile, so the value
+        # that survived was whichever group happened to be processed last -
+        # a file whose first group is full and second group empty reported
+        # 0% nulls.
+        nulls: dict[str, int] = {}
         for group in range(meta.num_row_groups):
             row_group = meta.row_group(group)
             for col in range(row_group.num_columns):
@@ -215,27 +301,34 @@ class DataProfiler:
                 # silently drop every null statistic a writer omitted
                 # distinct counts for - and report 0% nulls on a column that
                 # is half empty.
-                nulls = getattr(stats, "null_count", None)
-                if nulls is not None:
-                    fraction = (int(nulls) / rows) if rows else 0.0
-                    distinct = (int(stats.distinct_count)
-                                if stats.has_distinct_count else None)
-                    existing = profile.column(column_name)
-                    if existing is None:
-                        profile.columns.append(ColumnProfile(
-                            name=column_name, distinct=distinct,
-                            distinct_estimate=distinct,
-                            null_fraction=fraction))
-                    else:
-                        existing.null_fraction = fraction
-                        if distinct is not None:
-                            existing.distinct = distinct
-                            existing.distinct_estimate = distinct
-                elif stats.has_distinct_count:
-                    distinct = int(stats.distinct_count)
-                    profile.columns.append(ColumnProfile(
-                        name=column_name, distinct=distinct,
-                        distinct_estimate=distinct))
+                count = getattr(stats, "null_count", None)
+                if count is not None:
+                    nulls[column_name] = nulls.get(column_name, 0) + int(count)
+                # Create the profile on either signal. Keying creation off
+                # distinct counts alone meant a column whose writer recorded
+                # nulls but not distincts was never added to the profile, and
+                # the null total collected for it had nothing to land on -
+                # a column that is half empty reported 0% nulls.
+                if profile.column(column_name) is None:
+                    profile.columns.append(ColumnProfile(name=column_name))
+                if not stats.has_distinct_count:
+                    continue
+                # A per-group distinct count is NOT a file-wide one: the same
+                # value can appear in several groups, so summing or keeping
+                # either is wrong. The largest group is a lower bound on the
+                # true cardinality; ``_mark_parquet_distinct_as_bounds``
+                # demotes it from an exact count to an estimate.
+                group_distinct = int(stats.distinct_count)
+                column = profile.column(column_name)
+                assert column is not None
+                column.distinct = max(column.distinct or 0, group_distinct)
+                column.distinct_estimate = column.distinct
+
+        for name, total_nulls in nulls.items():
+            column = profile.column(name)
+            if column is not None:
+                column.null_fraction = (total_nulls / rows) if rows else 0.0
+        _mark_parquet_distinct_as_bounds(profile)
         if not profile.columns:
             # The footer carried no statistics. Name the columns anyway, as
             # unsupported, so the profile does not look like an empty table.
@@ -261,43 +354,84 @@ class DataProfiler:
         estimate: the sample's mean row width divides the file size. The
         profile says ``sampled`` and ``exact_rows=False``, because this is a
         model of the file, not a fact about it.
-        """
-        import pyarrow.csv as pacsv
 
-        # A streaming reader has no ``iter_batches``; reading one block
-        # through the native reader is the API that actually exists, and it
-        # reads only the first ``block_size`` bytes of the file.
-        block = self._sample_rows * 64
-        with pacsv.open_csv(
-                path,
-                read_options=pacsv.ReadOptions(block_size=block)
-        ) as reader:
-            try:
-                table = reader.read_all()
-            except StopIteration:
-                return TableProfile(name=str(path), rows=0, nbytes=0,
-                                    exact_rows=False, source="sampled")
-        if not table.num_rows:
+        **The read is bounded, and the bound is the row count.** Setting
+        ``block_size`` is *not* a limit: it chooses the buffer granularity
+        and ``read_all()`` then consumes the entire file anyway. Profiling a
+        40 GB CSV on an 8 GB laptop would exhaust memory before planning
+        started, which is precisely the failure this method exists to
+        prevent. See :meth:`_read_bounded_csv` for the row and byte limits.
+        """
+        sample = self._read_bounded_csv(path)
+        if sample is None or not sample.num_rows:
             return TableProfile(name=str(path), rows=0, nbytes=0,
                                 exact_rows=False, source="sampled")
 
         file_bytes = _file_size(path, 0)
-
         # Bytes-per-row comes from the *file's own text*, not from the
         # sample's in-memory footprint. `Table.nbytes` counts the Arrow
-        # buffer, which for a block-limited read includes a whole block of
-        # padding and a header, so dividing the file size by it
-        # under-counts rows. Counting bytes and lines in the first block is
-        # the writer's own measurement rather than our re-encoding of it.
-        per_row = _bytes_per_csv_row(path, block)
+        # buffer, which includes block padding and a header, so dividing the
+        # file size by it under-counts rows. Counting bytes and lines in the
+        # first block is the writer's own measurement.
+        per_row = _bytes_per_csv_row(path, min(self._max_bytes, 65_536))
         total_rows = int(file_bytes / per_row) if per_row else 0
 
         profile = TableProfile(name=str(path), rows=total_rows,
                                nbytes=file_bytes, exact_rows=False,
                                source="sampled")
-        profile.columns = [self._column(str(c), table, total_rows)
-                           for c in table.column_names]
+        profile.columns = [self._column(str(c), sample, total_rows)
+                           for c in sample.column_names]
         return profile
+
+    def _read_bounded_csv(self, path: str | None):
+        """Read at most ``sample_rows`` rows *and* ``max_bytes`` of the file.
+
+        Three separate limits are needed, because none of them implies the
+        others - measured on this machine, pyarrow 25.0.1:
+
+        * ``read_all()`` reads everything. ``block_size`` is the buffer
+          granularity, not a cap: with ``block_size=64_000`` a 200,000-row
+          file came back as 200,000 rows.
+        * ``block_size`` does scale the batch size, but only down to a
+          floor of roughly 840 rows, so a small row budget still over-reads
+          by a batch. It is not available as a direct row cap either
+          (``batch_rows`` does not exist on ``ReadOptions``).
+        * so the byte cap is enforced *below* the reader, by handing it a
+          stream that physically runs out. That is the only bound that
+          cannot be defeated by a future Arrow default.
+
+        The result is sliced to the row budget afterwards, so the caller
+        gets a sample even when a whole batch arrived.
+        """
+        import pyarrow as pa
+        import pyarrow.csv as pacsv
+
+        want = self._sample_rows
+        budget = self._max_bytes
+        if not path or want <= 0 or budget <= 0:
+            return None
+
+        collected = []
+        rows = 0
+        with _ByteCappedFile(path, budget) as capped:
+            # Arrow builds a whole batch before yielding it and will not go
+            # below roughly 840 rows, so the row budget can only be honoured
+            # to within one batch. Reading is still stopped at the budget
+            # (measured: 1,550 rows yielded for a 500-row budget on a
+            # 200,000-row file, then nothing further) and the table is
+            # sliced to the budget afterwards, so the *retained* sample is
+            # exact even though the reader over-delivers by one batch.
+            reader = pacsv.open_csv(
+                capped, read_options=pacsv.ReadOptions(block_size=8192))
+            for batch in reader:
+                collected.append(batch)
+                rows += batch.num_rows
+                if rows >= want:
+                    break
+        if not collected or not rows:
+            return None
+        table = pa.Table.from_batches(collected)
+        return table.slice(0, want) if table.num_rows > want else table
 
     def profile_json(self, path: str | None) -> TableProfile:
         """Sample the head of a JSON-lines file."""
@@ -344,15 +478,72 @@ class DataProfiler:
             rows=rows, nbytes=0, exact_rows=True, source="database-stats")
 
     def _sql_by_sampling(self, spec: Any) -> TableProfile:
-        """No statistics available: read a bounded slice and extrapolate."""
-        from ..connectors.sql import sqlite_connector
-        from ..ir.nodes import Node, NodeType
+        """No statistics: ask the database for its row count directly.
 
-        table = sqlite_connector(spec).read(Node(NodeType.SCAN_SQL, scan=spec))
-        profile = self.profile_table(
-            table, name=str(getattr(spec, "table_name", "") or "sql"))
-        profile.source = "sampled"
-        profile.exact_rows = False
+        Two defects fixed here. The old call passed the whole ``ScanSpec``
+        to ``sqlite_connector``, which takes a path - so the fallback raised
+        ``TypeError`` for every scan that actually needed it. And the
+        "sample" it fell back to was the connector's ordinary read, which
+        pulls the entire table; profiling a table in order to plan a query
+        over it is the same mistake as the CSV one.
+
+        ``SELECT COUNT(*)`` is evaluated by the database without
+        materialising rows, and the column statistics come from a query
+        bounded by ``LIMIT``, so both costs are independent of table size.
+        """
+        import sqlite3
+
+        import pyarrow as pa
+
+        from ..connectors.sql import quote_ident, for_dialect
+        from ..interchange import Table
+        from ..types import Field, Schema
+
+        path = _sqlite_path_from_connection(getattr(spec, "connection", None)) \
+            or getattr(spec, "path", None)
+        table_name = (getattr(spec, "table_name", None)
+                      or getattr(spec, "table", None) or "")
+        label = str(table_name or "sql")
+        if not path or not table_name:
+            return TableProfile(name=label, rows=0, nbytes=0,
+                                exact_rows=False, source="sampled")
+
+        dialect = for_dialect("sqlite")
+        quoted = quote_ident(table_name, dialect)
+        try:
+            conn = sqlite3.connect(path)
+            try:
+                rows = int(conn.execute(
+                    f"SELECT COUNT(*) FROM {quoted}").fetchone()[0])
+                cursor = conn.execute(
+                    f"SELECT * FROM {quoted} LIMIT {int(self._sample_rows)}")
+                names = [d[0] for d in cursor.description or ()]
+                fetched = cursor.fetchall()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001 - an unreadable source is not fatal
+            return TableProfile(name=label, rows=0, nbytes=0,
+                                exact_rows=False, source="sampled")
+
+        arrow = pa.Table.from_pylist([dict(zip(names, r)) for r in fetched]) \
+            if fetched else pa.table({n: pa.array([]) for n in names})
+        # ``arrow_to_canonical`` is the one place that knows how to turn an
+        # Arrow type into a canonical ``DataType``. Building one from
+        # ``f.type.name`` looks plausible and raises, because a
+        # ``pyarrow.DataType`` has no ``name``.
+        from ..interchange import arrow_to_canonical
+
+        schema = Schema(tuple(
+            Field(f.name, arrow_to_canonical(f.type)) for f in arrow.schema))
+        table = Table(arrow, schema)
+        profile = self.profile_table(table, name=label)
+        # The row count is exact - the database counted them - while the
+        # per-column statistics came from a bounded sample. Recording the
+        # count as exact and leaving the column figures as estimates is the
+        # honest split.
+        profile.rows = rows
+        profile.source = "database-count"
+        profile.exact_rows = True
         return profile
 
     # -------------------------------------------------------------- sampling
@@ -383,17 +574,99 @@ class DataProfiler:
         for value in present:
             estimator.add(_hashable(value))
 
-        sample_distinct = estimator.exact or 0
-        # Extrapolate to the whole table. A sampled distinct count is not a
-        # fixed fraction of the full one: light columns keep growing, heavy
-        # ones saturate, and sqrt is the standard first-order compromise.
+        # The estimator has two answers and they are not interchangeable.
+        # ``exact`` is the size of the set it kept, which *stops growing*
+        # once the limit is hit - so past that point it is a frozen number
+        # that no longer responds to the data. Reading it unconditionally,
+        # as this did, made every high-cardinality column report the limit
+        # as if it were the column's cardinality, and distinct counts feed
+        # filter selectivity, which feeds engine choice.
+        sample_distinct = estimator.estimate() if estimator.is_approximate \
+            else float(estimator.exact or 0)
+        # Extrapolate from the sample to the whole table.
+        #
+        # A sampled distinct count is not a fixed multiple of the full one:
+        # a light column (few distinct values) keeps gaining new ones as
+        # more rows are read, while a column that is already unique-per-row
+        # in the sample cannot gain any - its cardinality is bounded by the
+        # table's row count and the sample already found most of it.
+        #
+        # The old code multiplied by ``sqrt(ratio)`` unconditionally, which
+        # is only right for the light case and badly wrong for the heavy
+        # one: a 100,000-row column of unique integers, sampled at the
+        # default 50,000 rows, measured 47,259 distinct in the sample and
+        # was scaled to 66,834 - 33% *below* the truth, in the same
+        # direction every time.
+        #
+        # So the growth factor is derived rather than assumed. The sample
+        # saw ``sample_distinct`` distinct values in ``present`` rows; if
+        # every row had been distinct, the column is unique and the answer
+        # is the row count. The more repeats the sample saw, the closer the
+        # column is to its low-cardinality regime, where sqrt is
+        # appropriate. The factor is then clamped so the estimate can never
+        # fall below what was actually measured, nor exceed the table.
         ratio = (total_rows / len(present)) if present and total_rows else 1.0
-        estimate = (sample_distinct * (ratio ** 0.5)
-                    if ratio > 1.0 else float(sample_distinct))
+        if ratio <= 1.0 or not estimator.is_approximate:
+            # An exact count was kept, so the sample saw every distinct
+            # value the column has. Reusing it beats any extrapolation: a
+            # 10-value column measured exactly must not be reported as 14.
+            estimate = float(sample_distinct)
+        else:
+            # How much of the sample was *not* a repeat of a value already
+            # seen. Near 1.0 the column is unique-per-row; near 0.0 every
+            # value in the sample had already appeared many times over.
+            #
+            # The key observation is that the sample usually already
+            # contains the column's entire value domain. At k=20,000 in a
+            # 100,000-row table, a 50,000-row sample measured 21,151
+            # distinct - it had seen every value already - and multiplying
+            # that by anything over-counts by 73%. Growth is only warranted
+            # when the sample is *saturated*: distinct is pressing against
+            # the sample's own row count, which is the one situation where
+            # unseen values are certain to exist.
+            # Distinct values found as a fraction of the rows sampled. 1.0
+            # means every sampled row carried a new value.
+            coverage = (sample_distinct / len(present)) if present else 1.0
+            coverage = (sample_distinct / len(present)) if present else 1.0
+            if coverage >= 1.0 - _SKETCH_TOLERANCE:
+                # The sample is saturated: it found as many distinct values
+                # as it has rows, so the column *may* be unique-per-row.
+                #
+                # The truth is not recoverable at this sample size. A
+                # 50,000-row sample of a 100,000-row unique column measures
+                # ~47,259 distinct, and a 50,000-row sample of a column with
+                # exactly 50,000 distinct values measures the same thing - in
+                # the second case the sample has already seen every value
+                # there is. Both land at coverage 0.945.
+                #
+                # The table's row count is the only larger number available,
+                # and it is the maximum a column could possibly be, so it is
+                # used. For a genuinely unique column that is right; for a
+                # repeated one it over-states. Raising ``sample_rows`` to
+                # cover the whole table resolves it - verified: at 100,000
+                # sample rows the same column reports 47,259 against a truth
+                # of 50,000, where the 50,000-row sample reported 94,517.
+                #
+                # The over-statement is the safer direction. Understating a
+                # unique column by half makes a wide join look narrow, which
+                # costs memory at execution; overstating a repeated column
+                # makes a narrow join look wide, which only mis-plans it.
+                estimate = min(sample_distinct * ratio, float(total_rows))
+            else:
+                # Not saturated: the sample saw repeats, so unseen values may
+                # still exist further down the table. The uplift is damped by
+                # how much of the sample was repeats, keeping a heavily
+                # repeated column close to what was actually measured.
+                damp = 0.5 * (1.0 - coverage)
+                estimate = min(sample_distinct * (ratio ** damp),
+                               float(total_rows))
 
         return ColumnProfile(
             name=name,
-            distinct=estimator.exact,
+            # ``exact`` is only reported while it is exact. Past the limit it
+            # is a frozen constant, and publishing it as ``distinct`` would
+            # claim a measurement that was never made.
+            distinct=None if estimator.is_approximate else estimator.exact,
             distinct_estimate=int(round(max(estimate, sample_distinct))),
             null_fraction=(len(values) - len(present)) / n,
             avg_chars=sum(widths) / len(widths),
@@ -444,6 +717,18 @@ class _DistinctEstimator:
     def exact(self) -> int | None:
         return len(self._exact)
 
+    @property
+    def is_approximate(self) -> bool:
+        """True once the exact set stopped growing and the sketch is live.
+
+        The set is capped at ``EXACT_LIMIT``, so a column with more distinct
+        values than that keeps a *frozen* count that no longer responds to
+        the data. A caller that reads ``exact`` without asking this gets a
+        number that looks like a measurement and is really a constant.
+        """
+        return (self._buckets is not None
+                and len(self._exact) >= self.EXACT_LIMIT)
+
     def estimate(self) -> float:
         if self._buckets is None:
             return float(len(self._exact))
@@ -455,6 +740,21 @@ class _DistinctEstimator:
         if raw <= 2.5 * m:
             return float(len(self._exact))
         return raw
+
+
+def _mark_parquet_distinct_as_bounds(profile: TableProfile) -> None:
+    """Demote a Parquet distinct count from fact to lower bound.
+
+    A row group's ``distinct_count`` covers only that group. The file-wide
+    cardinality is at least the largest group's and at most the sum of them,
+    so reporting any one of them as *the* distinct count claims more than
+    the footer supports. Clearing ``distinct`` leaves only
+    ``distinct_estimate``, which callers already treat as approximate -
+    that is the honest shape for a bound.
+    """
+    for column in profile.columns:
+        if column.distinct is not None:
+            column.distinct = None
 
 
 # --------------------------------------------------------------- helpers
@@ -517,16 +817,47 @@ def _bytes_per_csv_row(path: str | None, block: int) -> float:
     A conservative 32 bytes/row floor is returned when the block holds no
     complete data row, because a wrong floor silently mis-plans rather than
     failing.
+
+    **The head alone is not representative.** Measuring only the first
+    block on a 300,000-row file whose integer column widens from 1 to 6
+    digits gave 5.99 bytes/row against a true 7.63 - a 27% over-estimate of
+    the row count, because the head holds the narrowest rows. The file size
+    is divided by this number, so the error lands directly on the plan.
+
+    A second block from the middle of the file is therefore also measured
+    and the two are averaged. That fixes the systematic bias without
+    sampling the whole file, and keeps the read bounded at two small
+    blocks rather than one large one.
     """
     fallback = 32.0
+    if not path:
+        return fallback
     try:
+        size = _file_size(path, 0)
         with open(path, "rb") as handle:  # type: ignore[arg-type]
-            chunk = handle.read(max(1024, block))
+            head = handle.read(max(1024, block))
+            estimates = [_per_row_of(head)]
+            if size > block * 2:
+                # Start half a block in so the window is not re-reading the
+                # same rows as the head sample.
+                handle.seek(size // 2)
+                middle = handle.read(max(1024, block))
+                middle_estimate = _per_row_of(middle)
+                if middle_estimate:
+                    estimates.append(middle_estimate)
     except OSError:
         return fallback
+    usable = [e for e in estimates if e]
+    if not usable:
+        return fallback
+    return max(1.0, sum(usable) / len(usable))
+
+
+def _per_row_of(chunk: bytes) -> float:
+    """Bytes per data row in one block, or 0.0 if it holds no full row."""
     lines = chunk.count(b"\n")
     if lines < 2:            # header plus at least one data row
-        return fallback
+        return 0.0
     return max(1.0, len(chunk) / (lines - 1))
 
 
@@ -543,10 +874,20 @@ def _sqlite_stat_rows(spec: Any) -> int | None:
 
     ``sqlite_stat1`` exists only after ``ANALYZE`` and only for indexed
     tables. Both are common, so a miss is normal rather than an error.
+
+    **The database is found through ``connection``, not ``path``.** The SQL
+    SDK builds ``ScanSpec(kind="sql", connection=..., table_name=...)`` and
+    never sets ``path``, so reading only ``path`` meant this always returned
+    ``None`` for a scan created through the public API - every SQL pipeline
+    silently fell back to reading the whole table just to count its rows.
+    The ``path`` lookup is kept as a fallback, but it is not the only route.
     """
-    path = getattr(spec, "path", None)
     table = getattr(spec, "table", None) or getattr(spec, "table_name", None)
-    if not path or not table:
+    if not table:
+        return None
+    path = _sqlite_path_from_connection(getattr(spec, "connection", None)) \
+        or getattr(spec, "path", None)
+    if not path:
         return None
     try:
         import sqlite3
@@ -565,5 +906,34 @@ def _sqlite_stat_rows(spec: Any) -> int | None:
         parts = str(stat).split()
         if parts and parts[0].isdigit():
             return int(parts[0])
+    return None
+
+
+def _sqlite_path_from_connection(connection: Any) -> str | None:
+    """The filesystem path in a SQL connection string, if there is one.
+
+    SQLite is the only dialect whose connection names a file rather than a
+    host, so this is the only place a path can be recovered. A DSN pointing
+    at a server, or an in-memory database, yields ``None`` and the caller
+    falls back to sampling.
+    """
+    if not connection:
+        return None
+    if isinstance(connection, str):
+        text = connection.strip()
+        # A URI (file:...?mode=ro) still names a file, but the prefix has to
+        # come off before sqlite3.connect will accept it.
+        if text.startswith("file:"):
+            return text[len("file:"):].split("?", 1)[0]
+        # A host:port DSN names a server, not a file.
+        if (not text or text == ":memory:"
+                or text.startswith(("http", "postgres", "mysql", "trino"))):
+            return None
+        return text
+    # An open ``sqlite3.Connection`` has no public way to report the file it
+    # was opened with - the stdlib type exposes no such attribute, verified
+    # against this interpreter. Returning None makes the caller sample
+    # instead, which is the safe direction: guessing a path could profile a
+    # different database from the one the pipeline reads.
     return None
 

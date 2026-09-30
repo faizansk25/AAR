@@ -99,9 +99,31 @@ class PipelineService:
         """Produce a physical plan for an already-loaded root."""
         return self._make_planner().plan(root)
 
+    def prepare(self, path: str, profile: bool = True) -> tuple:
+        """Load, profile, then plan - returning ``(root, plan)``.
+
+        Exists because a front end that wants to *show* a plan before
+        running it used to plan twice, and the first plan was made before
+        the sources were measured. That ordering is not a cosmetic problem:
+        a source declared as 100 MB and actually 8 GB gets planned from
+        100 MB, and the profiler then measures 8 GB and does nothing with
+        it. The measurement exists to change the plan, so it has to happen
+        first.
+
+        This is the same sequence :meth:`run` uses, which is the point: one
+        order, one behaviour, whichever front end asks.
+        """
+        root = self.load(path)
+        self.profile_sources(root) if profile else {}
+        return root, self.plan(root)
+
     def explain(self, path: str) -> Any:
-        """Load and plan a file, returning the plan for display."""
-        return self.plan(self.load(path))
+        """Load and plan a file, returning the plan for display.
+
+        Profiles first, like :meth:`prepare`, so ``aar explain`` and
+        ``aar run`` cannot disagree about the same pipeline.
+        """
+        return self.prepare(path)[1]
 
     def run(self, path: str, role: str | None = None,
             policy_path: str | None = None,

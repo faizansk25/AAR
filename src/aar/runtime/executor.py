@@ -593,10 +593,27 @@ class Executor:
 
         for k in order:
             indices = partitions[k]
-            for col, ascending in spec.order_by:
-                indices.sort(key=lambda i: _sort_key(rows[i].get(col)),
-                             reverse=not ascending)
+            # One sort over the whole ORDER BY list, not one sort per column.
+            #
+            # Sorting by `a` and then by `b` makes the *last* key primary:
+            # rows (1,1),(1,2),(2,1) came out (1,1),(2,1),(1,2), which is
+            # `ORDER BY b, a` - the opposite of what was asked for. A single
+            # sort on the composite key gives the declared precedence, and
+            # it is the same key the ranking uses, so the two cannot disagree
+            # about what "sorted order" means.
+            indices.sort(key=lambda i: _partition_key(rows, i, spec))
             span = len(indices)
+            # ``RANK`` and ``DENSE_RANK`` are computed once per partition,
+            # over the *whole* ORDER BY key, rather than per row.
+            #
+            # RANK is 1 + the number of rows that sort strictly before this
+            # one, so ties share a rank and every gap a tie leaves is
+            # counted. DENSE_RANK is 1 + the number of distinct keys before
+            # it, so it never skips. Computing them by scanning the rows
+            # already visited - as this did - counts *equal* preceding
+            # values instead, which gives 1,1,2,1 for 10,20,20,30 where
+            # SQL requires 1,2,2,4 (verified against DuckDB).
+            positional = _positional_functions(node, indices, rows, spec)
             for name, fn in node.window_functions.items():
                 for pos, i in enumerate(indices):
                     # ROW_NUMBER and RANK are positional: they depend on where
@@ -608,17 +625,16 @@ class Executor:
                         rows[i][name] = pos + 1
                         continue
                     if func == "RANK":
-                        key_col = _rank_key(spec)
-                        rows[i][name] = 1 + sum(
-                            1 for prev in indices[:pos]
-                            if _sort_key(rows[prev].get(key_col)) ==
-                            _sort_key(rows[i].get(key_col)))
+                        rows[i][name] = positional["rank"][pos]
+                        continue
+                    if func in ("DENSE_RANK", "DENSERANK"):
+                        rows[i][name] = positional["dense"][pos]
                         continue
                     lo, hi = _frame_bounds(spec.frame, pos, span)
                     frame = [rows[j] for j in indices[lo:hi]]
                     rows[i][name] = _apply_aggregate(fn, frame)
 
-        return _rebuild(rows, table)
+        return _rebuild(rows, table, node)
 
     @staticmethod
     def _record_failure(ledger: DegradationLedger, node: Node,
@@ -699,6 +715,92 @@ def _rank_key(spec: Any) -> str | None:
     return spec.order_by[0][0] if spec.order_by else None
 
 
+def _order_key(rows: list[dict], indices: list[int],
+               spec: Any) -> list[tuple]:
+    """The composite sort key for each row, in partition order.
+
+    The whole ``ORDER BY`` list is the key, not just its first column. Two
+    rows tie under SQL only when *every* ordering column ties, so ranking
+    on ``order_by[0]`` alone would call distinct rows equal.
+    """
+    return [_partition_key(rows, i, spec) for i in indices]
+
+
+def _partition_key(rows: list[dict], index: int, spec: Any) -> tuple:
+    """One row's position under the full ``ORDER BY`` list.
+
+    **Direction is encoded in the key, not in the sort call.** Sorting with
+    ``reverse=True`` reorders the positions, after which a key built from
+    ascending values no longer describes the order they are in. Inverting a
+    component is what makes ``key < previous`` mean "sorts earlier" under
+    both directions, so ``RANK`` on ``ORDER BY v DESC`` reads 3,2,1 instead
+    of the 1,1,1 that a plain comparison produced.
+    """
+    components = []
+    for col, ascending in spec.order_by:
+        marker, value = _sort_key(rows[index].get(col))
+        components.append((marker, value if ascending else _Negated(value)))
+    return tuple(components)
+
+
+class _Negated:
+    """Reverses ordering for one ``ORDER BY`` component.
+
+    A wrapper rather than ``-value``, because the component may be a string
+    or a timestamp and negating those is either meaningless or a TypeError.
+    Comparison is inverted, equality is preserved, so a descending key still
+    ties exactly when the underlying values are equal.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+    def __lt__(self, other: "_Negated") -> bool:
+        return other.value < self.value
+
+    def __gt__(self, other: "_Negated") -> bool:
+        return other.value > self.value
+
+    def __le__(self, other: "_Negated") -> bool:
+        return other.value <= self.value
+
+    def __ge__(self, other: "_Negated") -> bool:
+        return other.value >= self.value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _Negated) and other.value == self.value
+
+    def __hash__(self) -> int:
+        return hash(("neg", self.value))
+
+
+def _positional_functions(node: Any, indices: list[int], rows: list[dict],
+                          spec: Any) -> dict:
+    """``RANK`` and ``DENSE_RANK`` for a whole partition, computed once.
+
+    Returns lists indexed by position within ``indices``. Both are
+    derived from one pass over the ordering keys:
+
+    * ``RANK`` is 1 + how many rows sort strictly earlier. Ties therefore
+      share a value and every row a tie skips is counted, which is what
+      makes it 1,2,2,4 for ``10,20,20,30``.
+    * ``DENSE_RANK`` is 1 + how many *distinct* keys sort strictly earlier,
+      so it increments only when the key changes: 1,2,2,3. Counting rows
+      instead of distinct keys would reproduce ``RANK`` and never skip -
+      which is the one thing that tells the two functions apart.
+    """
+    keys = _order_key(rows, indices, spec)
+    rank: list[int] = []
+    dense: list[int] = []
+    for pos, key in enumerate(keys):
+        earlier = keys[:pos]
+        rank.append(1 + sum(1 for other in earlier if other < key))
+        dense.append(1 + len({other for other in earlier if other < key}))
+    return {"rank": rank, "dense": dense}
+
+
 def _sort_key(value: Any) -> tuple[int, Any]:
     """A total order over possibly-mixed values, for window ``order_by``.
 
@@ -761,7 +863,7 @@ def _frame_bounds(frame: str | None, pos: int, span: int) -> tuple[int, int]:
         f"as 'rows between unbounded preceding and current row'")
 
 
-def _rebuild(rows: list[dict], table: Table) -> Table:
+def _rebuild(rows: list[dict], table: Table, node: Any = None) -> Table:
     """Rebuild a table from mutated row dicts, keeping known column types.
 
     Columns that did not exist before - the window functions a frame just
@@ -769,6 +871,17 @@ def _rebuild(rows: list[dict], table: Table) -> Table:
     extending Arrow leaves ``Table``'s field-count check to fail, and the
     failure lands on an unrelated-looking ``ValueError`` at construction
     rather than on the operation that actually dropped the column.
+
+    **A derived column inherits the classifications of the columns it was
+    computed from.** The previous version created a bare ``Field``, so a
+    running total over a ``confidential`` salary column came out
+    unclassified - and since a sum of salaries still reveals salaries, a
+    policy engine checking the output would wave it through. The comment
+    claimed guessing at sensitivity was worse than recording none; that
+    inverted the risk. Under-recording is the failure that leaks.
+
+    Partition and ordering keys count as sources, because the row's position
+    relative to them is exactly what a rank or a running total encodes.
     """
     import pyarrow as pa
 
@@ -779,6 +892,7 @@ def _rebuild(rows: list[dict], table: Table) -> Table:
     known = list(table.column_names)
     extra = [n for n in rows[0] if n not in known] if rows else []
     names = known + extra
+    inherited = _inherited_classifications(node, table)
     fields = []
     canonical: list[Field] = []
     for name in names:
@@ -789,11 +903,55 @@ def _rebuild(rows: list[dict], table: Table) -> Table:
         else:
             inferred = _infer_arrow_type([r.get(name) for r in rows])
             fields.append(pa.field(name, inferred))
-            # A derived column inherits no tags: it is a function of columns
-            # the analyst can already see, and guessing at its sensitivity is
-            # worse than recording none. ``inherit_classification`` exists for
-            # the cases that do need an explicit link.
-            canonical.append(Field(name, arrow_to_canonical(inferred)))
+            tags = inherited.get(name, frozenset())
+            canonical.append(Field(name, arrow_to_canonical(inferred),
+                                   classification=frozenset(tags)))
     return Table(pa.Table.from_pylist(rows, schema=pa.schema(fields)),
                  Schema(tuple(canonical)))
+
+
+def _inherited_classifications(node: Any, table: Table) -> dict:
+    """Map each derived output column to the tags it must inherit.
+
+    Resolves an aggregate or window function's input column back to the
+    input table, then unions that column's classification with the
+    partition and ordering keys. An expression that cannot be resolved to a
+    bare column inherits nothing - there is nothing honest to claim.
+    """
+    if node is None:
+        return {}
+    try:
+        from ..ir import Col
+    except Exception:  # noqa: BLE001 - a missing IR cannot leak anything
+        return {}
+
+    def tags_of(column: str) -> frozenset:
+        if not column or not table.schema.has(column):
+            return frozenset()
+        return frozenset(table.schema.get(column).classification)
+
+    # Partition and ordering keys describe *where* a row sits, which the
+    # derived value encodes.
+    window = getattr(node, "window", None)
+    shared: set = set()
+    if window is not None:
+        for column in getattr(window, "partition_by", ()) or ():
+            shared |= tags_of(column)
+        for column, _asc in getattr(window, "order_by", ()) or ():
+            shared |= tags_of(column)
+
+    functions = dict(getattr(node, "agg_functions", {}) or {})
+    functions.update(getattr(node, "window_functions", {}) or {})
+
+    out: dict = {}
+    for name, fn in functions.items():
+        # ``Agg`` names its input ``arg``. Reading ``column``/``expr``
+        # instead silently yields nothing, and silently yielding nothing is
+        # exactly how a derived column ends up unclassified - the failure
+        # this function exists to prevent, reintroduced by a typo.
+        expression = getattr(fn, "arg", None)
+        if not isinstance(expression, Col):
+            continue
+        out[name] = frozenset(shared | tags_of(expression.name))
+    return out
 

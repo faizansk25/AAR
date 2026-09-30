@@ -200,29 +200,35 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _plan_for(path: str):
-    """Load and plan a pipeline file. Returns the root node and the plan.
+def _plan_for(path: str, profile: bool = True):
+    """Load, profile and plan a pipeline file. Returns ``(root, plan)``.
 
     Delegates to :class:`PipelineService` so the CLI and the Workbench plan
     through the same code. The CLI's own ``SystemExit`` behaviour is kept
     here because only a command line has an exit code to set.
+
+    **Profiling happens before planning, and unconditionally.** This used to
+    be ``plan()`` followed by ``profile_sources()``, which meant a source
+    declared as 100 MB and actually 8 GB was planned from the declaration and
+    the measurement was then discarded. It was also skipped entirely under
+    ``--json``, so the same pipeline planned differently depending on the
+    output format - two answers to one question, chosen by a flag that has
+    nothing to do with planning.
     """
     from .application import PipelineService
     from .failures import PlanInfeasible
 
     try:
-        root = PipelineService().load(path)
+        return PipelineService().prepare(path, profile=profile)
     except FileNotFoundError as exc:
+        print(f"aar: {exc}", file=sys.stderr)
+        raise SystemExit(_EXIT_USER_ERROR) from exc
+    except PlanInfeasible as exc:
         print(f"aar: {exc}", file=sys.stderr)
         raise SystemExit(_EXIT_USER_ERROR) from exc
     except Exception as exc:  # noqa: BLE001
         print(f"aar: could not load {path}: {type(exc).__name__}: {exc}",
               file=sys.stderr)
-        raise SystemExit(_EXIT_USER_ERROR) from exc
-    try:
-        return root, PipelineService().plan(root)
-    except PlanInfeasible as exc:
-        print(f"aar: {exc}", file=sys.stderr)
         raise SystemExit(_EXIT_USER_ERROR) from exc
 
 
@@ -283,10 +289,9 @@ def _cmd_run(args: argparse.Namespace) -> int:
         print(plan.render())
         print()
 
-    # Profile before planning, exactly as PipelineService.run does, so the
-    # plan that is displayed and the plan that is executed are the same one.
-    if not args.json:
-        service.profile_sources(root)
+    # No profiling here: `_plan_for` already did it, before planning, via
+    # PipelineService.prepare. Profiling again now would be a second read of
+    # the same sources for a result the plan has already been built from.
 
     policy = _load_policy(getattr(args, "policy", None))
     subject = None
