@@ -184,8 +184,17 @@ def segment_predecessors(segments: list[Segment]) -> dict[int, list[int]]:
     return preds
 
 
+#: Largest number of complete engine assignments the search will evaluate.
+#: Configurable because the right budget depends on the machine and the
+#: workload, and a fixed 20,000 is neither: it is generous for a linear
+#: pipeline of five segments and useless for fifteen.
+DEFAULT_SEARCH_BUDGET = 20_000
+
+
 def _cheapest_assignment(segments: list[Segment], options: list[dict],
-                         preds: dict[int, list[int]], hop) -> list[str]:
+                         preds: dict[int, list[int]], hop,
+                         budget: int = DEFAULT_SEARCH_BUDGET
+                         ) -> tuple[list[str], "OptimizationReport"]:
     """The globally cheapest engine per segment, over the real graph.
 
     A single forward pass cannot answer this once there is more than one
@@ -194,12 +203,10 @@ def _cheapest_assignment(segments: list[Segment], options: list[dict],
     therefore scores complete assignments rather than reading one layer off
     the table, which is what silently under-counted a second branch.
 
-    The search is exhaustive over the product of the per-segment candidate
-    sets. That is exponential in the number of segments and is the honest
-    limit of the current design: it is exact, and exact is what the test
-    needs, but a pipeline with many unconstrained segments would not scale.
-    A DP over *engine sets* per segment is the way to make that cheaper and
-    is recorded as the next step rather than quietly approximated here.
+    Returns the assignment *and* a report saying how it was found, because an
+    approximate answer that admits it is the only kind worth returning: a
+    caller reading a plan cannot otherwise tell a globally optimal search
+    from a per-segment guess that looks identical in the output.
     """
     import itertools
 
@@ -216,33 +223,102 @@ def _cheapest_assignment(segments: list[Segment], options: list[dict],
                     continue
                 source = assignment[previous]
                 if source != engine:
+                    # The bytes crossing this edge are the *predecessor's*
+                    # output, not this segment's. A join with a 100 MB side
+                    # and a 2 GB side produces 50 MB; charging the join's own
+                    # 50 MB for both edges under-counts the movement by the
+                    # ratio between the input and the output - measured at
+                    # 2x for a 100 MB input, and unboundedly wrong as the
+                    # input grows. It also hides the large side entirely,
+                    # so the plan sees a cheap join where the expensive one
+                    # is.
                     total += hop(source, engine,
-                                 segments[index].nbytes).total_s
+                                 segments[previous].nbytes).total_s
         return total
 
     if not choices:
-        return []
+        return [], OptimizationReport("exact", 0, 0, 0)
+
     # Guard against a combinatorial blow-up on a wide pipeline. When the
-    # product is too large, fall back to a per-segment local choice and say
-    # so in the plan rather than hanging: an approximate answer that admits
+    # product is too large, fall back to a per-segment local choice and *say
+    # so in the plan* rather than hanging: an approximate answer that admits
     # it beats an exact one that never arrives.
     product = 1
     for options_for_segment in choices:
         product *= max(1, len(options_for_segment))
-    if product > 20_000:
-        return [min(choices[i], key=lambda e: (options[i][e][0].total_s, e))
-                for i in order]
+
+    if product > budget:
+        local = [min(choices[i], key=lambda e: (options[i][e][0].total_s, e))
+                 for i in order]
+        return local, OptimizationReport(
+            "approximate", product, 0, budget,
+            reason=(f"search budget of {budget:,} assignments exceeded; "
+                    f"{product:,} were needed. Each engine was chosen on its "
+                    f"own segment cost, so the plan is not globally optimal "
+                    f"and the cheap local choice may pay more in engine "
+                    f"crossings than it saves."))
 
     best_assignment: dict[int, str] | None = None
     best_cost = float("inf")
+    evaluated = 0
     for combination in itertools.product(*choices):
         assignment = dict(zip(order, combination))
         cost = score(assignment)
+        evaluated += 1
         if cost < best_cost - 1e-12:
             best_cost, best_assignment = cost, assignment
     if best_assignment is None:  # pragma: no cover - choices is never empty
         raise PlanInfeasible("no feasible engine assignment")
-    return [best_assignment[i] for i in order]
+    return ([best_assignment[i] for i in order],
+            OptimizationReport("exact", product, evaluated, budget))
+
+
+@dataclass(slots=True)
+class OptimizationReport:
+    """How the engine assignment was found, so a plan can say so.
+
+    A plan that reports 4.2s looks identical whether the search proved it is
+    the cheapest possible 4.2s or merely picked each engine on its own
+    segment's cost and hoped the crossings came out cheap. Those are very
+    different claims, and a reader of the output has no way to tell them
+    apart - which is exactly what the search-budget fallback did silently.
+    """
+
+    #: ``"exact"`` when every assignment was evaluated, ``"approximate"``
+    #: when the budget forced a per-segment local choice.
+    method: str = "exact"
+    #: How many assignments a complete search would have needed.
+    combinations: int = 0
+    #: How many were actually evaluated.
+    evaluated: int = 0
+    #: The budget that was applied.
+    budget: int = DEFAULT_SEARCH_BUDGET
+    #: Why it fell back, when it did. Empty for an exact search.
+    reason: str = ""
+
+    @property
+    def is_global_optimum(self) -> bool:
+        """True only when every candidate assignment was scored."""
+        return self.method == "exact"
+
+    def render(self) -> str:
+        if self.is_global_optimum:
+            return (f"Optimization: exact, {self.evaluated:,} of "
+                    f"{self.combinations:,} assignments evaluated "
+                    f"(budget {self.budget:,}). Global optimality: proven.")
+        return (f"Optimization: APPROXIMATE. {self.reason} Evaluated "
+                f"{self.evaluated:,} of {self.combinations:,} assignments "
+                f"(budget {self.budget:,}). Global optimality: NOT ESTABLISHED.")
+
+    def to_dict(self) -> dict:
+        return {
+            "method": self.method,
+            "combinations": self.combinations,
+            "evaluated": self.evaluated,
+            "budget": self.budget,
+            "is_global_optimum": self.is_global_optimum,
+            "reason": self.reason,
+        }
 
 
 def decompose_into_segments(root: Node) -> list[Segment]:
@@ -417,6 +493,11 @@ class Plan:
     segments: list[SegmentPlan]
     total_s: float
     sources_used: dict[str, str] = field(default_factory=dict)
+    #: Whether the engine search was exhaustive, and if not, why. A plan
+    #: that does not carry this looks identical whether it is the cheapest
+    #: possible plan or a per-segment guess.
+    optimization: "OptimizationReport" = field(
+        default_factory=OptimizationReport)
 
     @property
     def engines(self) -> tuple[str, ...]:
@@ -424,8 +505,25 @@ class Plan:
 
     @property
     def boundaries(self) -> int:
-        """Number of engine changes - the data movement the plan pays for."""
-        return sum(1 for a, b in zip(self.engines, self.engines[1:]) if a != b)
+        """Engine changes on real dependency edges, not adjacent pairs.
+
+        Counting changes between *neighbouring segments* only works for a
+        chain. In a branching DAG the segment before a join may belong to
+        the other branch and feed it not at all, while a segment two places
+        back may feed it directly - so adjacency both over-counts and misses
+        crossings that really happen. Every edge of the segment graph is
+        inspected instead.
+        """
+        segments = [p.segment for p in self.segments]
+        preds = segment_predecessors(segments)
+        count = 0
+        for index in (s.index for s in segments):
+            for previous in preds.get(index, []):
+                if previous >= index:
+                    continue
+                if self.segments[previous].engine != self.segments[index].engine:
+                    count += 1
+        return count
 
     def render(self) -> str:
         lines = ["PLAN", ""]
@@ -443,6 +541,10 @@ class Plan:
         lines.append(f"  total {self.total_s * 1e3:.1f} ms across "
                      f"{len(self.segments)} segment(s), "
                      f"{self.boundaries} engine boundary/ies")
+        # Always shown, including when the search was exact. A reader who is
+        # told only that a plan is approximate cannot act on it; a reader
+        # told it is exact can trust the number above it.
+        lines.append(f"  {self.optimization.render()}")
         return "\n".join(lines)
 
     def assign(self) -> Node:
@@ -481,7 +583,7 @@ class AdaptivePlanner:
     """
 
     __slots__ = ("_cost", "_registry", "_profile", "_ledger",
-                 "_require_available", "_margin")
+                 "_require_available", "_margin", "_search_budget")
 
     def __init__(
         self,
@@ -491,6 +593,7 @@ class AdaptivePlanner:
         ledger: DegradationLedger | None = None,
         require_available: bool = True,
         margin: float = 0.0,
+        search_budget: int = DEFAULT_SEARCH_BUDGET,
     ) -> None:
         self._cost = cost_model or CostModel()
         self._registry = registry or CapabilityRegistry()
@@ -502,6 +605,10 @@ class AdaptivePlanner:
         self._require_available = require_available
         #: Extra fraction added to every estimated cost, for safety.
         self._margin = margin
+        #: How many complete engine assignments the search may evaluate.
+        #: Configurable because a fixed budget is wrong at both ends: 20,000
+        #: is generous for a five-segment pipeline and hopeless for fifteen.
+        self._search_budget = int(search_budget)
 
     # ------------------------------------------------------------ candidates
     def candidate_engines(self, segment: Segment) -> list[str]:
@@ -657,12 +764,17 @@ class AdaptivePlanner:
         # segment i may not feed it at all, and a segment may have two
         # predecessors whose crossings both have to be paid. The search below
         # scores complete assignments against the real graph instead.
-        path = _cheapest_assignment(segments, options, preds, hop)
-        return self._assemble(root, segments, options, path)
+        path, report = _cheapest_assignment(
+            segments, options, preds, hop,
+            budget=getattr(self, "_search_budget", DEFAULT_SEARCH_BUDGET))
+        return self._assemble(root, segments, options, path,
+                              optimization=report)
 
     def _assemble(self, root: Node, segments: list[Segment],
                   options: list[dict[str, tuple[CostBreakdown, str]]],
-                  path: list[str]) -> Plan:
+                  path: list[str],
+                  optimization: "OptimizationReport | None" = None
+                  ) -> Plan:
         """Turn a chosen engine path into a :class:`Plan`.
 
         The dynamic program gave the optimal *assignment*; this fills in the
@@ -684,21 +796,29 @@ class AdaptivePlanner:
         preds = segment_predecessors(segments)
 
         for seg, engine in zip(segments, path):
-            # The engines this segment's data actually arrives on.
-            incoming = [path[p] for p in preds.get(seg.index, [])
+            # The engines this segment's data actually arrives on, paired with
+            # the segment that produced each: a crossing costs the bytes the
+            # *predecessor* emitted, not what this segment will emit. A join
+            # over a 100 MB and a 2 GB side produces 50 MB, and pricing both
+            # edges at 50 MB hides the 2 GB entirely. The pairing also keeps
+            # the figure below consistent with the one the search optimised,
+            # which used the same rule.
+            incoming = [(path[p], p) for p in preds.get(seg.index, [])
                         if p < seg.index]
             inbound = 0.0
-            for source in incoming:
+            for source, origin in incoming:
                 if source != engine:
-                    inbound += hop(source, engine, seg.nbytes).total_s
+                    inbound += hop(source, engine,
+                                  segments[origin].nbytes).total_s
 
             scored: list[tuple[str, float, CostBreakdown, float, str]] = []
             for other, (breakdown, source) in options[seg.index].items():
                 hop_in = 0.0
                 cost = breakdown
-                for predecessor in incoming:
+                for predecessor, origin in incoming:
                     if predecessor != other:
-                        hop_in += hop(predecessor, other, seg.nbytes).total_s
+                        hop_in += hop(predecessor, other,
+                                      segments[origin].nbytes).total_s
                 if hop_in:
                     # ``segment_cost`` is called without a ``from_engine``,
                     # so its ``transfer_s`` is 0 and the crossings are not
@@ -732,7 +852,8 @@ class AdaptivePlanner:
                                     scored),
             ))
 
-        plan = Plan(root=root, segments=chosen, total_s=total)
+        plan = Plan(root=root, segments=chosen, total_s=total,
+                    optimization=optimization or OptimizationReport())
         plan.assign()
         return plan
 

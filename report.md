@@ -4,8 +4,73 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 751 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 761 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 16 — transfer accounting, and a plan that admits its own search
+
+The audit's ordering advice is followed here: costs get fixed **before** the
+optimizer, because a better search over wrong costs still picks the wrong plan.
+
+#### Transfers were priced with the wrong number
+
+`_cheapest_assignment` charged `segments[index].nbytes` for every inbound
+edge — the *destination's* output, not what is arriving. The audit's example
+reproduced exactly:
+
+```
+segment 0  nbytes =    100,000,000   (the data arriving)
+segment 1  nbytes =     50,000,000   (the join's output)
+  charged for the inbound edge: 50,000,000   UNDER by 2x
+```
+
+The 2 GB side was not represented at all, and the error grows with the
+input-to-output ratio, so a join moving two gigabytes to produce fifty
+megabytes looked nearly free.
+
+**The same expression appeared twice** — once in the search, once in
+`_assemble` — and had already drifted. Both now price each edge with its own
+predecessor's output, and a test asserts the plan's total equals the sum of
+its own segments so the two cannot disagree again.
+
+This changes real decisions: the audit's pipeline now reports
+`segment 1 [gpu] Join (preferred gpu, chose cpu on cost)` where it previously
+took the GPU, because the inbound transfer is no longer under-priced.
+
+#### A plan now states how it was optimized
+
+`OptimizationReport` is carried on every `Plan` and always rendered:
+
+```
+Optimization: exact, 36 of 36 assignments evaluated (budget 20,000).
+Global optimality: proven.
+```
+
+and when the budget is exceeded:
+
+```
+Optimization: APPROXIMATE. search budget of 4 assignments exceeded;
+8,192 were needed. ... Global optimality: NOT ESTABLISHED.
+```
+
+The budget is now a planner constructor argument rather than a constant,
+because a fixed 20,000 is wrong at both ends — generous for a five-segment
+pipeline, hopeless for fifteen. `Plan.boundaries` also counts crossings over
+**real dependency edges** rather than adjacent pairs, which only coincides
+for a chain.
+
+**761 passed, 7 skipped, 0 failed; ruff clean.** NYC taxi Parquet unchanged:
+3,627,882 rows / 55,682,369 bytes.
+
+#### Still open
+
+The search is still exhaustive over the assignment product — now *visible*
+when it falls back, but not faster. A DP over engine sets is the next step
+and is not attempted here: with the costs only now trustworthy, an exact
+search is worth more than a scalable approximate one. Peak-memory planning,
+cardinality uncertainty bounds, and the Workbench security boundary remain.
 
 ---
 

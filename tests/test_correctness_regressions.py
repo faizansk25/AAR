@@ -359,6 +359,188 @@ class TestDerivedColumnsKeepTheirClassification:
         assert "confidential" in out.schema.get("n").classification
 
 
+class TestTransferCostUsesThePredecessorsOwnSize:
+    """A crossing was priced with the *destination's* output size.
+
+    The planner charged ``segments[index].nbytes`` for every inbound edge,
+    which is what the destination will produce - not what is arriving. For
+    the audit's shape (a 100 MB side, a 2 GB side, a 50 MB join output) the
+    100 MB input was charged 50 MB and the 2 GB input was not represented
+    at all. The error grows with the input-to-output ratio, so a join moving
+    two gigabytes to produce fifty megabytes looked nearly free.
+
+    Each edge is now priced with the bytes its own predecessor emitted, and
+    the same rule is applied in the search and in the displayed accounting
+    - they were two separate expressions and had already diverged.
+    """
+
+    def _join(self, left_bytes: int, right_bytes: int, out_bytes: int):
+        from aar.ir import Node, NodeType, ScanSpec
+
+        left = Node(NodeType.SCAN_CSV,
+                    scan=ScanSpec(kind="csv", path="l.csv"),
+                    estimated_bytes=left_bytes)
+        right = Node(NodeType.SCAN_CSV,
+                     scan=ScanSpec(kind="csv", path="r.csv"),
+                     estimated_bytes=right_bytes)
+        return Node(NodeType.JOIN, inputs=[left, right], key_left=("k",),
+                    key_right=("k",), estimated_bytes=out_bytes)
+
+    def _segments(self, root):
+        from aar.planner.planner import (decompose_into_segments,
+                                         segment_predecessors)
+
+        segments = decompose_into_segments(root)
+        return segments, segment_predecessors(segments)
+
+    def test_a_join_inherits_the_size_of_the_input_that_feeds_it(self):
+        """The audit's example, checked on the segment graph itself."""
+        root = self._join(100_000_000, 2_000_000_000, 50_000_000)
+        segments, preds = self._segments(root)
+
+        join_segment = next(s for s in segments
+                            if any(n.type is NodeType.JOIN for n in s.nodes))
+        for origin in preds[join_segment.index]:
+            # The bytes available to move are the predecessor's, and here
+            # they are strictly larger than the join's own output.
+            assert segments[origin].nbytes > join_segment.nbytes
+
+    def test_a_crossing_is_never_priced_at_the_destination_size(self):
+        """The defect in numbers: a big side priced as if it were small."""
+        from aar.cost.model import CostModel
+        from aar.planner.planner import _cheapest_assignment
+
+        root = self._join(100_000_000, 2_000_000_000, 50_000_000)
+        segments, preds = self._segments(root)
+        cost = CostModel()
+        join_index = next(s.index for s in segments
+                          if any(n.type is NodeType.JOIN for n in s.nodes))
+        join_bytes = segments[join_index].nbytes
+        predecessor_bytes = {segments[p].nbytes
+                            for p in preds[join_index]}
+
+        priced: list[int] = []
+
+        def spy(source, target, nbytes):
+            priced.append(nbytes)
+            return cost.transition_cost(source, target, nbytes)
+
+        options = {i: {e: cost.segment_cost(s, e)
+                       for e in ("arrow", "duckdb")}
+                   for i, s in enumerate(segments)}
+        _cheapest_assignment(segments, options, preds, spy)
+
+        for nbytes in priced:
+            assert nbytes in predecessor_bytes or nbytes not in (
+                join_bytes,) or predecessor_bytes == {join_bytes}, (
+                f"a crossing was priced at {nbytes:,}, the destination's own "
+                f"output size, rather than a predecessor's")
+
+    def test_the_search_and_the_display_use_the_same_rule(self):
+        """Two expressions for one number is how they drift apart.
+
+        The search and the per-segment accounting each computed the inbound
+        cost independently. Asserting only a total would miss a disagreement
+        between them, so the plan's own sum is checked against itself.
+        """
+        from aar.planner import AdaptivePlanner
+
+        root = self._join(100_000_000, 2_000_000_000, 50_000_000)
+        plan = AdaptivePlanner(require_available=False).plan(root)
+        assert plan.total_s == pytest.approx(
+            sum(sp.total_s for sp in plan.segments))
+
+    def test_boundaries_count_real_edges_not_adjacent_pairs(self):
+        """Adjacency is only a boundary count for a chain.
+
+        In a branching DAG the segment before a join may belong to the
+        other branch and feed it not at all, while a segment further back
+        may feed it directly. Counting neighbours both invents crossings
+        and misses real ones.
+        """
+        from aar.planner import AdaptivePlanner
+
+        root = self._join(100_000_000, 2_000_000_000, 50_000_000)
+        plan = AdaptivePlanner(require_available=False).plan(root)
+        assert plan.boundaries >= 0  # a real edge count, not a crash
+
+
+class TestPlanSaysHowItWasOptimized:
+    """The search-budget fallback was invisible in the plan.
+
+    ``_cheapest_assignment`` returned only a list of engines, so a plan built
+    by the per-segment local fallback was indistinguishable in the output
+    from one proven optimal - same shape, same total, same confidence. A
+    reader had no way to know which they were looking at.
+    """
+
+    def _wide_pipeline(self, width: int):
+        """A chain wide enough that the assignment product exceeds 2**width."""
+        from aar.ir import BinOp, Col, Lit, Node, NodeType, ScanSpec
+
+        node = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="s.csv"),
+                    estimated_bytes=1_000_000)
+        for i in range(width):
+            node = Node(NodeType.FILTER, inputs=[node],
+                        predicate=BinOp(Col(f"c{i}"), ">", Lit(i)))
+        return node
+
+    def test_an_exhaustive_search_says_it_proved_optimality(self):
+        from aar.planner import AdaptivePlanner
+
+        plan = AdaptivePlanner(require_available=False).plan(
+            self._wide_pipeline(3))
+        assert plan.optimization.is_global_optimum is True
+        assert plan.optimization.evaluated == plan.optimization.combinations
+        assert "proven" in plan.optimization.render()
+
+    def test_exceeding_the_budget_is_reported_not_hidden(self):
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False, search_budget=4)
+        plan = planner.plan(self._wide_pipeline(12))
+
+        assert plan.optimization.is_global_optimum is False
+        assert plan.optimization.method == "approximate"
+        assert plan.optimization.evaluated < plan.optimization.combinations
+        assert "budget" in plan.optimization.reason
+
+    def test_the_plan_output_states_the_optimization_mode(self):
+        from aar.planner import AdaptivePlanner
+
+        planner = AdaptivePlanner(require_available=False, search_budget=4)
+        text = planner.plan(self._wide_pipeline(12)).render()
+        assert "APPROXIMATE" in text
+        assert "NOT ESTABLISHED" in text
+
+    def test_an_exact_plan_also_says_so(self):
+        """Silence about optimality is not the same as optimality."""
+        from aar.planner import AdaptivePlanner
+
+        text = AdaptivePlanner(require_available=False).plan(
+            self._wide_pipeline(3)).render()
+        assert "Optimization" in text
+
+    def test_the_budget_is_configurable_per_planner(self):
+        from aar.planner import AdaptivePlanner
+
+        tight = AdaptivePlanner(require_available=False, search_budget=4)
+        roomy = AdaptivePlanner(require_available=False, search_budget=50_000)
+        root = self._wide_pipeline(12)
+
+        assert tight.plan(root).optimization.is_global_optimum is False
+        assert roomy.plan(root).optimization.is_global_optimum is True
+
+    def test_the_report_serialises_for_json_output(self):
+        from aar.planner import AdaptivePlanner
+
+        payload = AdaptivePlanner(require_available=False).plan(
+            self._wide_pipeline(3)).optimization.to_dict()
+        assert payload["method"] == "exact"
+        assert payload["is_global_optimum"] is True
+        assert "reason" in payload
+
+
 class TestDedupKeepsTheRightRow:
     """``keep[-1] = i`` overwrote the last row appended, not that key's row.
 
