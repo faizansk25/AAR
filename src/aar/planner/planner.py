@@ -134,11 +134,20 @@ class Segment:
 def estimate_bytes(node: Node) -> int:
     """Best available size estimate for a node's output.
 
-    Uses the node's own declared estimate when present, otherwise a coarse
-    default. This is a *declared* estimate - the runtime replaces it with
-    measured statistics once the segment has executed once - so it is
-    deliberately conservative rather than clever.
+    Prefers a *measured* profile when one exists (see :mod:`aar.stats`),
+    falls back to the node's declared estimate, and finally to a coarse
+    default. The order matters: a plan built on a Parquet footer or a
+    measured table is qualitatively better informed than one built on a
+    number the pipeline guessed about itself.
+
+    Profiling is deliberately *not* attempted here. Opening a file to
+    measure it is a side effect, and ``explain`` must stay safe to run with
+    no data present. ``PipelineService`` and ``aar profile`` do the
+    measuring and attach the result; this function consumes it.
     """
+    profile = getattr(node, "aar_profile", None)
+    if profile is not None and getattr(profile, "nbytes", 0):
+        return int(profile.nbytes)
     if node.estimated_bytes is not None:
         return int(node.estimated_bytes)
     rows = node.estimated_rows

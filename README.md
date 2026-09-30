@@ -69,9 +69,62 @@ database).
 
 ## Install
 
+### Conda (recommended on this machine)
+
+Conda is already installed here (`conda 26.7.1`, `C:\Users\fzcit\miniconda3`).
+Use a dedicated environment so AAR's engines cannot collide with the `base`
+env or with your other work:
+
+```powershell
+conda create -n aar python=3.11 -y
+conda activate aar
+python -m pip install -e ".[arrow,duckdb,polars,excel]"
+```
+
+Check it worked — `aar` should be on your path and the engines should report
+available:
+
+```powershell
+aar version
+aar doctor
+aar engines
+```
+
+`aar doctor` prints this machine's real hardware, and `aar engines` probes
+each engine by importing it. If an engine says it is unavailable, the reason
+is printed verbatim rather than being greyed out silently.
+
+From then on, **every command in this README is run from the `aar`
+environment**, with no `.venv\` prefix:
+
+```powershell
+conda activate aar
+aar explain pipelines\example_orders.py
+aar run    pipelines\example_orders.py
+aar workbench                      # the GUI - see below
+```
+
+The four commands you need most often:
+
+| Command | What it does |
+|---|---|
+| `conda activate aar` | Put the right Python on your path. Do this first, in every new terminal. |
+| `aar doctor` | What this machine is, and what AAR can actually do on it |
+| `aar run <pipeline>` | Execute a pipeline and print the result |
+| `aar profile <file>` | Measure a data file: rows, size, per-column statistics |
+| `aar workbench` | Open the GUI in your browser |
+
+If `conda activate` is not recognised in a new PowerShell window, run
+`conda init powershell` once, then open a new terminal.
+
+### pip / venv (alternative)
+
+If you would rather not use conda:
+
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e ".[dev]"
+.\.venv\Scripts\aar.exe doctor
 ```
 
 The core has **no required third-party dependencies** and runs on the standard
@@ -81,14 +134,71 @@ library alone. Engines are opt-in extras:
 .\.venv\Scripts\python.exe -m pip install -e ".[arrow,duckdb,polars,excel]"
 ```
 
-## Verify
+---
+
+## GUI — yes, there is one
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q             # 654 tests
-.\.venv\Scripts\python.exe tools\check_syntax.py    # parse every module
-.\.venv\Scripts\python.exe tools\smoke_run.py       # build a plan, run it, check the numbers
-.\.venv\Scripts\python.exe tools\manual_test.py     # guided tour, by hand
-.\.venv\Scripts\python.exe tools\debug_calib.py     # per-benchmark timings
+aar workbench
+```
+
+That opens `http://127.0.0.1:8765` in your browser. It is a real UI over the
+real system, not a demo: the engine list comes from a live probe, `Explain`
+returns the actual planner's decision trace, and `Run` executes the pipeline
+through the same `PipelineService` the CLI uses. The result grid pages
+through real rows.
+
+```powershell
+aar workbench --port 9000              # if 8765 is taken
+aar workbench --no-browser             # start it without opening a browser
+aar workbench --open                   # open a browser (the default)
+```
+
+It binds to `127.0.0.1` only, so it is reachable from this machine and
+nothing else. **Do not** pass `--host 0.0.0.0` on a shared or untrusted
+network: the server has no authentication and `/api/run` executes Python
+pipeline files from disk.
+
+## Measure your data first
+
+```powershell
+aar profile data\nyc_taxi_2022_03.parquet
+aar profile data\nyc_taxi_2022_03.parquet --json
+```
+
+```
+data\nyc_taxi_2022_03.parquet: 3,627,882 rows, 55,682,369 bytes (15 B/row, parquet-metadata)
+  tpep_pickup_datetime, ~3.7 chars
+  trip_distance, ~1.4 chars
+  passenger_count, 3% null, ~0.2 chars
+```
+
+Every profile states its own provenance. `parquet-metadata` is exact and free
+— the row count and per-column widths come from the footer, so nothing is
+read. `sampled` means a bounded sample was extrapolated, and the numbers are
+marked as estimates. A profile that does not say which one it is would be a
+guess wearing a measurement's clothes.
+
+`aar run` does this for you automatically, so the planner's arithmetic rests
+on measured sizes rather than on the `estimated_bytes` a pipeline declares
+about itself.
+
+## Verify
+
+With conda active:
+
+```powershell
+python -m pytest -q                   # 678 tests
+python tools\check_syntax.py          # parse every module
+python tools\smoke_run.py             # build a plan, run it, check the numbers
+python tools\manual_test.py           # guided tour, by hand
+python tools\debug_calib.py           # per-benchmark timings
+```
+
+Or without activating anything, using the environment's interpreter directly:
+
+```powershell
+conda run -n aar python -m pytest -q
 ```
 
 The large-data audit needs a one-off download (~100 MB, NYC taxi

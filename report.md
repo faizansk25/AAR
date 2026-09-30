@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 654 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 678 tests
 **Last updated:** 2026-09-29
 
 ---
@@ -555,9 +555,55 @@ Where the eighth design principle ("empirical, not hardcoded") is cashed in.
 
 ---
 
+### 3.8 Data profiler — `src/aar/stats/__init__.py`
+
+The gap this closes: the cost model sized every segment from
+`Node.estimated_bytes` — a number the pipeline *declared* — or a flat 1 MB
+guess. The dynamic program added in round 13 was therefore reasoning from
+numbers nobody had checked.
+
+- **Prefers declared metadata over sampling.** A Parquet footer gives the row
+  count, per-column distinct counts, null counts and compressed chunk sizes
+  without reading a single value. SQLite's `sqlite_stat1` does the same after
+  `ANALYZE`. Both are exact and free; reading 10 GB to plan a query is
+  neither.
+- **Bounded sampling where metadata is absent.** A CSV carries nothing, so
+  the first N rows are read and the row count extrapolated from bytes-per-row
+  *measured from the file's own text*. Distinct counts come from a
+  HyperLogLog sketch with a 4096-value exact set, because an exact set over
+  50M distinct strings is the memory problem the component exists to avoid.
+- **Every profile names its provenance** — `parquet-metadata`,
+  `database-stats`, `measured`, or `sampled` — and `exact_rows` says whether
+  the count is a fact or an extrapolation. A profile that cannot say which is
+  a guess wearing a measurement's clothes.
+- **An unreadable source returns `None`, not zero rows.** Zero would plan a
+  trivially cheap pipeline, which is the one answer a missing measurement must
+  never produce.
+- **`aar profile <file>` and `aar run`** both use it. `PipelineService` profiles
+  every source before planning, so the estimate is measured by default rather
+  than opt-in.
+
+Verified on real data, not only in tests:
+
+```
+$ aar profile data\nyc_taxi_2022_03.parquet
+data\nyc_taxi_2022_03.parquet: 3,627,882 rows, 55,682,369 bytes (15 B/row, parquet-metadata)
+  tpep_pickup_datetime, ~3.7 chars
+  trip_distance, ~1.4 chars
+  passenger_count, 3% null, ~0.2 chars
+```
+
+**Not yet done:** measured *estimation error*. The profiler records what it
+believed, but nothing yet compares that against the row count the executor
+actually observed, so a systematically wrong profiler would not be caught by
+the system itself. The executor already records real output row counts, so
+the comparison is a matter of wiring rather than invention.
+
+---
+
 ## 4. Testing
 
-**654 tests: 654 passing, 8 skipped, 0 failing.** Every skip states the
+**678 tests: 678 passing, 8 skipped, 0 failing.** Every skip states the
 missing dependency rather than passing vacuously. `README.md` states the same
 number, and `test_the_readme_test_count_is_the_real_one` fails the suite if
 the two ever disagree again — a stale count is the cheapest way to lose a
@@ -571,6 +617,7 @@ reader's trust, and this project shipped one for months.
 | `test_hardware.py` | 32 | Byte helpers, all 6 probes, profile facade, curve fitting, store round-trip, stale-profile rejection, **live calibration** |
 | `test_failures.py` | 20 | Full matrix coverage, error hierarchy, ledger semantics |
 | `test_ir.py` | 20 | Expressions incl. SQL-injection safety, node metadata, DAG ordering, cycle detection |
+| `test_data_profiler.py` | 24 | **Row counts, cardinality, nulls, widths, provenance, sampling bounds** |
 | `test_planner.py` | 28 | Segment decomposition, **global optimality vs brute force**, transitions charged exactly once, feasibility |
 | `test_correctness_regressions.py` | 16 | **Defects that shipped with the suite green** — dedup, window frames, quality rules, trace integrity |
 | `test_cli.py` | 37 | `doctor` / `engines` / `calibrate` / `explain` / `run` / `policy`, exit codes |

@@ -96,16 +96,27 @@ class PipelineService:
 
     def run(self, path: str, role: str | None = None,
             policy_path: str | None = None,
-            actor: str | None = None) -> RunReport:
-        """Load, plan and execute one pipeline end to end.
+            actor: str | None = None,
+            profile: bool = True) -> RunReport:
+        """Load, profile, plan and execute one pipeline end to end.
 
         Planning and execution stay inside one call on purpose. A caller that
         plans separately from running can pair one pipeline with another's
         plan, and the resulting error names neither.
+
+        ``profile`` measures each source before planning. That is the whole
+        point of the profiler: the cost model otherwise sizes segments from
+        numbers the pipeline declared about itself. Profiling is bounded -
+        a Parquet footer or a database's own statistics, else a capped
+        sample - and a source that cannot be measured is left alone, with
+        the plan falling back to the declared estimate. It never fails a run
+        because a file was unreadable.
         """
         from .runtime import Executor
 
         root = self.load(path)
+        if profile:
+            self.profile_sources(root)
         plan = self.plan(root)
         policy = self._load_policy(policy_path)
         subject = self._subject(role, actor)
@@ -113,3 +124,29 @@ class PipelineService:
                       history=self._history) as executor:
             result = executor.execute(plan)
         return RunReport(plan=plan, result=result, root=root)
+
+    def profile_sources(self, root: Any) -> dict:
+        """Measure every source a pipeline reads, and attach the results.
+
+        Returns the profiles that were taken, so a caller can show them.
+        A source that cannot be measured is skipped rather than reported as
+        zero rows - a zero would plan a trivially cheap pipeline, which is
+        the one answer a missing measurement must never produce.
+        """
+        from .ir import NodeType
+        from .stats import DataProfiler
+
+        # SCAN_ARROW is an in-memory handle and SCAN_CONST has no source at
+        # all; neither has anything to read from disk.
+        skip = (NodeType.SCAN_ARROW, NodeType.SCAN_CONST)
+        profiler = DataProfiler()
+        taken: dict = {}
+        for node in root.walk():
+            if node.type in skip or node.aar_profile is not None:
+                continue
+            profile = profiler.profile_node(node)
+            if profile is None:
+                continue
+            node.aar_profile = profile
+            taken[str(node.type.value)] = profile
+        return taken

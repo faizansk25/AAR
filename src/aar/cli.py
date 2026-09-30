@@ -19,7 +19,7 @@ import argparse
 import os
 import sys
 import traceback
-from typing import Sequence
+from typing import Any, Sequence
 
 from . import __version__
 
@@ -119,6 +119,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="bind address (loopback by default)")
     w.add_argument("--open", action="store_true",
                    help="open a browser window immediately")
+    w.add_argument("--no-browser", action="store_true",
+                   help="serve without opening a browser")
+
+    p_profile = sub.add_parser(
+        "profile", help="measure a data source: rows, size, per-column statistics")
+    p_profile.add_argument("target", nargs="?",
+                           help="a file to profile, or a pipeline to inspect")
+    p_profile.add_argument("--sample-rows", type=int, default=50_000,
+                           help="rows to sample when metadata is unavailable")
+    p_profile.add_argument("--json", action="store_true",
+                           help="emit JSON instead of a readable summary")
 
     p_examples = sub.add_parser(
         "examples", help="list, show, or write out a runnable example pipeline")
@@ -407,9 +418,121 @@ def _cmd_version(_args: argparse.Namespace) -> int:
 def _cmd_workbench(args: argparse.Namespace) -> int:
     from .workbench import WorkbenchServer
 
+    open_browser = bool(getattr(args, "open", False))
+    if getattr(args, "no_browser", False):
+        # An explicit refusal wins over --open; serving quietly is what
+        # --no-browser is for, and the two flags can arrive together.
+        open_browser = False
+    if not open_browser and not getattr(args, "no_browser", False):
+        # Default: open the browser, because `aar workbench` with no flags
+        # that then shows nothing is a bad first experience.
+        open_browser = True
+    print(f"Workbench on http://{args.host}:{args.port}  (Ctrl-C to stop)")
     WorkbenchServer(host=args.host, port=args.port,
-                    open_browser=args.open).serve_forever()
+                    open_browser=open_browser).serve_forever()
     return _EXIT_OK
+
+
+def _cmd_profile(args: argparse.Namespace) -> int:
+    """Measure a data source and print what was learned.
+
+    The point is to replace a *declared* row count with a measured one, so
+    that the planner's arithmetic rests on evidence. The output always names
+    its own provenance, because a profile that does not say whether it came
+    from a Parquet footer or a 50k-row sample is a guess wearing a
+    measurement's clothes.
+    """
+    import json
+    import os
+
+    from .stats import DataProfiler
+
+    if not args.target:
+        print("aar: profile needs a file or a pipeline path", file=sys.stderr)
+        return _EXIT_USER_ERROR
+    if not os.path.exists(args.target):
+        print(f"aar: no such file: {args.target}", file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    profiler = DataProfiler(sample_rows=args.sample_rows)
+    if args.target.lower().endswith(".py"):
+        profiles = _profile_pipeline(args.target, profiler)
+    else:
+        profile = profiler.profile_node(
+            _scan_node_for(args.target))
+        profiles = {args.target: profile} if profile else {}
+
+    if not profiles:
+        print(f"aar: could not profile {args.target}: unsupported or "
+              f"unreadable source", file=sys.stderr)
+        return _EXIT_USER_ERROR
+
+    if args.json:
+        print(json.dumps(
+            {name: _profile_dict(p) for name, p in profiles.items()},
+            indent=2, default=str))
+        return _EXIT_OK
+
+    for name, profile in profiles.items():
+        print(profile.render())
+        print()
+    return _EXIT_OK
+
+
+def _profile_pipeline(path: str, profiler: Any) -> dict:
+    """Profile every source a pipeline file reads."""
+    from .application import PipelineService
+    from .ir import NodeType
+
+    root = PipelineService().load(path)
+    profiles: dict = {}
+    for node in root.walk():
+        if node.type in (NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
+                         NodeType.SCAN_JSON, NodeType.SCAN_EXCEL,
+                         NodeType.SCAN_SQL, NodeType.SCAN_MONGO):
+            profile = profiler.profile_node(node)
+            if profile is not None:
+                profiles[f"{path}::{node.type.value}"] = profile
+    return profiles
+
+
+def _scan_node_for(path: str) -> Any:
+    """Wrap a bare file path in the scan node its extension implies.
+
+    The node type has to match the ``ScanSpec.kind``, or the profiler's
+    dispatch routes on the wrong reader - a ``.xlsx`` path tagged as a
+    Parquet scan profiles as Parquet and quietly reports zero rows.
+    """
+    from .ir import Node, NodeType, ScanSpec
+
+    lowered = path.lower()
+    if lowered.endswith(".parquet"):
+        return Node(NodeType.SCAN_PARQUET,
+                    scan=ScanSpec(kind="parquet", path=path))
+    if lowered.endswith(".json"):
+        return Node(NodeType.SCAN_JSON, scan=ScanSpec(kind="json", path=path))
+    if lowered.endswith((".xlsx", ".xlsm")):
+        return Node(NodeType.SCAN_EXCEL,
+                    scan=ScanSpec(kind="excel", path=path))
+    return Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path=path))
+
+
+def _profile_dict(profile: Any) -> dict:
+    return {
+        "name": profile.name,
+        "rows": profile.rows,
+        "nbytes": profile.nbytes,
+        "bytes_per_row": profile.bytes_per_row,
+        "exact_rows": profile.exact_rows,
+        "source": profile.source,
+        "columns": [
+            {"name": c.name, "distinct": c.distinct,
+             "distinct_estimate": c.distinct_estimate,
+             "null_fraction": c.null_fraction, "avg_chars": c.avg_chars,
+             "min": c.min_value, "max": c.max_value,
+             "unsupported": c.unsupported}
+            for c in profile.columns],
+    }
 
 
 def _cmd_examples(args: argparse.Namespace) -> int:
@@ -472,6 +595,7 @@ _COMMANDS = {
     "run": _cmd_run,
     "policy": _cmd_policy,
     "workbench": _cmd_workbench,
+        "profile": _cmd_profile,
     "examples": _cmd_examples,
     "version": _cmd_version,
 }

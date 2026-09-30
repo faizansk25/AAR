@@ -515,6 +515,12 @@ class Node:
     estimated_rows: int | None = None
     estimated_bytes: int | None = None
     estimated_selectivity: float | None = None
+    #: A measured :class:`aar.stats.TableProfile` for this node's source, when
+    #: one has been taken. This is *evidence* where ``estimated_bytes`` is a
+    #: declaration: the planner prefers it, and it is what lets a plan say
+    #: "measured from a Parquet footer" rather than "assumed". Typed as
+    #: ``Any`` to keep the IR free of a dependency on the statistics layer.
+    aar_profile: Any = None
     privacy: Privacy = Privacy.INTERNAL
     deterministic: bool = True
     streamable: bool = True
