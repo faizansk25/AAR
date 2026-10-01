@@ -42,6 +42,33 @@ def _vector(value: VectorLike | None, *, name: str) -> tuple[int, ...]:
     return out
 
 
+def _estimated_input_shape(node: Node, fallback: VectorLike) -> tuple[int, ...]:
+    """Input-byte vector visible to the planner for one node.
+
+    ``CostModel.compute_s`` still calls history with its historical scalar
+    ``nbytes`` argument. For a join that scalar is normally the node/output
+    estimate, while execution records the two *input* buffers. Regressing one
+    against the other would train a model whose X axis changes meaning between
+    planning and execution.
+
+    Prefer each parent's measured profile, then its declared byte estimate.
+    If any input is unknown, fall back to the scalar the caller supplied rather
+    than inventing a partial vector that looks complete.
+    """
+    if not node.inputs:
+        return _vector(fallback, name="input_bytes")
+    sizes: list[int] = []
+    for parent in node.inputs:
+        profile = getattr(parent, "aar_profile", None)
+        measured = int(getattr(profile, "nbytes", 0) or 0)
+        declared = int(getattr(parent, "estimated_bytes", 0) or 0)
+        size = measured or declared
+        if size <= 0:
+            return _vector(fallback, name="input_bytes")
+        sizes.append(size)
+    return tuple(sizes)
+
+
 @dataclass(frozen=True, slots=True)
 class ExecutionRecord:
     """One observed execution, retaining every input independently.
@@ -230,9 +257,16 @@ class ExecutionHistory:
         the explainable one-dimensional model. Crucially, the original vector
         remains stored in every record, so a later join-aware/multivariate
         estimator can be introduced without throwing the evidence away.
+
+        When called from the existing :class:`CostModel`, derive the input
+        vector from the node's parents. That keeps the regression's X axis the
+        same at planning time and execution time even though ``compute_s``
+        still passes its historical scalar size argument.
         """
         key = self.operation_key(node_or_key)
-        shape = _vector(input_bytes, name="input_bytes")
+        shape = (_estimated_input_shape(node_or_key, input_bytes)
+                 if isinstance(node_or_key, Node)
+                 else _vector(input_bytes, name="input_bytes"))
         obs = self.records(key, engine_id, target_key=target_key)
         if not obs:
             return None
