@@ -357,8 +357,7 @@ instead — which is strictly worse.
 Four properties worth knowing:
 
 - **Enforcement happens before the bytes move.** A write that lands and is
-  then noticed is a breach that already happened; the only useful time to
-  refuse is before execution.
+  then noticed is a breach that already happened.
 - **An unknown key in a policy file is an error, not a no-op.** A misspelled
   `mask_threshold` that were silently ignored would leave a policy that looks
   configured and protects nothing.
