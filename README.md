@@ -188,7 +188,7 @@ about itself.
 With conda active:
 
 ```powershell
-python -m pytest -q                   # 802 tests
+python -m pytest -q                   # 811 tests
 python tools\check_syntax.py          # parse every module
 python tools\smoke_run.py             # build a plan, run it, check the numbers
 python tools\manual_test.py           # guided tour, by hand
@@ -357,7 +357,8 @@ instead — which is strictly worse.
 Four properties worth knowing:
 
 - **Enforcement happens before the bytes move.** A write that lands and is
-  then noticed is a breach that already happened.
+  then noticed is a breach that already happened; the only useful time to
+  refuse is before execution.
 - **An unknown key in a policy file is an error, not a no-op.** A misspelled
   `mask_threshold` that were silently ignored would leave a policy that looks
   configured and protects nothing.
