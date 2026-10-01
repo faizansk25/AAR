@@ -15,13 +15,35 @@ from __future__ import annotations
 import pytest
 
 from aar.capability import CapabilityRegistry, Device
-from aar.cost import CostModel, Priors, TransferProfile
+from aar.cost import CostModel, Priors, ResourceBudget, TransferProfile
 from aar.hardware.calibrate import CalibrationPoint, CalibrationStore
 from aar.ir import BinOp, Col, Lit, Node, NodeType, ScanSpec
 from aar.planner import (AdaptivePlanner, NodeTypeAffinity, decompose_into_segments, estimate_bytes, self_device)
 
 
 # ------------------------------------------------------------- fixtures
+class _FakeProfile:
+    """A target machine, stated rather than detected.
+
+    Every planner test that asserts on arithmetic needs a *known* target. If a
+    test omits ``profile=``, ``AdaptivePlanner`` detects the host, and the
+    result then depends on how much RAM the CI runner happened to have free -
+    which is how five transfer-accounting tests failed on a busy macOS runner
+    with PlanInfeasible while passing everywhere else.
+
+    Duck-typed on purpose: the planner only reads ``memory_budget_bytes`` and
+    ``vram_budget_bytes``, so this needs no probe, no platform branch, and no
+    real hardware.
+    """
+
+    def __init__(self, ram: int, vram: int = 0) -> None:
+        self.memory_budget_bytes = ram
+        self.vram_budget_bytes = vram
+
+    def fingerprint(self) -> str:
+        return "testtarget00000000"
+
+
 def _scan(nbytes: int = 100_000_000) -> Node:
     n = Node(NodeType.SCAN_PARQUET,
              scan=ScanSpec(kind="parquet", path="t.parquet"))
@@ -569,6 +591,19 @@ class TestSegmentBoundaries:
     """
 
     def _expensive_gpu_plan(self):
+        """A planner whose target is specified, not whatever CI happens to be.
+
+        These tests build a 1 GB pipeline with a 2.5 GB estimated peak and
+        assert things about transfers and engine choice. They are arithmetic
+        tests. They were constructing ``AdaptivePlanner`` with no profile,
+        which made admission consult the *real* runner's available RAM - so a
+        busy macOS runner rejected a 2.5 GB workload as PlanInfeasible and the
+        test failed for reasons that had nothing to do with the planner.
+
+        Both halves are now stated: ample RAM and a real VRAM budget, so the
+        GPU is admissible and nothing is charged for spilling. The point of
+        the class is that the CPU still wins, and it must lose on transfers.
+        """
         n = 1_000_000_000
         points = []
         for op in ("filter", "groupby", "sort", "scan"):
@@ -581,9 +616,14 @@ class TestSegmentBoundaries:
         model = CostModel(calibration=store,
                           registry=CapabilityRegistry(),
                           priors=Priors(gpu_startup_s=0.0, startup_s=0.0),
-                          transfer=transfer)
+                          transfer=transfer,
+                          resources=ResourceBudget(
+                              ram_bytes=64_000_000_000,
+                              vram_bytes=8_000_000_000))
         planner = AdaptivePlanner(cost_model=model,
                                   registry=CapabilityRegistry(),
+                                  profile=_FakeProfile(
+                                      ram=64_000_000_000, vram=8_000_000_000),
                                   require_available=False)
         return planner
 

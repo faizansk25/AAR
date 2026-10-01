@@ -623,33 +623,37 @@ def probe_memory() -> MemoryInfo:
 #: refused with PlanInfeasible. Two GitHub macOS runners failed this way before
 #: the cause was found.
 #:
-#: The terms, and why each is in exactly once:
+#: The two terms, and why each is in exactly once:
 #:
-#:   Pages free      - untouched memory. Always safe to count.
-#:   Pages inactive  - resident but not recently used. The kernel evicts these
+#:   Pages inactive - resident but not recently used. The kernel evicts these
 #:                     without disk I/O, so the memory is effectively
 #:                     available. This is the large term, and it is why simply
-#:                     adding a few counters to "Pages free" fixes the bug.
-#:   Pages purgeable - caches the kernel has explicitly marked as droppable.
+#:                     adding a second counter to "Pages free" fixes the bug.
+#:   Pages free      - untouched memory. Always safe to count.
 #:
-#: Deliberately excluded, each for a specific reason:
+#: **This is exactly psutil's macOS `available`, and that is the point.**
+#: ``psutil/arch/osx/mem.c`` computes::
 #:
-#:   Pages speculative - already counted *inside* "Pages free". The kernel's
-#:     free_count includes speculative pages, and psutil's own macOS
-#:     implementation subtracts them precisely to avoid counting them twice
-#:     (giampaolo/psutil#1277). Adding them here would double-count.
-#:   File-backed pages - the page cache, which overlaps purgeable and
-#:     inactive. Summing it with them inflates the total.
-#:   active / wired / Pages occupied by compressor - in use right now. Counting
-#:     these would let AAR admit a workload that then gets OOM-killed, which is
-#:     the exact failure this number exists to prevent.
+#:     available = inactive + free;      // from host_statistics64
+#:     used      = active + wired;
+#:     free     -= speculative;          // affects the *free field only*
 #:
-#: The result is deliberately equivalent to what psutil reports as "available"
-#: on macOS, so the psutil and stdlib paths agree rather than diverging.
+#: Two things follow, and both were previously got wrong here:
+#:
+#: 1. Speculative is **not** subtracted from ``available``. psutil subtracts it
+#:    only from the value it reports as ``free``, to match the ``free(1)``
+#:    utility. So the subtraction belongs to the free field, not to available.
+#: 2. Purgeable is **not** included at all.
+#:
+#: Parity is not cosmetic. ``probe_memory`` uses psutil when it is installed and
+#: this fallback when it is not, and the same machine must not get a different
+#: admission decision depending on whether an optional dependency is present.
+#: A formula that merely *looks* reasonable would make `pip install psutil` a
+#: behaviour change. An earlier version of this comment claimed parity while
+#: the code summed free + inactive + purgeable, which it does not have.
 _DARWIN_RECLAIMABLE = (
     "Pages free",
     "Pages inactive",
-    "Pages purgeable",
 )
 
 #: macOS reports a page size in the ``vm_stat`` header. 4096 is the value on

@@ -647,6 +647,67 @@ class TestPlanningRespectsTheMachineItRunsOn:
         with pytest.raises(PlanInfeasible):
             tiny.plan(self._oversized(50_000_000))
 
+    def test_the_cost_model_is_given_the_same_target_as_the_planner(self):
+        """The planner and the cost model must describe one machine, not two.
+
+        Admission consults ``planner._profile``. The spill penalty used to be
+        computed from a ``HardwareProfile()`` built *inside* the cost model,
+        which is the host rather than the target. A plan could therefore be
+        admitted against an 8 GB VRAM budget and then charged for spilling
+        because the machine running the tests had no GPU - and the reverse on
+        Apple Silicon. Same planner, same calibration, different answer per
+        runner.
+
+        This is the property the measurement history will need most: a
+        prediction recorded against target X must be reproducible from target
+        X alone, with no reference to whatever host produced it.
+        """
+        from aar.planner import AdaptivePlanner
+
+        profile = self._Profile(1_000_000_000, vram=8_000_000_000)
+        planner = AdaptivePlanner(require_available=False, profile=profile)
+        assert planner._cost.resources.vram_bytes == profile.vram_budget_bytes
+        assert planner._cost.resources.ram_bytes == profile.memory_budget_bytes
+
+    def test_a_supplied_cost_model_keeps_its_own_budget(self):
+        """Overriding a caller's model would make a shared one unpredictable.
+
+        ``AdaptivePlanner`` fills in the budget only for the model it builds
+        itself. A model handed in already carries a deliberate budget, and
+        silently rewriting it would mean the same object priced differently
+        depending on who was holding it.
+        """
+        from aar.cost import CostModel, ResourceBudget
+        from aar.planner import AdaptivePlanner
+
+        model = CostModel(resources=ResourceBudget(vram_bytes=123))
+        planner = AdaptivePlanner(cost_model=model,
+                                  require_available=False,
+                                  profile=self._Profile(64_000_000_000,
+                                                       vram=99_000_000_000))
+        assert planner._cost is model
+        assert planner._cost.resources.vram_bytes == 123
+
+    def test_two_planners_for_different_targets_price_differently(self):
+        """The end-to-end property, on identical input.
+
+        Same pipeline, same calibration, two stated targets. If these agree,
+        the target is not actually reaching the arithmetic.
+        """
+        from aar.planner import AdaptivePlanner
+
+        def spill_for(vram: int) -> float:
+            planner = AdaptivePlanner(
+                require_available=False,
+                profile=self._Profile(64_000_000_000, vram=vram))
+            node = self._small()
+            return planner._cost.node_cost(node, "polars_gpu", 1_000_000)[0]\
+                .spill_s
+
+        assert spill_for(8_000_000_000) == 0.0
+        assert spill_for(0) > 0.0
+        assert spill_for(8_000_000_000) == spill_for(8_000_000_000)
+
 
 class TestEveryDataFlowEdgeCarriesItsOwnBytes:
     """Two differently-sized sources sharing one segment lost the smaller.

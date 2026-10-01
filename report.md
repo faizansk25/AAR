@@ -4,8 +4,100 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 796 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 802 tests
 **Last updated:** 2026-09-30
+
+---
+
+### Round 23 — the cost model was reading the wrong machine
+
+The remaining macOS failures were not flaky, and they were not about memory.
+They were the visible symptom of a bug that had nothing to do with either
+platform: `CostModel._spill_s` built a `HardwareProfile()` and read the *live
+host's* VRAM budget to decide whether GPU work spilled. A supposedly reusable
+cost model was silently a model of whichever machine was running Python.
+
+The platform split falls straight out of it:
+
+```text
+Linux/Windows runner:  no usable GPU -> budget 0 -> spill penalty charged
+macOS Apple Silicon:   unified memory -> budget set -> no penalty
+```
+
+Same pipeline, same calibration, opposite conclusions. A cost model built for
+machine B could answer using machine A's hardware.
+
+`AdaptivePlanner` now passes its own profile's budget to the model it builds,
+so admission and pricing describe one machine. `ResourceBudget` is frozen,
+because a budget that can change after construction is the same
+non-determinism one layer down. An explicitly supplied cost model keeps its own
+budget — silently rewriting a caller's calibrated model would make a shared
+object behave differently depending on who held it.
+
+#### The specification's central claim was not actually being tested
+
+Removing the host coupling exposed something worse than the coupling. With a
+stated 8 GB VRAM budget, the specification's worked example **inverted**: the
+GPU won, 0.520 s against 0.600 s.
+
+The cause is the low-confidence penalty. That test seeded one calibration point
+per curve, which is flagged `low_confidence` and multiplied by 1.5. It scaled
+the CPU kernel from 400 ms to 600 ms and left the GPU's 400 ms of transfers
+alone — so a penalty intended to express doubt about a measurement decided an
+engine choice instead.
+
+So the example had only ever passed because a GPU-less CI host charged a 6.7 s
+spill penalty that overwhelmed the difference. **The GPU was losing for the
+wrong reason.** Every CPU-only runner agreed; Apple Silicon disagreed, and that
+disagreement was the honest signal.
+
+Fixed by seeding three points so the curve is confident, which returns the
+specification's own figures exactly: CPU 0.400 s, GPU 0.480 s. There is now a
+second test asserting the conclusion still holds with a zero VRAM budget, so
+the claim cannot be satisfied by a spill penalty again.
+
+**I got this wrong twice on the way.** My first fix asserted `gpu.total_s ==
+0.480` while the penalty was still applied, and the failure showed 0.520. My
+second attempt added three `add_points` calls in a loop — but `add_points`
+refits once per call, so each call *replaced* the curve and left a single point.
+The tests caught both. The comment now records the refit-per-call behaviour,
+because it is a genuine trap in that API.
+
+#### Darwin: the formula now matches psutil exactly
+
+The claim of psutil parity was false. The actual implementation is
+`psutil/arch/osx/mem.c`:
+
+```c
+available = inactive + free;
+used      = active + wired;
+free     -= speculative;      // the *free field* only
+```
+
+Two corrections fall out, and the earlier code and comment were wrong on both:
+
+1. Speculative is **not** subtracted from `available`. It is subtracted only
+   from the separately reported `free` field, to match `free(1)`.
+2. Purgeable is **not** included in `available` at all.
+
+I matched psutil rather than keeping AAR's own definition, because parity is
+load-bearing rather than cosmetic: `probe_memory` uses psutil when installed
+and the stdlib fallback when not, so a divergent formula would make
+`pip install psutil` a silent behaviour change. The test now pins the exact
+arithmetic and names both differences, so a future edit has to argue with them.
+
+#### Tests no longer depend on the CI host
+
+The five planner tests that failed with `PlanInfeasible` build a 1 GB pipeline
+with a 2.5 GB peak and assert things about transfers. They now state their
+target — 64 GB RAM, 8 GB VRAM — instead of consulting whatever RAM the runner
+had free. They are arithmetic tests; the host is not an input.
+
+The spill test no longer skips when the machine has no GPU. It used to assert
+nothing on every CPU-only runner, which is why the host coupling survived so
+long: the one test positioned to catch it was the one test that could not run.
+
+792 passed, 10 skipped, 0 failed; ruff clean.
 
 ---
 

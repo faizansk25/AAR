@@ -35,8 +35,8 @@ from ..ir.nodes import Node, NodeType
 
 __all__ = [
     "CostBreakdown", "TransferProfile", "CostModel", "Priors",
-    "node_operation", "default_cost_model", "EstimationError",
-    "EstimationLog",
+    "ResourceBudget", "node_operation", "default_cost_model",
+    "EstimationError", "EstimationLog",
 ]
 
 #: Node type -> the calibration operation that measures its compute cost.
@@ -215,6 +215,48 @@ class TransferProfile:
 
 
 
+# ------------------------------------------------------------------ budget
+@dataclass(frozen=True, slots=True)
+class ResourceBudget:
+    """The memory a cost model may assume about its **target** machine.
+
+    A cost model that answers "does this fit in VRAM?" has to be told what
+    VRAM means *for the machine being planned for*. It cannot go and look.
+
+    This exists because :meth:`CostModel._spill_s` used to construct a
+    ``HardwareProfile()`` and read the live host's VRAM. That made a supposedly
+    reusable cost model a model of whichever machine happened to be running
+    Python, and it failed CI in a way that read as flakiness:
+
+    * a Linux/Windows runner with no usable GPU reported a VRAM budget of 0, so
+      every GPU plan paid a spill penalty;
+    * an Apple Silicon runner has unified memory, so no penalty was charged.
+
+    Same pipeline, same calibration, opposite conclusions. A cost model built
+    for machine B could quietly use the hardware of machine A - which matters
+    far more once AAR records predicted-versus-actual costs, because the wrong
+    target would then be written into the measurement history itself.
+
+    Frozen, because a budget that can change after construction reintroduces
+    the same non-determinism one layer down.
+    """
+
+    ram_bytes: int = 0
+    vram_bytes: int = 0
+
+    @classmethod
+    def from_profile(cls, profile: object) -> "ResourceBudget":
+        """Read a budget from a ``HardwareProfile``-shaped object.
+
+        Duck-typed rather than isinstance-checked so tests can pass a stub, and
+        so this module never has to import :mod:`aar.hardware` at module scope.
+        """
+        return cls(
+            ram_bytes=int(getattr(profile, "memory_budget_bytes", 0) or 0),
+            vram_bytes=int(getattr(profile, "vram_budget_bytes", 0) or 0),
+        )
+
+
 # ---------------------------------------------------------------- breakdown
 @dataclass(frozen=True, slots=True)
 class CostBreakdown:
@@ -312,7 +354,7 @@ class CostModel:
     """
 
     __slots__ = ("_calibration", "_registry", "_priors", "_transfer",
-                 "_history")
+                 "_history", "_resources")
 
     def __init__(
         self,
@@ -321,6 +363,7 @@ class CostModel:
         priors: Priors = DEFAULT_PRIORS,
         transfer: TransferProfile | None = None,
         history: "ExecutionHistory | None" = None,
+        resources: ResourceBudget | None = None,
     ) -> None:
         self._calibration = (calibration if calibration is not None
                             else _load_saved_calibration())
@@ -328,11 +371,28 @@ class CostModel:
         self._priors = priors
         self._transfer = transfer or TransferProfile()
         self._history = history
+        # **The target's budget, never this machine's.**
+        #
+        # Defaulting to ResourceBudget() (both zero) rather than probing the
+        # host is deliberate. A zero VRAM budget makes GPU plans pay the spill
+        # penalty, which is the conservative direction: it can refuse or
+        # de-rank a GPU plan, but it cannot admit work the target cannot hold.
+        # Probing the host here - which is what this used to do inside
+        # _spill_s - made the model's answers depend on the runner.
+        #
+        # AdaptivePlanner passes its own profile's budget, so a plan and its
+        # cost model always describe the same machine.
+        self._resources = resources or ResourceBudget()
 
     # ------------------------------------------------------------ properties
     @property
     def calibration(self) -> CalibrationStore:
         return self._calibration
+
+    @property
+    def resources(self) -> ResourceBudget:
+        """The target machine's memory budget this model prices against."""
+        return self._resources
 
     @property
     def is_calibrated(self) -> bool:
@@ -520,22 +580,26 @@ class CostModel:
     def _spill_s(self, node: Node, engine_id: str, nbytes: int) -> float:
         """Cost of spilling when the working set exceeds the engine's memory.
 
-        Only charged when the caller says the working set actually exceeds
-        the budget. Charging unconditionally would mean every GPU plan paid
-        a spill cost for work that comfortably fits in VRAM, which biases the
-        optimiser toward CPU for reasons that have nothing to do with reality.
+        Only charged when the working set actually exceeds the **supplied
+        target's** budget. Two properties matter here.
+
+        The threshold is the target's VRAM, never the host's. This method used
+        to build a ``HardwareProfile()`` and read ``vram_budget_bytes`` from
+        whatever machine was running Python, which meant the same cost model
+        gave different answers on a GPU-less CI runner and an Apple Silicon
+        one. It now reads ``self._resources``, which the caller supplies.
+
+        A zero budget means "no VRAM is assumed", not "no GPU exists". That is
+        the conservative reading: charge the spill rather than assume the work
+        fits somewhere unverified. An engine that genuinely has room - because
+        the caller passed the real budget - is not charged.
         """
         if not node.spillable or not nbytes:
             return 0.0
         spec = self._registry.spec(engine_id)
         if spec.device is not Device.GPU:
             return 0.0
-        try:
-            from ..hardware import HardwareProfile
-
-            vram = HardwareProfile().vram_budget_bytes
-        except Exception:  # noqa: BLE001
-            vram = 0
+        vram = self._resources.vram_bytes
         if vram and nbytes <= vram:
             return 0.0
         return nbytes / self._priors.spill_bytes_per_s

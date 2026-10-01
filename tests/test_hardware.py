@@ -83,11 +83,31 @@ Swapouts:                                     0.
         # hundreds of MB, not the tens.
         assert 200e6 < available < 7e9, available
 
-    def test_it_sums_each_reclaimable_pool_exactly_once(self):
-        # free + inactive + purgeable, no speculative, no file-backed, and
-        # nothing that is in use right now.
-        expected = (142896 + 358912 + 11520) * 4096
-        assert detect.parse_darwin_vm_stat(self.SAMPLE) == expected
+    def test_it_sums_exactly_what_psutil_sums(self):
+        """Parity with ``psutil/arch/osx/mem.c``, which computes::
+
+            available = inactive + free;
+            used      = active + wired;
+            free     -= speculative;     // the *free field* only
+
+        Speculative is subtracted from psutil's reported *free*, never from
+        *available*, and purgeable is not counted at all. Matching that
+        exactly is the requirement: ``probe_memory`` takes the psutil path
+        when psutil is installed and this fallback when it is not, so a
+        different formula would make ``pip install psutil`` a silent
+        behaviour change.
+        """
+        free, inactive = 142896, 358912
+        assert detect.parse_darwin_vm_stat(self.SAMPLE) == (
+            free + inactive) * 4096
+
+        # And the two differences from the previous version, stated
+        # explicitly so a future edit has to argue with them.
+        assert "Pages purgeable" not in detect._DARWIN_RECLAIMABLE, (
+            "psutil does not include purgeable in available")
+        assert "Pages speculative" not in detect._DARWIN_RECLAIMABLE, (
+            "speculative is already inside Pages free, and psutil leaves it "
+            "in available; only its separate `free` field subtracts it")
 
     def test_in_use_memory_is_never_counted_as_available(self):
         """The point of the whole exercise.

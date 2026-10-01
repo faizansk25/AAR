@@ -16,7 +16,8 @@ import pytest
 
 from aar.capability import CapabilityRegistry, Device
 from aar.cost import (CostBreakdown, CostModel, ExecutionHistory, Priors,
-                      TransferProfile, default_cost_model, node_operation)
+                      ResourceBudget, TransferProfile, default_cost_model,
+                      node_operation)
 from aar.hardware.calibrate import CalibrationPoint, CalibrationStore
 from aar.ir import Node, NodeType
 
@@ -465,24 +466,90 @@ class TestGPUSpecificationExample:
 
         A 1 GB working set rather than 1 MB: the transfer rates are scaled to
         give exactly 240 ms up and 160 ms down at that size.
+
+        Three calibration points per curve, not one. A single point is flagged
+        ``low_confidence`` and multiplied by ``low_confidence_penalty`` (1.5),
+        which scales the CPU kernel to 600 ms and inverts the conclusion - the
+        GPU would win at 520 ms against 600 ms. The specification's example is
+        about *transfers*, and a confidence penalty on the compute term is a
+        different question entirely. With a confident fit the model returns the
+        specification's own figures: CPU 400 ms, GPU 480 ms.
+
+        That this only shows up once the host coupling is gone is the point.
+        The old ``_spill_s`` read the runner's VRAM, and on a machine with no
+        GPU it added a 6.7 s spill penalty that made the GPU lose for reasons
+        that had nothing to do with transfers. The test passed on every
+        CPU-only CI runner and failed on Apple Silicon, which is what made it
+        look like flakiness rather than a real gap in what was being tested.
+
+        The VRAM budget is stated above the working set for the same reason:
+        the GPU must be admitted and must lose on transfers alone.
         """
         nbytes = 1_000_000_000
+        # Three sizes at the specification's 400 ms / 80 ms ratio, so the
+        # fitted curve reproduces its figures at 1 GB.
+        #
+        # All six points go in **one** ``add_points`` call. That method refits
+        # once per call, so three separate calls would leave only the last
+        # size on the curve - a single point, flagged low-confidence, and the
+        # penalty would invert the conclusion all over again.
+        points = []
+        for scale in (0.25, 0.5, 1.0):
+            n = int(nbytes * scale)
+            points.append(CalibrationPoint("groupby", "gpu", n, 0.080 * scale))
+            points.append(CalibrationPoint("groupby", "cpu", n, 0.400 * scale))
         store = CalibrationStore()
-        store.add_points([CalibrationPoint("groupby", "gpu", nbytes, 0.080)])
-        store.add_points([CalibrationPoint("groupby", "cpu", nbytes, 0.400)])
+        store.add_points(points)
+        assert not store.get("groupby", "cpu").low_confidence, (
+            "the CPU curve must be confident, or the penalty applies and the "
+            "specification's example is not what is being measured")
 
         transfer = TransferProfile(h2d_bytes_per_s=nbytes / 0.240,
                                    d2h_bytes_per_s=nbytes / 0.160)
         m = CostModel(calibration=store, registry=CapabilityRegistry(),
                       priors=Priors(gpu_startup_s=0.0, startup_s=0.0),
-                      transfer=transfer)
+                      transfer=transfer,
+                      resources=ResourceBudget(vram_bytes=8_000_000_000))
 
         node = _node(NodeType.GROUPBY)
         cpu, _ = m.node_cost(node, "duckdb", nbytes)
         gpu, _ = m.node_cost(node, "polars_gpu", nbytes)
 
+        assert gpu.spill_s == 0.0              # it fits, so nothing is charged
+        assert gpu.kernel_s == pytest.approx(0.080, abs=2e-3)
         assert gpu.kernel_s < cpu.kernel_s      # the kernel really is faster
+        assert gpu.total_s == pytest.approx(0.480, abs=2e-3)  # 0.080 + 0.400
+        assert cpu.total_s == pytest.approx(0.400, abs=2e-3)
         assert gpu.total_s > cpu.total_s        # and the GPU still loses
+
+    def test_the_example_still_holds_when_the_gpu_has_no_vram(self):
+        """The conclusion must not depend on the machine doing the planning.
+
+        Same test as above with a zero VRAM budget. The GPU now also pays a
+        spill penalty, so it loses by much more - but the *reason* the
+        specification's example holds has to be the transfers, or the example
+        is not being tested at all.
+        """
+        nbytes = 1_000_000_000
+        points = []
+        for scale in (0.25, 0.5, 1.0):
+            n = int(nbytes * scale)
+            points.append(CalibrationPoint("groupby", "gpu", n, 0.080 * scale))
+            points.append(CalibrationPoint("groupby", "cpu", n, 0.400 * scale))
+        store = CalibrationStore()
+        store.add_points(points)
+        transfer = TransferProfile(h2d_bytes_per_s=nbytes / 0.240,
+                                   d2h_bytes_per_s=nbytes / 0.160)
+        m = CostModel(calibration=store, registry=CapabilityRegistry(),
+                      priors=Priors(gpu_startup_s=0.0, startup_s=0.0),
+                      transfer=transfer, resources=ResourceBudget(vram_bytes=0))
+
+        cpu, _ = m.node_cost(_node(NodeType.GROUPBY), "duckdb", nbytes)
+        gpu, _ = m.node_cost(_node(NodeType.GROUPBY), "polars_gpu", nbytes)
+        # The CPU total is untouched by the target's VRAM, and the GPU only
+        # ever gets worse - so the ordering cannot flip.
+        assert cpu.total_s == pytest.approx(0.400, abs=2e-3)
+        assert gpu.total_s > cpu.total_s
 
     def test_resident_gpu_data_pays_no_inbound_transfer(self):
         store = CalibrationStore()
@@ -550,9 +617,9 @@ class TestTransitionCost:
 
 
 class TestPeakMemory:
-    def _model(self) -> CostModel:
+    def _model(self, **kw) -> CostModel:
         return CostModel(calibration=CalibrationStore(),
-                         registry=CapabilityRegistry())
+                         registry=CapabilityRegistry(), **kw)
 
     def test_join_uses_more_memory_than_filter(self):
         m = self._model()
@@ -572,20 +639,59 @@ class TestPeakMemory:
         The spec is explicit that non-UVM runs OOM past VRAM, so exceeding it
         is a real cost - but charging for work that fits would bias the
         optimiser toward CPU for reasons unrelated to reality.
-        """
-        m = self._model()
-        from aar.hardware import HardwareProfile
 
-        vram = HardwareProfile().vram_budget_bytes
-        if not vram:
-            pytest.skip("no GPU on this machine; VRAM budget is zero")
+        The budget is supplied rather than read from this machine. It used to
+        call ``HardwareProfile().vram_budget_bytes`` and skip when that was
+        zero, so the test asserted nothing on every CPU-only CI runner and
+        asserted something else on Apple Silicon. The arithmetic is the thing
+        under test; the host's GPU is not.
+        """
+        vram = 8_000_000_000
+        m = self._model(resources=ResourceBudget(vram_bytes=vram))
 
         fits, _ = m.node_cost(_node(NodeType.GROUPBY), "polars_gpu",
-                              min(1_000_000, vram // 2))
+                              vram // 2)
         overflows, _ = m.node_cost(_node(NodeType.GROUPBY), "polars_gpu",
                                    vram * 4)
         assert fits.spill_s == 0.0
         assert overflows.spill_s > 0.0
+
+    def test_the_model_does_not_read_the_host_vram(self):
+        """The regression that made this whole change necessary.
+
+        ``_spill_s`` used to construct a ``HardwareProfile()`` and read the
+        live host's VRAM budget. That made a cost model for machine B answer
+        using machine A's hardware, and it failed the macOS CI jobs: no usable
+        GPU meant a zero budget and a spill penalty on a GPU plan, while
+        unified memory on Apple Silicon meant no penalty at all.
+        """
+        m = self._model(resources=ResourceBudget(vram_bytes=8_000_000_000))
+        inside, _ = m.node_cost(_node(NodeType.GROUPBY), "polars_gpu",
+                                1_000_000)
+        assert inside.spill_s == 0.0, (
+            "a 1 MB working set fits any real GPU, so charging it a spill "
+            "penalty means the threshold came from a machine with no GPU")
+
+    def test_two_models_with_different_targets_disagree(self):
+        """A cost model is a function of its target, not of its host.
+
+        This is the property the measurement work will depend on: the same
+        operation, priced for two different machines, must produce two
+        different answers - and each must be reproducible on any host.
+        """
+        node = _node(NodeType.GROUPBY)
+        nbytes = 1_000_000
+
+        big_gpu = self._model(resources=ResourceBudget(vram_bytes=8_000_000_000))
+        no_gpu = self._model(resources=ResourceBudget(vram_bytes=0))
+
+        assert big_gpu.node_cost(node, "polars_gpu", nbytes)[0].spill_s == 0.0
+        assert no_gpu.node_cost(node, "polars_gpu", nbytes)[0].spill_s > 0.0
+
+        # And the same target gives the same answer twice, on any machine.
+        again = self._model(resources=ResourceBudget(vram_bytes=8_000_000_000))
+        assert (again.node_cost(node, "polars_gpu", nbytes)[0].spill_s
+                == big_gpu.node_cost(node, "polars_gpu", nbytes)[0].spill_s)
 
     def test_cpu_work_never_spills(self):
         m = self._model()

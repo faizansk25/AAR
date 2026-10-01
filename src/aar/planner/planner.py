@@ -29,7 +29,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from ..capability import CapabilityRegistry, Device
-from ..cost import CostBreakdown, CostModel
+from ..cost import CostBreakdown, CostModel, ResourceBudget
 from ..failures import DegradationLedger, PlanInfeasible
 from ..ir import Node, NodeType, topological_order
 
@@ -673,7 +673,6 @@ class AdaptivePlanner:
         margin: float = 0.0,
         search_budget: int = DEFAULT_SEARCH_BUDGET,
     ) -> None:
-        self._cost = cost_model or CostModel()
         self._registry = registry or CapabilityRegistry()
         # **Detect the hardware unless a profile was supplied.**
         #
@@ -687,6 +686,23 @@ class AdaptivePlanner:
         # will not fit on this machine" a statement AAR can actually make.
         # Pass ``profile=`` explicitly to plan for a different machine.
         self._profile = profile if profile is not None else self._detect()
+        # **Hand the cost model the same machine.**
+        #
+        # The planner admits against `self._profile`, so the cost model must
+        # price against it too. Otherwise the two disagree about which machine
+        # the plan is for: admission would consult the supplied profile while
+        # the spill penalty came from whatever host happened to run Python.
+        # That divergence is observable - a GPU plan can be admitted against a
+        # large VRAM figure and then charged for spilling because the runner
+        # had no GPU.
+        #
+        # Only applied when the caller let the planner build the model. An
+        # explicitly supplied cost model carries its own budget on purpose, and
+        # silently rewriting it would make a shared, calibrated model behave
+        # differently depending on who holds it.
+        self._cost = cost_model if cost_model is not None else CostModel(
+            resources=ResourceBudget.from_profile(self._profile)
+            if self._profile is not None else None)
         self._ledger = ledger or DegradationLedger()
         #: When True (the default) an engine that is not installed cannot be
         #: chosen, so the plan is executable. Set False to plan for a machine
