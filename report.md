@@ -7,6 +7,9 @@
 **Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 802 tests
 **Last updated:** 2026-09-30
 
+**CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
+including both macOS jobs. Verified from the Actions API, job by job.
+
 ---
 
 ### Round 23 — the cost model was reading the wrong machine
@@ -97,7 +100,25 @@ The spill test no longer skips when the machine has no GPU. It used to assert
 nothing on every CPU-only runner, which is why the host coupling survived so
 long: the one test positioned to catch it was the one test that could not run.
 
-792 passed, 10 skipped, 0 failed; ruff clean.
+792 passed, 10 skipped, 0 failed locally; ruff clean. In CI the macOS 3.12 job
+shows every step green — Lint, module parse, **`Check the client parses as
+JavaScript`**, and the test suite — so the `node --check` gate and the parser
+tests both executed rather than skipping on the platform that has Node. I could
+not read the CI log to confirm the skip count (the logs endpoint needs repo
+admin rights), so the per-test skip figures here are the local ones.
+
+CI is 6/6 for the first time. Ready for the semantic operation ID.
+
+**One requirement this round adds to the measurement work.** A prediction is
+now reproducible from (operation, calibration, target hardware) alone, with no
+reference to the host that produced it. So a measurement record must carry an
+explicit **target hardware identity** alongside the operation ID — otherwise
+the same logical operation accumulates different expected costs depending on
+which machine ran the planner, and the history cannot tell a real regression
+from a change of hardware. `HardwareProfile.fingerprint()` is the obvious
+candidate, since it deliberately excludes free/available quantities that change
+minute to minute; it would need to be part of the record's identity, not
+metadata.
 
 ---
 
