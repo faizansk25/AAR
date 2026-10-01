@@ -95,6 +95,30 @@ def test_regression_uses_total_bytes_without_discarding_the_vector():
     assert history.records("join", "duckdb")[0].input_bytes == (500, 500)
 
 
+def test_node_prediction_uses_parent_input_sizes_not_join_output_size():
+    """Planning and execution must regress on the same physical quantity."""
+    history = ExecutionHistory(
+        min_samples_for_regression=3,
+        operation_key_fn=lambda _node: "aar-op-v1:join",
+        target_key="t",
+    )
+    for scale in (1, 2, 3, 4):
+        history.record(
+            "aar-op-v1:join", "duckdb",
+            (1000 * scale, 9000 * scale), (10, 90), 10.0 * scale,
+        )
+
+    left = Node(NodeType.SCAN_PARQUET, estimated_bytes=5_000)
+    right = Node(NodeType.SCAN_PARQUET, estimated_bytes=45_000)
+    join = Node(NodeType.JOIN, inputs=[left, right], estimated_bytes=500)
+
+    # CostModel.compute_s currently supplies the node/output scalar (500).
+    # History must recover the real 5k + 45k input shape from the parents,
+    # otherwise this predicts near-zero from a model trained on input bytes.
+    predicted = history.predict(join, "duckdb", 500)
+    assert predicted == pytest.approx(0.050, rel=0.05)
+
+
 def test_executor_observer_passes_the_full_join_shape_to_history():
     history = ExecutionHistory(
         operation_key_fn=lambda _node: "aar-op-v1:join",
