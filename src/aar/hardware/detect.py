@@ -1189,8 +1189,14 @@ class HardwareProfile:
 
         Deliberately excludes free/available quantities, which change minute to
         minute; a profile keyed on them would be discarded on every reload.
-        It includes free VRAM because a driver upgrade genuinely changes
-        what the GPU can do.
+        It includes total ``vram_bytes`` - not ``free_vram_bytes``, which
+        varies continuously - because the amount of memory a GPU has is a
+        property of the card, while how much of it is currently free is not.
+
+        This keys *calibration* files. Measurement records use the separate
+        :func:`aar.ir.identity.target_id`, which is versioned and pairs with a
+        resource snapshot; this one was not changed, because stored profiles
+        already depend on it.
         """
         parts = [
             self.os.system, self.os.release, self.os.architecture,

@@ -703,6 +703,21 @@ class TestPeakMemory:
 
 
 class TestExecutionHistory:
+    """The estimators, keyed on a **semantic** identity.
+
+    These tests used to record under ``node.id`` - a per-instance UUID - and
+    then predict from the same node. That worked only because it was the same
+    object: two parses of one pipeline could never share a measurement, so the
+    history filled with singletons and never learned anything. Recording under
+    ``semantic_operation_id`` is what makes the store worth having.
+    """
+
+    @staticmethod
+    def _key(node) -> str:
+        from aar.ir.identity import semantic_operation_id
+
+        return semantic_operation_id(node)
+
     def test_no_history_means_no_prediction(self):
         h = ExecutionHistory()
         assert h.predict(_node(NodeType.GROUPBY), "duckdb", 1000) is None
@@ -710,37 +725,40 @@ class TestExecutionHistory:
     def test_single_observation_is_a_lookup(self):
         h = ExecutionHistory()
         node = _node(NodeType.GROUPBY)
-        h.record(node.id, "duckdb", 1000, 10, elapsed_ms=50.0)
+        h.record(self._key(node), "duckdb", 1000, 10, elapsed_ms=50.0)
         assert h.predict(node, "duckdb", 1000) == pytest.approx(0.05)
 
     def test_predictions_are_separated_by_engine(self):
         h = ExecutionHistory()
         node = _node(NodeType.GROUPBY)
-        h.record(node.id, "duckdb", 1000, 10, elapsed_ms=50.0)
+        h.record(self._key(node), "duckdb", 1000, 10, elapsed_ms=50.0)
         assert h.predict(node, "polars_cpu", 1000) is None
 
     def test_failures_are_never_averaged_in(self):
         """A crashed run's duration is not a cost."""
         h = ExecutionHistory()
         node = _node(NodeType.GROUPBY)
-        h.record(node.id, "duckdb", 1000, 10, elapsed_ms=10.0, success=True)
-        h.record(node.id, "duckdb", 1000, 10, elapsed_ms=9999.0, success=False)
+        key = self._key(node)
+        h.record(key, "duckdb", 1000, 10, elapsed_ms=10.0, success=True)
+        h.record(key, "duckdb", 1000, 10, elapsed_ms=9999.0, success=False)
         assert h.predict(node, "duckdb", 1000) == pytest.approx(0.010)
 
     def test_regression_extrapolates_with_size(self):
         h = ExecutionHistory(min_samples_for_regression=3)
         node = _node(NodeType.GROUPBY)
+        key = self._key(node)
         for size, ms in ((1000, 10.0), (2000, 20.0), (3000, 30.0),
                          (4000, 40.0)):
-            h.record(node.id, "duckdb", size, size, elapsed_ms=ms)
+            h.record(key, "duckdb", size, size, elapsed_ms=ms)
         assert h.predict(node, "duckdb", 8000) > h.predict(node, "duckdb", 2000)
 
     def test_history_never_predicts_negative_time(self):
         h = ExecutionHistory(min_samples_for_regression=3)
         node = _node(NodeType.GROUPBY)
+        key = self._key(node)
         for size, ms in ((1000, 100.0), (2000, 10.0), (3000, 50.0),
                          (4000, 20.0)):
-            h.record(node.id, "duckdb", size, size, elapsed_ms=ms)
+            h.record(key, "duckdb", size, size, elapsed_ms=ms)
         for size in (1, 1000, 10_000_000):
             assert h.predict(node, "duckdb", size) >= 0
 
@@ -751,7 +769,7 @@ class TestExecutionHistory:
         m = CostModel(calibration=store, registry=CapabilityRegistry(),
                       history=h)
         node = _node(NodeType.GROUPBY)
-        h.record(node.id, "duckdb", 1000, 10, elapsed_ms=5.0)
+        h.record(self._key(node), "duckdb", 1000, 10, elapsed_ms=5.0)
         value, source = m.compute_s(node, "duckdb", 1000)
         assert source == "history"
         assert value == pytest.approx(0.005)
@@ -761,6 +779,46 @@ class TestExecutionHistory:
         h.record("op1", "duckdb", 1000, 10, elapsed_ms=25.0)
         text = h.render()
         assert "duckdb" in text and "25.0" in text
+
+    def test_a_rebuilt_pipeline_finds_the_first_runs_evidence(self):
+        """The property the whole subsystem exists for.
+
+        Two separately constructed but logically identical nodes have different
+        ``Node.id`` values, so any store keyed on that UUID would find nothing.
+        This is the test that fails if identity silently regresses to the
+        transient id.
+        """
+        h = ExecutionHistory()
+        first = _node(NodeType.GROUPBY)
+        key = self._key(first)
+        h.record(key, "duckdb", 1000, 10, elapsed_ms=50.0)
+
+        rebuilt = _node(NodeType.GROUPBY)
+        assert rebuilt.id != first.id, (
+            "precondition: these must be distinct instances")
+        assert self._key(rebuilt) == key
+        assert h.predict(rebuilt, "duckdb", 1000) == pytest.approx(0.05), (
+            "history recorded for one parse must be found by another")
+
+    def test_a_node_without_stable_identity_predicts_nothing(self):
+        """A UDF with no recoverable source has no identity, so no prediction.
+
+        Returning a number here would mean inventing an identity and pooling
+        unrelated UDFs together, which is the failure the refusal exists to
+        prevent.
+        """
+        from aar.ir.identity import UnstableSemanticIdentity
+
+        class Opaque:
+            def __call__(self, x):
+                return x
+
+        node = Node(NodeType.PYTHON_UDF, udf=Opaque(), udf_name="opaque")
+        with pytest.raises(UnstableSemanticIdentity):
+            self._key(node)
+        # And the history declines to guess.
+        h = ExecutionHistory()
+        assert h.predict(node, "duckdb", 1000) is None
 
 
 class TestExplain:

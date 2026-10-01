@@ -29,6 +29,26 @@ from .base import Engine
 
 __all__ = ["DuckDBEngine"]
 
+#: Join kinds DuckDB genuinely implements, and the SQL keyword for each.
+#:
+#: An **allow-list**, not a deny-list. The earlier code was
+#: ``{"inner": "INNER", ...}.get(str(how), "INNER")``, so any kind not named
+#: became an inner join - which is how SEMI, ANTI and ASOF quietly returned
+#: inner-join rows. A missing entry now means "raise", because an unknown join
+#: kind is a question AAR cannot answer correctly on the user's behalf.
+#:
+#: ASOF is deliberately absent. DuckDB has no ASOF join of this shape, and
+#: pretending otherwise is the exact bug being fixed.
+_DUCKDB_JOIN_KINDS: dict[str, str] = {
+    "inner": "INNER",
+    "left": "LEFT",
+    "right": "RIGHT",
+    "full": "FULL",
+    "semi": "SEMI",
+    "anti": "ANTI",
+    "cross": "CROSS",
+}
+
 
 class DuckDBEngine(Engine):
     """Executes through an embedded DuckDB connection."""
@@ -230,26 +250,73 @@ class DuckDBEngine(Engine):
     # ----------------------------------------------------------------- join
     def join(self, left: Table, right: Table, keys: Sequence[str],
              how: str) -> Table:
+        """Join, with the join kind honoured rather than approximated.
+
+        **This used to end in ``.get(str(how), "INNER")``**, which meant any
+        join kind DuckDB was not explicitly listed for silently became an
+        inner join. Measured on left={k:1,2,3} and right={k:2,3,4}:
+
+            semi  -> returned [2, 3]  (correct rows, wrong columns)
+            anti  -> returned [2, 3]  (the *exact complement* of [1])
+            asof  -> returned [2, 3]  (inner again)
+
+        Anti is the dangerous one: it returned exactly the rows it was defined
+        to exclude, with no error and no warning. A pipeline that filtered with
+        an anti-join would report success and produce the opposite of the
+        intended answer. That is worse than a crash, because a crash is at
+        least visible.
+
+        DuckDB supports SEMI, ANTI, LEFT, RIGHT, FULL and INNER natively, so
+        the honest implementation maps what it genuinely supports and
+        **raises** for ASOF rather than pretending. An unsupported kind is now
+        a visible error at the boundary, not a silent rewrite.
+        """
         rel_l = self._register(left)
         rel_r = self._register(right)
+        # ``how`` arrives as a JoinType member, and JoinType is a ``str``
+        # mixin enum: ``str(JoinType.INNER)`` is "JoinType.INNER" on Python
+        # 3.11+, not "inner", so the lookup has to unwrap ``.value``.
+        kind = getattr(how, "value", how)
+        how_sql = _DUCKDB_JOIN_KINDS.get(str(kind))
+        if how_sql is None:
+            raise ValueError(
+                f"duckdb cannot perform a {str(kind)!r} join; it was not "
+                f"silently converted to an inner join. Supported: "
+                f"{sorted(_DUCKDB_JOIN_KINDS)}")
         try:
             on = " AND ".join(f'l.{_quote_ident(k)} = r.{_quote_ident(k)}'
                               for k in keys)
-            how_sql = {"inner": "INNER", "left": "LEFT", "right": "RIGHT",
-                       "full": "FULL"}.get(str(how), "INNER")
-            cols = ", ".join(
-                [f"l.{_quote_ident(c)}" for c in left.column_names]
-                + [f"r.{_quote_ident(c)}" for c in right.column_names
-                   if c not in keys])
+            if how_sql == "CROSS":
+                # A cross join has no ON clause at all; emitting `ON` is a
+                # syntax error rather than a silent behaviour change.
+                on = "" if not keys else on
+            # SEMI and ANTI keep only the left side's columns by definition, so
+            # the projection has to differ too - emitting the right columns
+            # would fabricate data that a semi-join is defined not to produce.
+            if how_sql in ("SEMI", "ANTI"):
+                cols = ", ".join(f"l.{_quote_ident(c)}"
+                                 for c in left.column_names)
+            else:
+                cols = ", ".join(
+                    [f"l.{_quote_ident(c)}" for c in left.column_names]
+                    + [f"r.{_quote_ident(c)}" for c in right.column_names
+                       if c not in keys])
             # Either input can contribute to a joined row, so every output
             # column is as sensitive as the more sensitive of the two sides.
             both = _lineage.merge_schemas(left.schema, right.schema)
-            out_names = list(left.column_names) + [
-                c for c in right.column_names if c not in keys]
+            if how_sql in ("SEMI", "ANTI"):
+                # Only the left side's rows survive, so only its lineage can.
+                out_names = list(left.column_names)
+            else:
+                out_names = list(left.column_names) + [
+                    c for c in right.column_names if c not in keys]
+            join_sql = f'{how_sql} JOIN {_quote_ident(rel_r.name)} r'
+            if how_sql != "CROSS":
+                join_sql += f" ON {on}"
             return self._to_table(
                 rel_l.sql(
                     f'SELECT {cols} FROM {_quote_ident(rel_l.name)} l '
-                    f'{how_sql} JOIN {_quote_ident(rel_r.name)} r ON {on}'),
+                    f'{join_sql}'),
                 source=left, derived=dict.fromkeys(out_names, both))
         finally:
             rel_l.release()

@@ -258,6 +258,27 @@ class PredicateCompiler:
 
     @staticmethod
     def _call(expr: Any, row: dict[str, Any]) -> bool:
+        """Evaluate a scalar function call, or refuse an unknown one.
+
+        **This used to end in ``return bool(args[0]) if args else True``**,
+        which ignored the function name completely: an unrecognised call was
+        evaluated as "is the first argument truthy". Measured on
+        ``amount > 100 AND regexp_match(name, '^A')``:
+
+            returned : ['Ann', 'Cid']   (amount > 100 alone)
+            correct  : ['Ann']
+
+        The predicate *looked* like it had two conditions and silently had
+        one. That is the most dangerous shape of wrong answer: the user wrote a
+        stricter filter, saw rows disappear, and had no reason to suspect the
+        second term was never applied.
+
+        So an unknown function now raises. A filter that cannot be evaluated
+        is a question AAR must not answer on the caller's behalf - and since
+        this is the fallback path every engine without a native compiler
+        reaches, refusing here is what makes the other engines' refusals safe
+        too.
+        """
         name = expr.name.lower()
         args = [PredicateCompiler._scalar(a, row) for a in expr.args]
         if name in ("isnull", "is_null"):
@@ -266,7 +287,10 @@ class PredicateCompiler:
             return not _is_null(args[0])
         if name == "coalesce":
             return any(not _is_null(a) for a in args)
-        return bool(args[0]) if args else True
+        raise NotImplementedError(
+            f"cannot evaluate the function {expr.name!r} in a predicate. "
+            f"A known filter cannot be silently reduced to a weaker one, so "
+            f"this raises rather than returning something plausible.")
 
     @classmethod
     def compile(cls, expr: Expr) -> Any:

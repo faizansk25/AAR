@@ -12,9 +12,16 @@ from .nodes import (  # noqa: F401
     Privacy, ScanSpec, UnaryOp, WindowSpec, is_sink, is_source,
     topological_order,
 )
+from .identity import (  # noqa: F401
+    SEMANTIC_ID_VERSION, UnstableSemanticIdentity, graph_node_id,
+    operation_payload, resource_snapshot, semantic_operation_id, target_id,
+)
 
 __all__ = [
     "Agg", "BinOp", "CastExpr", "Col", "Expr", "Func", "JoinType", "Lit",
     "Node", "NodeType", "Privacy", "ScanSpec", "UnaryOp", "WindowSpec",
     "is_sink", "is_source", "topological_order",
+    "SEMANTIC_ID_VERSION", "UnstableSemanticIdentity", "graph_node_id",
+    "operation_payload", "resource_snapshot", "semantic_operation_id",
+    "target_id",
 ]

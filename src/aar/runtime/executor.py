@@ -27,6 +27,9 @@ from ..engines import create_engine
 from ..failures import (DegradationLedger, FailureKind)
 from ..interchange import Table
 from ..ir import Node, NodeType, topological_order
+from ..ir.identity import (
+    UnstableSemanticIdentity, graph_node_id, semantic_operation_id,
+)
 from ..planner import Plan
 
 __all__ = ["ExecutionResult", "Executor"]
@@ -43,19 +46,66 @@ _EXECUTOR_SIDE: frozenset[NodeType] = frozenset({
 
 @dataclass(slots=True)
 class NodeOutcome:
-    """What happened to one node, as opposed to what was predicted."""
+    """What happened to one node, as opposed to what was predicted.
+
+    **Input shape is a vector, not a scalar.** ``rows_in``/``bytes_in`` used to
+    be single integers filled from ``inputs[0]``, which is harmless for a unary
+    node and quietly wrong for every other one. A join of a 2 GB left side
+    against an 8 GB right side recorded ``input = 2 GB``; the 8 GB side was not
+    summarised, it was *lost*, and the history would have learned a per-byte
+    cost from one eighth of the work.
+
+    ``input_rows``/``input_bytes`` keep every input in declared order, and
+    ``rows_in``/``bytes_in`` are now read-only totals derived from them, so a
+    caller that only cares about the sum need not care about arity.
+
+    **Unmeasured is ``None``, not ``0``.** A zero peak-memory reading is a
+    real measurement that happened to be zero; "we never measured it" is a
+    different fact, and a measurement store that conflates them will eventually
+    report a confident average built mostly from absent data.
+    """
 
     node_id: str
     node_type: str
     engine_requested: str
     engine_used: str
-    rows_in: int = 0
+    #: Stable semantic identity, when one could be computed. ``None`` when the
+    #: node refuses identity (an unhashable UDF), which marks the outcome as
+    #: not persistable rather than persisting it under a transient id.
+    operation_id: str | None = None
+    #: Stable graph-node identity, likewise optional and likewise paired with
+    #: ``operation_id``: same operation, different position in the pipeline.
+    graph_node_id: str | None = None
+    input_rows: tuple[int, ...] = ()
     rows_out: int = 0
-    bytes_in: int = 0
+    input_bytes: tuple[int, ...] = ()
     bytes_out: int = 0
     elapsed_ms: float = 0.0
+    #: ``None`` until something actually measures it. See the class docstring.
+    actual_peak_memory: int | None = None
+    actual_transfer_bytes: int | None = None
     error: str | None = None
     degraded: bool = False
+
+    @property
+    def rows_in(self) -> int:
+        """Total input rows. A convenience total, never a replacement."""
+        return sum(self.input_rows)
+
+    @property
+    def bytes_in(self) -> int:
+        """Total input bytes across every input, not just the first."""
+        return sum(self.input_bytes)
+
+    @property
+    def max_bytes_in(self) -> int:
+        """The largest single input - what a working-set limit actually bites."""
+        return max(self.input_bytes, default=0)
+
+    @property
+    def is_persistable(self) -> bool:
+        """Whether this outcome can be stored under a stable identity."""
+        return bool(self.operation_id)
 
     def render(self) -> str:
         flag = "  DEGRADED" if self.degraded else ""
@@ -201,9 +251,22 @@ class Executor:
                 # did not run on the engine it was assigned to.
                 engine_used=("executor" if self._runs_in_executor(node.type)
                              else requested),
-                rows_in=inputs[0].num_rows if inputs else 0,
-                bytes_in=inputs[0].nbytes if inputs else 0,
+                # Every input, in declared order. Recording only inputs[0] lost
+                # the right side of every join, so the history learned a
+                # per-byte cost from a fraction of the bytes actually read.
+                input_rows=tuple(t.num_rows for t in inputs),
+                input_bytes=tuple(t.nbytes for t in inputs),
             )
+            # Identity is best-effort: a node that cannot be hashed (an
+            # unhashable UDF) must still execute. It is simply not persistable,
+            # which is recorded rather than papered over.
+            try:
+                outcome.operation_id = semantic_operation_id(node)
+                outcome.graph_node_id = graph_node_id(node)
+            except (UnstableSemanticIdentity, RecursionError, TypeError,
+                    ValueError):
+                outcome.operation_id = None
+                outcome.graph_node_id = None
             try:
                 engine, degraded = self._engine(
                     requested, result.ledger, node)
@@ -253,15 +316,39 @@ class Executor:
         model excludes failed runs from its averages - a crashed operation's
         duration is not a cost - but keeping it means a plan can be asked
         "how often does this fail?" without a second store.
+
+        Keyed on ``operation_id``, never ``node.id``. The transient UUID is
+        unique per instance, so keying on it meant two parses of one pipeline
+        could never share a measurement - which is the entire reason the
+        semantic identity exists.
+
+        A node without a stable identity is skipped rather than recorded under
+        something unstable. One lost sample is recoverable; a store silently
+        populated with per-instance keys is not, because it looks populated.
         """
         if history is None:
             return
         record = getattr(history, "record", None)
         if record is None:
             return
+        key = outcome.operation_id or getattr(node, "operation_id", None)
+        if not key:
+            return
         try:
-            record(node.id, outcome.engine_used, outcome.bytes_in,
-                   outcome.rows_in, outcome.elapsed_ms, success=success)
+            record(key, outcome.engine_used, outcome.bytes_in,
+                   outcome.rows_in, outcome.elapsed_ms, success=success,
+                   input_bytes=outcome.input_bytes, input_rows=outcome.input_rows,
+                   output_bytes=outcome.bytes_out, output_rows=outcome.rows_out,
+                   actual_peak_memory=outcome.actual_peak_memory,
+                   actual_transfer_bytes=outcome.actual_transfer_bytes)
+        except TypeError:
+            # A history implementation predating the richer signature. Fall
+            # back to the positional form rather than dropping the sample.
+            try:
+                record(key, outcome.engine_used, outcome.bytes_in,
+                       outcome.rows_in, outcome.elapsed_ms, success=success)
+            except Exception:  # noqa: BLE001
+                return
         except Exception:  # noqa: BLE001
             # Learning must never break the run it is learning from. A
             # history store that cannot accept a record loses one sample,

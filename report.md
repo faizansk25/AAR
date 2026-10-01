@@ -4,11 +4,137 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 802 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 942 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
 including both macOS jobs. Verified from the Actions API, job by job.
+
+---
+
+### Round 25 — three engines returned wrong rows, and a suite that could have caught it
+
+An audit of the remote repository found four claimed P0s. I verified each by
+measurement rather than by reading, and the headline was worse than the report:
+**not one engine was correct for every join kind**, and the bug was not where
+the audit pointed.
+
+Measured on left={k:1,2,3}, right={k:2,3,4}, before the fix:
+
+```text
+              INNER  LEFT  RIGHT  FULL  SEMI  ANTI  CROSS
+arrow            2     3      2*     4      2*     2*      2*
+duckdb           2     3      3      4      2      2        9
+expected         2     3      3      4      2      1        9
+
+* wrong
+```
+
+`ANTI` is the alarming one: it returned `[2,3]` where `[1]` is correct — the
+exact complement of the answer, with no error. A pipeline filtering with an
+anti-join would have reported success and returned the opposite of what was
+asked.
+
+Four root causes, all "return something plausible instead of refusing":
+
+1. **DuckDB** mapped SEMI/ANTI/ASOF through `.get(str(how), "INNER")`. Now an
+   allow-list, with ASOF raising.
+2. **Arrow's Python join** had no SEMI/ANTI/CROSS branch at all, so they fell
+   through to equality-join behaviour. Implemented.
+3. **`_build_joined`** ignored `how`, so a semi-join emitted `rv` full of nulls —
+   a column the join is defined not to produce.
+4. **pyarrow's native RIGHT/FULL** emits the *right* row's key for an unmatched
+   row; DuckDB coalesces to the left, which is NULL. A library divergence, so
+   those two kinds now use the Python path.
+
+**The Polars predicate bug was real and so was a worse twin.** `_to_polars_expr`
+dropped an operand it could not render, so `supported AND unsupported` ran as
+`supported`. But the shared `PredicateCompiler._call` — the fallback *every*
+engine without a native compiler reaches — ignored the function name entirely
+and evaluated an unknown call as "is the first argument truthy". Same wrong
+rows, wider blast radius. Both now refuse.
+
+#### The suite nearly reproduced the bug it exists to prevent
+
+`test_cross_engine_semantics.py` initially passed while testing nothing. My
+discovery probe used bare `create_engine`, which **silently substitutes** a
+fallback rather than raising — so it reported 'polars' as available on a build
+where polars is not in `ENGINE_FACTORIES`, and every "compare two engines"
+assertion quietly ran DuckDB twice. Fixed with `allow_degradation=False`, and
+engines are now discovered *behaviourally* (does a trivial operation run?) so
+delegating engines that correctly refuse are excluded.
+
+Getting there took four wrong attempts I had to undo: a source-inspection probe
+excluded Polars because its ASOF branch mentions `NotImplementedError`, two
+malformed inline conditionals, and a speculative Polars FULL-join rewrite that
+made things worse. Each was caught by a test rather than by reading the diff.
+
+#### One defect left open, deliberately
+
+Polars still emits both `k` and `k_right` on a **FULL** join where every other
+engine coalesces to one `k`. The rows are correct; the column set is not. I
+attempted a fix, could not verify it, and reverted it — an unverified rewrite of
+join semantics is worse than a recorded defect. It is now pinned by
+`test_the_documented_divergences_are_real`, so CI reports the day it changes in
+either direction.
+
+**932 passed, 10 skipped, 0 failed; ruff clean.** 62 of those are the new
+cross-engine checks.
+
+Still open from the audit and **not** touched, because each needs a design
+decision rather than a patch: RLS applied after aggregation, `policy=None`
+bypassing governance, Workbench POST without Origin checks, and the
+planner/executor segment mismatch. Those are the next round.
+
+---
+
+### Round 24 — a PR arrived that did not come from this working tree
+
+A message reported PR #1 "vector-aware and semantic-key ready" at commit
+`cc0bfd8`, 6/6 green, 811 tests. I checked before believing it, and the branch
+is real — but it was **not produced from this working tree**, and two of its
+claims are false in a way that matters more than a red test.
+
+**Verified true:** the commit exists on `origin/feature/semantic-execution-history`,
+811 tests collect, and 801 pass locally with ruff clean.
+
+**False: "the runtime observation path records every input table."**
+`src/aar/runtime/executor.py` on that branch still reads
+`rows_in=inputs[0].num_rows` and `bytes_in=inputs[0].nbytes`. The real executor
+was never touched. The join bug the change claims to fix is exactly as open
+there as it was before.
+
+**The mechanism, and why 801 tests passed anyway.** The PR adds a *second*
+148-line `history_executor.py` and rewrites `aar/runtime/__init__.py` to
+
+    from .history_executor import Executor, NodeOutcome
+
+so `from aar.runtime import Executor` resolves to the new stub, not to the real
+one. Verified at runtime: `r.Executor is e.Executor` → `False`.
+`application.py` and `cli.py` both import from that public path, so **the CLI
+would execute pipelines on the stub**. The new tests import from `aar.runtime`
+too, so they test the copy and pass — 801 green means nothing here. A shadowing
+re-export is the one failure mode a test suite structurally cannot catch,
+because every test that imports the public name gets the substitute.
+
+I have **not** merged it and have **not** adopted it. The correct move is not
+to patch the stub but to change the one real `ExecutionRecord` and the one real
+`_observe`, in the tree this branch is based on, with the semantic key computed
+from `identity.py` rather than injected as an optional `operation_key_fn`. Two
+executors is the defect; a third parameter to opt into correctness is not the
+fix.
+
+I should also be plain that `identity.py` — the semantic identity the PR was
+framed as preparing for — is **not** in that branch at all. It remains uncommitted
+here, which is why the PR could report readiness for a subsystem that had not
+been written.
+
+**Status: identity is in progress, not done.** `identity.py` exists and is
+exported; `topological_order` no longer sorts by UUID; `NodeOutcome` carries
+input vectors and `None`-for-unmeasured; `_observe` keys on `operation_id`. Not
+yet done: `ExecutionRecord`/`ExecutionHistory` still take the scalar signature,
+and the identity module has never been executed. No test has been written for
+any of it.
 
 ---
 

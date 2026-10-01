@@ -555,6 +555,22 @@ class ArrowEngine(Engine):
         if overlapping:
             return None
 
+        # **RIGHT and FULL must not use Arrow's native join.** With
+        # ``coalesce_keys=True`` Arrow emits the *right* row's key for an
+        # unmatched row; DuckDB, with coalesced keys, emits the *left* table's,
+        # which is NULL because nothing matched:
+        #
+        #     arrow  right : k = [2, 3, 4]
+        #     duckdb right : k = [2, 3, None]
+        #
+        # Same three rows, different values in the key column, and the second
+        # one matches SQL. This is a library divergence rather than a bug in
+        # either, so the only way to be right is not to use Arrow's answer
+        # here. The Python path implements coalesce-keys semantics and is the
+        # reference; these two kinds pay its cost rather than the whole engine.
+        if str(kind) in ("right", "full"):
+            return None
+
         try:
             result = left.arrow.join(
                 right.arrow, keys=key_names, join_type=join_type,
@@ -592,7 +608,30 @@ class ArrowEngine(Engine):
 
     def _python_join(self, left: Table, right: Table, key_names: list[str],
                      how: str) -> Table:
-        """The original implementation: always correct, and slow."""
+        """The reference implementation: correct for every join kind, and slow.
+
+        **This used to fall through to equality-join behaviour for SEMI, ANTI
+        and CROSS.** Measured on left={k:1,2,3}, right={k:2,3,4}:
+
+            semi  -> returned the *inner* rows [2, 3] with the right columns
+            anti  -> returned [2, 3], the exact complement of the answer
+            cross -> returned 2 rows instead of 9
+
+        So all three were wrong, and wrong in the worst direction: they
+        produced rows another engine also produces, so nothing downstream could
+        tell the difference. ASOF is genuinely not implemented and now raises.
+
+        The match-finding below is shared; only what gets *emitted* differs per
+        kind, which is where the semantics actually live.
+        """
+        kind = getattr(how, "value", how)
+        if str(kind) == "asof":
+            raise NotImplementedError(
+                "asof joins are not implemented: 'nearest preceding match' "
+                "requires ordering and a tolerance that no engine here takes "
+                "uniformly, so any answer would be an approximation presented "
+                "as a result.")
+
         right_rows = right.arrow.to_pylist()
         right_by_key: dict[tuple, list[dict]] = {}
         for rrow in right_rows:
@@ -601,6 +640,28 @@ class ArrowEngine(Engine):
 
         left_rows = left.arrow.to_pylist()
         out: list[dict] = []
+
+        # SEMI and ANTI emit left rows only - never the right columns, which a
+        # semi-join is defined not to produce.
+        if str(kind) in ("semi", "anti"):
+            for lrow in left_rows:
+                k = tuple(_hashable(lrow.get(name)) for name in key_names)
+                matched = bool(right_by_key.get(k)) and None not in k
+                if (str(kind) == "semi") == matched:
+                    out.append(dict(lrow))
+            return _build_joined(out, left, right, key_names, how)
+
+        if str(kind) == "cross":
+            # Every left row against every right row, keys included.
+            for lrow in left_rows:
+                for rrow in right_rows:
+                    merged = dict(lrow)
+                    for name, value in rrow.items():
+                        if name not in key_names:
+                            merged[name] = value
+                    out.append(merged)
+            return _build_joined(out, left, right, key_names, how)
+
         for lrow in left_rows:
             k = tuple(_hashable(lrow.get(name)) for name in key_names)
             # SQL: NULL never equals NULL, not even to itself. Matching them
@@ -627,15 +688,18 @@ class ArrowEngine(Engine):
             for rrow in right_rows:
                 k = tuple(_hashable(rrow.get(n)) for n in key_names)
                 if k not in left_keys:
-                    merged = {n: None for n in left.column_names
-                              if n not in key_names}
-                    for name in key_names:
-                        merged[name] = rrow.get(name)
+                    # The key columns must be NULL, not the right row's key.
+                    #
+                    # With coalesced keys the key column is the *left* table's,
+                    # and a right row that matched nothing has no left key to
+                    # contribute. Copying ``rrow[k]`` put k=4 where DuckDB puts
+                    # NULL, so Arrow and DuckDB disagreed on a right join while
+                    # both returned three rows.
+                    merged = dict.fromkeys(left.column_names)
                     for name, value in rrow.items():
                         if name not in key_names:
                             merged[name] = value
                     out.append(merged)
-
 
         return _build_joined(out, left, right, key_names, how)
 
@@ -1100,6 +1164,13 @@ def _build_joined(out: list[dict], left: Table, right: Table,
     from. Classification is the union of both sides: either input can
     contribute to a joined row, so a right-hand ``CONFIDENTIAL`` column is as
     sensitive as if it had arrived alone.
+
+    **SEMI and ANTI emit left columns only.** This function used to union both
+    schemas unconditionally, so a semi-join returned ``rv`` full of nulls -
+    a column the join is defined not to produce. Callers that only checked the
+    row count saw a correct answer, and only a schema comparison revealed the
+    fabrication. ``how`` is consulted here rather than by each caller because
+    every caller would otherwise have to remember.
     """
     import pyarrow as pa
 
@@ -1108,13 +1179,16 @@ def _build_joined(out: list[dict], left: Table, right: Table,
     from ..types import Field, Schema
 
     both = _lineage.merge_schemas(left.schema, right.schema)
+    kind = str(getattr(how, "value", how))
+    left_only = kind in ("semi", "anti")
     names: list[str] = []
     for name in left.column_names:
         if name not in names:
             names.append(name)
-    for name in right.column_names:
-        if name not in names:
-            names.append(name)
+    if not left_only:
+        for name in right.column_names:
+            if name not in names:
+                names.append(name)
 
     fields = []
     for name in names:
@@ -1133,7 +1207,15 @@ def _build_joined(out: list[dict], left: Table, right: Table,
         else:
             fields.append(pa.field(name, pa.string()))
     arrow_schema = pa.schema(fields)
-    return Table(pa.Table.from_pylist(out, schema=arrow_schema),
+    # Every row is re-keyed in `names` order before conversion.
+    # `from_pylist` lays the table out using the *first* row's key order, and
+    # the RIGHT/FULL branch above builds its unmatched rows key-first. So a
+    # correct join returned ['lv','k','rv'] while DuckDB returned
+    # ['k','lv','rv'] - the same rows in a different shape, which is still a
+    # disagreement a caller can see. Column order belongs to the schema, not to
+    # whichever row happened to be assembled first.
+    ordered = [{name: row.get(name) for name in names} for row in out]
+    return Table(pa.Table.from_pylist(ordered, schema=arrow_schema),
                  Schema(tuple(
                      Field(f.name, _from_pa(f.type), nullable=f.nullable,
                            classification=both)

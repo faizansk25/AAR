@@ -503,6 +503,13 @@ class Node:
     udf: Any = None
     udf_name: str = ""
     udf_mode: str = "row"
+    #: Declared identity for a UDF whose source cannot be hashed - a C
+    #: extension, a callable object, a function defined in a REPL. Setting
+    #: this is an assertion by the author that the string captures everything
+    #: that affects behaviour and cost. When absent, identity is derived from
+    #: the function's source and raises if that is impossible; it is never
+    #: silently faked from a name or an address.
+    semantic_version: str | None = None
     limit: int | None = None
     target: str | None = None
     write_format: str | None = None
@@ -627,8 +634,24 @@ class Node:
 def topological_order(nodes: "list[Node] | Node") -> list[Node]:
     """Deterministic topological order, children before parents.
 
-    Ties break on node id so two runs over the same graph produce
-    byte-identical plans - a prerequisite for reproducible, diffable plans.
+    **Input order is the tie-break, not ``Node.id``.**
+
+    This used to sort by ``c.id``, which is a UUID. That made the order
+    deterministic *within one process* and arbitrary *between* two: parsing the
+    same pipeline twice produced different traversal orders, so the planner
+    saw a different graph and reached a different plan. It has already caused
+    a real defect - "the last scan in the segment" alternated between a 100 MB
+    and a 2 GB input, so the wrong one was priced.
+
+    Sorting by ``semantic_operation_id`` would be worse, not better: two
+    genuinely identical operations in one graph legitimately share an
+    operation ID, and the sort would then be arbitrary again while looking
+    deterministic. ``Node.inputs`` is in *declared* order, which is real
+    information - for a JOIN, ``inputs[0]`` is the left side - so it is used
+    directly.
+
+    Roots are likewise taken in the order given, falling back to the order they
+    appear in ``nodes``.
     """
     if isinstance(nodes, Node):
         nodes = [nodes]
@@ -643,14 +666,15 @@ def topological_order(nodes: "list[Node] | Node") -> list[Node]:
         if st == 1:
             raise ValueError(f"cycle detected at {n.id} ({n.type})")
         state[id(n)] = 1
-        for child in sorted(n.inputs, key=lambda c: c.id):
+        # Declared input order. Not sorted: see the docstring.
+        for child in n.inputs:
             visit(child)
         state[id(n)] = 2
         out.append(n)
 
-    for r in sorted(roots, key=lambda n: n.id):
+    for r in roots:
         visit(r)
-    for n in sorted(nodes, key=lambda n: n.id):
+    for n in nodes:
         if state.get(id(n), 0) != 2:
             visit(n)
     return out

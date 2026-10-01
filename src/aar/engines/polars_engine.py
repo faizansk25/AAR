@@ -138,22 +138,37 @@ class PolarsEngine(Engine):
 
     def join(self, left: Table, right: Table, keys: Sequence[str],
              how: str) -> Table:
-        from .arrow_engine import ArrowEngine
 
+        # ``str(how)`` on a JoinType member is "JoinType.SEMI" on Python 3.11+,
+        # not "semi", so an unmapped kind would miss the table and fall through
+        # to Arrow by accident rather than by decision. Unwrap explicitly.
+        kind = getattr(how, "value", how)
         how_map = {"inner": "inner", "left": "left", "right": "right",
-                   "full": "full"}
-        polars_how = how_map.get(str(how))
+                   "full": "full", "semi": "semi", "anti": "anti",
+                   "cross": "cross"}
+        polars_how = how_map.get(str(kind))
         if polars_how is None:
-            return ArrowEngine().join(left, right, keys, how)
+            # Polars has no ASOF join, and delegating to Arrow would rely on
+            # Arrow implementing it - which it also does not. Raise here so the
+            # gap is named at the boundary instead of being answered wrongly.
+            raise NotImplementedError(
+                f"polars cannot perform a {str(kind)!r} join. Supported: "
+                f"{sorted(how_map)}")
         lf = self._pl.from_arrow(left.arrow)
         rf = self._pl.from_arrow(right.arrow)
-        joined = lf.join(rf, on=list(keys), how=polars_how)
+        joined = lf.join(rf, on=list(keys) if polars_how != "cross" else None,
+                         how=polars_how)
         # A joined row can draw from either input, so every output column is
         # as sensitive as the more sensitive of the two sides. Left alone,
         # this boundary dropped both sides' tags on the floor.
         both = _lineage.merge_schemas(left.schema, right.schema)
-        out_names = list(left.column_names) + [
-            c for c in right.column_names if c not in keys]
+        if polars_how in ("semi", "anti"):
+            # A semi/anti join emits left columns only; naming the right ones
+            # would tag columns the result does not contain.
+            out_names = list(left.column_names)
+        else:
+            out_names = list(left.column_names) + [
+                c for c in right.column_names if c not in keys]
         return self._table(joined, source=left,
                            derived=dict.fromkeys(out_names, both))
 
@@ -193,7 +208,28 @@ def _import_polars() -> Any:
 
 # --------------------------------------------------------- expression glue
 def _to_polars_expr(pl: Any, expr: Any) -> Any:
-    """Render an IR predicate as a Polars expression, or None if too complex."""
+    """Render an IR predicate as a Polars expression, or None if too complex.
+
+    **Returning None must mean the *whole* predicate is unsupported**, never
+    "part of it". The AND/OR branches used to filter the operands::
+
+        pl.all_horizontal([e for e in (left, right) if e is not None])
+
+    which silently deleted an unsupported half. Measured on
+    ``amount > 100 AND regexp_match(name, '^A')`` - the second term is not
+    representable, so it compiled to ``None``:
+
+        compiled : [(col("amount")) > (dyn int: 100)].all_horizontal()
+        got rows : ['Ann', 'Cid']
+        correct  : ['Ann']
+
+    So the conjunction became the condition on its own and the filter was too
+    permissive. `filter()` above then sees a non-None expression and never
+    falls back to Arrow, so nothing noticed.
+
+    A dropped conjunct returns too many rows; a dropped disjunct returns too
+    few. Both are wrong answers that look like a working filter.
+    """
     from ..ir import BinOp, Col, Lit
 
     if expr is None:
@@ -205,14 +241,16 @@ def _to_polars_expr(pl: Any, expr: Any) -> Any:
     if not isinstance(expr, BinOp):
         return None
     op = expr.op
-    if op == "AND":
-        return pl.all_horizontal(
-            [e for e in (_to_polars_expr(pl, expr.left),
-                         _to_polars_expr(pl, expr.right)) if e is not None])
-    if op == "OR":
-        return pl.any_horizontal(
-            [e for e in (_to_polars_expr(pl, expr.left),
-                         _to_polars_expr(pl, expr.right)) if e is not None])
+    if op in ("AND", "OR"):
+        left = _to_polars_expr(pl, expr.left)
+        right = _to_polars_expr(pl, expr.right)
+        # All or nothing. A conjunction with a missing conjunct is not the
+        # conjunction, and a disjunction with a missing disjunct is not the
+        # disjunction - each returns a *different* row set, not a subset.
+        if left is None or right is None:
+            return None
+        combiner = pl.all_horizontal if op == "AND" else pl.any_horizontal
+        return combiner([left, right])
     left = _to_polars_expr(pl, expr.left)
     right = _to_polars_expr(pl, expr.right)
     if left is None or right is None:
