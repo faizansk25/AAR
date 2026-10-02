@@ -51,6 +51,89 @@ deliberately not solved by banning role-scoped aggregates.
 **6. Workbench POST hardening.** Startup token, Origin/Host validation,
 pipeline-root restriction, refusal to bind non-loopback. The RLS round makes
 this more urgent, not less: an exposed Workbench is an exposed policy engine.
+**Promoted above items 1-5** by the product decision below — it is now a
+prerequisite for any analyst-facing pilot, not a backlog item.
+
+---
+
+## Product direction — decided 2026-10-01, and it re-ranks everything above
+
+### The mistake
+
+Twenty-seven rounds went into making the query engine correct: join semantics,
+RLS placement, history units, cross-engine equivalence. Each was a real defect
+and each was invisible to anyone who will ever use this. The cost model, the
+hardware profiler and the device selection are **7,755 lines — 46% of a
+16,796-line codebase** — and they decide which engine runs on which chip.
+
+The thing being *bought* had, at that point, **zero persistence and zero query
+surface**: `LineageEvent`, `DegradationLedger`, `ExecutionResult.outcomes` and
+`PolicyEngine.decisions` were four append-only Python lists that die with the
+process.
+
+Scored against the product's own questions, before this decision:
+
+| Question | State |
+|---|---|
+| What was Dana allowed to see? | **No.** No access log exists |
+| Which rows did RLS remove before aggregation? | **Partial.** Barriers record no before/after count |
+| Did confidential data leave the machine? | **In-memory only** |
+| Which policy allowed/denied? | **In-memory only** |
+| Which engine actually executed? | **In-memory, per-run** |
+| Did runtime differ from the approved plan? | **In-memory** |
+| Can we reproduce the governed execution later? | **No store to reproduce against** |
+
+**Zero of seven.** That is the finding, and it should have been the first
+question asked rather than the twenty-eighth.
+
+### The decision
+
+The economic buyer is the **Head of Data Governance / Data Platform / Security &
+Compliance** in a regulated company. The analyst is the daily user; governance
+is what creates the budget. The product is a **governed local-first analytics
+runtime** — analysts work across Excel, SQL, Python, files and databases, and
+the organisation gets verifiable proof of what was accessed, transformed, moved
+and exposed.
+
+**Adaptive engine/resource selection stays, but demoted from product to
+sensor.** Its job is no longer to be fast; it is to emit provable evidence.
+The 7,755 lines are not wasted — they are the instrumentation that makes
+claims checkable. They simply stop being the destination.
+
+The GUI, the governance layer, the audit model and multi-tool orchestration
+are all explicitly *kept*. Connector breadth does not expand by default.
+
+### The filter
+
+Every feature must pass one test:
+
+> **Does this make governed analytical work easier for an analyst, or make that
+> work more provable or controlled for the organisation?**
+
+If neither, it is not a priority. This supersedes "fix what is broken" as the
+default ordering: a correct engine that nobody can audit is worth less than an
+auditable one that is correct enough.
+
+### What this reorders
+
+The single blocking gap is that **there is no governed execution record, and no
+way to ask it anything.** Next piece of work is the audit spine, in order:
+
+1. `GovernedRun` — subject, timestamp, policy identity, plan hash, exit
+   status, row counts;
+2. per-node events — *planned* engine vs *engine used*, degradation, and RLS
+   barriers carrying **rows-before / rows-after** (question 2, currently
+   unrecorded);
+3. every policy decision with rule and reason (questions 3 and 4);
+4. SQLite persistence — `history.py` already parses it, so no new dependency;
+5. **a query API** — `for_subject("dana")`, `egress_attempts()`,
+   `plan_vs_actual(run_id)`.
+
+Item 5 is what makes it a product rather than a log file. An audit trail
+nobody can query is what most audit logs already are.
+
+The Workbench POST hardening (§Open items 6) moves **up**, not down: an exposed
+Workbench is an exposed policy engine.
 
 ---
 
