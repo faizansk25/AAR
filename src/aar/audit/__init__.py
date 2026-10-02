@@ -48,11 +48,18 @@ from .recorder import (  # noqa: F401
     rows_removed, stamp, verify_chain,
 )
 
+from .view import (  # noqa: F401
+    Capability, EvidenceAuthorizer, EvidenceView, FieldState, FieldValue,
+    RESTRICTED_COUNT_FIELDS, project, trust_boundary_notice,
+)
+
 __all__ = [
-    "CanonicalisationError", "EVIDENCE_SCHEMA_VERSION", "EventType",
-    "EvidenceEvent", "EvidenceRecorder", "GENESIS_HASH", "RunContext",
-    "Subject", "SubjectIdentity", "VerificationResult", "canonical_bytes",
-    "canonical_text", "chain_digest", "digest", "event_fields",
-    "indexed_columns", "new_event_id", "new_run_id", "rows_removed", "stamp",
+    "CanonicalisationError", "Capability", "EVIDENCE_SCHEMA_VERSION",
+    "EvidenceAuthorizer", "EvidenceEvent", "EvidenceRecorder", "EvidenceView",
+    "EventType", "FieldState", "FieldValue", "GENESIS_HASH",
+    "RESTRICTED_COUNT_FIELDS", "RunContext", "Subject", "SubjectIdentity",
+    "VerificationResult", "canonical_bytes", "canonical_text", "chain_digest",
+    "digest", "event_fields", "indexed_columns", "new_event_id", "new_run_id",
+    "project", "rows_removed", "stamp", "trust_boundary_notice",
     "verify_chain",
 ]

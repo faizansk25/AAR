@@ -84,6 +84,18 @@ rn2.txt
 venv/
 env/
 ENV/
+
+# Credentials. `RELEASING.md` tells the release engineer to write a token into
+# `~/.pypirc`; if a release is ever rehearsed from a checkout, that file
+# lands in the working tree. Ignoring it costs nothing and there is no version
+# of this repository that needs one committed.
+.pypirc
+.env
+.env.*
+*.pem
+*.key
+credentials.json
+secrets.json
 *.egg-info/
 build/
 dist/

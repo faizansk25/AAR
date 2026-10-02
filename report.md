@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1051 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1079 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -136,6 +136,108 @@ The Workbench POST hardening (§Open items 6) moves **up**, not down: an exposed
 Workbench is an exposed policy engine.
 
 ---
+
+---
+
+---
+
+### Round 29 — the view layer: one trail, two authorized readings
+
+RLS counts are **data about data**. "614 of 18,241 rows survived" is itself a
+disclosure, and repeated counts across varying filters permit a
+**differencing attack** that recovers protected rows one at a time:
+
+```text
+restricted rows for A            = 614
+restricted rows for A + filter X = 613   -> exactly one row satisfies X
+```
+
+So the counts are evidence for governance and a disclosure to an analyst, and
+those are different things.
+
+### The store keeps everything; only the view withholds
+
+```text
+Execution -> FULL immutable evidence -> Evidence Store -> Authorization / View
+                                                          ├── analyst-safe
+                                                          └── compliance-detailed
+```
+
+Redaction at record time would produce a trail that is complete for whoever can
+read the raw file and silently incomplete for everyone else — and it would
+leave a compliance viewer with nothing at all. The chain therefore always
+records `rows_before: 18_241` and `rows_removed: 17_627`, and the withholding
+happens in `aar/audit/view.py`.
+
+### A view is not an event, and is never re-hashed
+
+`EvidenceView` carries `source_event_id`, `source_event_hash` and
+`chain_verified`, so AAR can say *"the evidence verifies; three fields were
+withheld from this viewer"* rather than passing off a doctored object as the
+proof. A redacted object and a tampered one would otherwise look identical.
+
+### Redaction is not `None`
+
+The evidence semantics already distinguish "never measured" from "measured as
+zero". Collapsing "you may not see this" into that same bucket would destroy
+the distinction, so a withheld value is a `FieldValue` in state `REDACTED`
+with a reason, and the view also returns `redacted_fields` and
+`unknown_fields` — three states, never two:
+
+```python
+{"state": "measured", "value": 17627}
+{"state": "unknown"}
+{"state": "redacted", "reason": "insufficient_privilege"}
+```
+
+### Capabilities, and the viewer is not the subject
+
+Roles are not hardcoded: `"compliance"`, `"auditor"` and
+`"data_governance_admin"` are the same capability at three companies, so
+authorization asks about `Capability` values and a deployment maps its own
+vocabulary onto them. And `explain_access("dana")` says *whose* run is
+examined, never *who is asking* — `EvidenceAuthorizer` holds the viewer, so a
+caller cannot pass `role="compliance"` about themselves.
+
+### The two views
+
+```
+DANA sees:                         COMPLIANCE sees:
+  rule: rls.finance.eu               rule: rls.finance.eu
+  source: employees                  source: employees
+  applied_before_aggregation: True   applied_before_aggregation: True
+  rows_before: [restricted detail]   rows_before: 18241
+  rows_removed: [restricted detail]  rows_removed: 17627
+  Chain verified: VALID              Chain verified: VALID
+```
+
+Same event, same hash, two authorized readings.
+
+### The trust boundary, stated rather than implied
+
+This layer enforces visibility in the Workbench, CLI and API. It is **not**
+strong isolation: the evidence database is local-first and lives on the user's
+machine, so anyone who can read that file directly can read what the API
+withholds. `trust_boundary_notice()` says so in words. Real separation needs
+restricted filesystem permissions, a separate audit service, a central evidence
+server, or an encrypted store with a separately-held key — none built, none
+claimed.
+
+### Two bugs the tests caught
+
+- **Empty strings were rendering as "measured".** `engine_planned: ""` is a
+  field claiming to be evidence while carrying none — the same absent-vs-measured
+  conflation this module exists to prevent, one level down.
+- **A permitted viewer never saw the predicate.** `project` only set the key
+  when *redacting* it, so the granted case produced a missing key rather than a
+  value. An absent key and a redacted one are different facts, so both branches
+  now set it.
+
+**1069 passed, 10 skipped, 0 failed; ruff clean.** 28 new checks.
+
+Also: `.pypirc`, `.env`, `*.pem` and `*.key` are now git-ignored. `RELEASING.md`
+instructs the release engineer to write a token into `~/.pypirc`, so rehearsing
+a release from a checkout would have left one in the working tree.
 
 ---
 
