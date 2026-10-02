@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1079 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1095 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -138,6 +138,85 @@ Workbench is an exposed policy engine.
 ---
 
 ---
+
+---
+
+---
+
+### Round 30 — absence of an event is not absence of a restriction
+
+Three refinements to the view layer. The third is the sharpest: **I had been
+inferring a security fact from the absence of an event.**
+
+### "No RLS" now needs its own positive evidence
+
+The implementation I proposed last round would have searched for a
+`rows.restricted` event and reported "no RLS was applied" when it found none.
+That conflates two opposite truths:
+
+```text
+A. Policy was evaluated and no rule matched this subject.
+B. Governance was bypassed, or the run died before determination.
+```
+
+Under the two-state shortcut, B reports as "unrestricted" — the one answer
+that must never be given without evidence. So the determination is now recorded
+on every event and rendered as four states:
+
+```text
+RestrictionState.APPLIED          a rule was found and executed
+                  .NOT_APPLICABLE  policy evaluated; nothing matched
+                  .NOT_EVALUATED   governance explicitly bypassed
+                  .UNKNOWN         run ended, or predates the field
+```
+
+`UNKNOWN` is the load-bearing one — it is what an old evidence version or an
+interrupted run resolves to. The same lesson as `unknown != zero !=
+redacted`, one level up. It is also hashed, so rewriting a determination breaks
+verification.
+
+### Integrity status is safe; diagnostics are not
+
+`chain_verified` was being surfaced to everyone while `AUDIT_VERIFY_INTEGRITY`
+existed and did nothing — a decorative capability. Splitting them:
+
+```text
+audit.read             -> may see VALID / BROKEN
+audit.verify_integrity -> may invoke detailed verification,
+                          inspect break diagnostics
+```
+
+Integrity *status* is safe for any reader: a valid chain reveals no protected
+business data, and suppressing it would only teach readers to distrust the word
+VALID. The diagnostics behind a *break* are what the capability gates, and a
+reader without it is told the break requires it rather than shown nothing.
+
+### The withholding message names no role and no field
+
+Enumerating withheld fields leaks the shape of privileged evidence — a viewer
+who learns `restricted_group_count` exists has been told something not theirs
+to know, and the list grows with every field added. So the machine-readable
+projection keeps the exact names and the human message does not:
+
+```text
+API       redacted_fields: [rows_before, rows_after, rows_removed]
+Workbench "additional audit detail is restricted for your current access"
+```
+
+The analyst learns that restriction happened and that detail is withheld. They
+do not learn which role could see it.
+
+### Two bugs the tests caught
+
+- **`RestrictionState` started life as a plain class, not an enum**, so
+  `is_determined` was a `property` object rather than a bool and every
+  assertion about it passed vacuously or failed confusingly.
+- **`restriction_state` never reached the main return path** in `project` —
+  a bad edit left it only on the denied-view branch, so *every* view reported
+  `unknown` regardless of what the record said. The four-state work was
+  completely inert until a test caught it.
+
+**1085 passed, 10 skipped, 0 failed; ruff clean.** 16 new checks.
 
 ---
 

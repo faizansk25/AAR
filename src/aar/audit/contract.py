@@ -162,6 +162,18 @@ class EvidenceEvent:
     rule_id: str = ""
     reason: str = ""
     degradation: str = ""
+    #: Whether row-level security actually governed this run, as one of the four
+    #: :class:`~aar.audit.view.RestrictionState` values.
+    #:
+    #: Recorded rather than inferred. A reader that concludes "no restriction
+    #: happened" from the absence of a ``rows.restricted`` event cannot tell
+    #: "evaluated, nothing matched" from "never evaluated" - and those demand
+    #: opposite answers.
+    restriction_state: str = "unknown"
+    #: Whether the caller was entitled to run detailed integrity verification.
+    #: The *result* is safe to show any ``audit.read`` viewer; the diagnostics
+    #: behind a break are not.
+    integrity_verified: bool = False
 
     # --- environment
     aar_version: str = ""
@@ -214,6 +226,8 @@ class EvidenceEvent:
             "rule_id": self.rule_id,
             "reason": self.reason,
             "degradation": self.degradation,
+            "restriction_state": self.restriction_state,
+            "integrity_verified": self.integrity_verified,
             "aar_version": self.aar_version,
             "target_id": self.target_id,
             "attributes": dict(self.attributes),

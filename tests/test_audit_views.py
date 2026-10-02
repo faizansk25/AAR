@@ -18,15 +18,17 @@ from __future__ import annotations
 import pytest
 
 from aar.audit import (Capability, EvidenceAuthorizer, EventType,
-                       EvidenceRecorder, FieldState, FieldValue, Subject,
-                       project, trust_boundary_notice)
+                       EvidenceEvent, EvidenceRecorder, FieldState,
+                       FieldValue, RestrictionState, Subject, project,
+                       summarise_withheld, trust_boundary_notice)
 from aar.governance import Subject as GovernanceSubject
 
 ANALYST_CAPS = (Capability.AUDIT_READ,)
 COMPLIANCE_CAPS = (Capability.AUDIT_READ,
                    Capability.AUDIT_READ_RESTRICTED_COUNTS,
                    Capability.AUDIT_READ_OTHER_SUBJECTS,
-                   Capability.AUDIT_READ_POLICY_DETAILS)
+                   Capability.AUDIT_READ_POLICY_DETAILS,
+                   Capability.AUDIT_VERIFY_INTEGRITY)
 
 
 def _viewer(name: str, *caps: Capability) -> EvidenceAuthorizer:
@@ -49,12 +51,30 @@ def rls_event():
     event = recorder.emit(
         EventType.ROWS_RESTRICTED, rule_id="rls.finance.eu",
         engine_used="arrow", rows_in=(18_241,), rows_out=614,
+        restriction_state=RestrictionState.APPLIED,
         attributes={"source": "employees", "rows_before": 18_241,
                     "rows_removed": 17_627,
                     "applied_before_aggregation": True,
                     "predicate": "department = 'FINANCE'"})
     recorder.finish_run()
     return event
+
+
+def _run_started(state: str) -> EvidenceEvent:
+    """An event carrying a determination and no restriction rule attached.
+
+    ``start_run`` already emits a ``run.started`` of its own, so this records
+    a second event and returns that one. Using a distinct event type keeps the
+    fixture honest: the point is a determination *without* a ``rows.restricted``
+    event, which is precisely the case that must not be read as "no RLS".
+    """
+    recorder = EvidenceRecorder()
+    recorder.start_run(
+        GovernanceSubject(name="dana"), policy_id="corp", policy_hash="h")
+    recorder.emit(EventType.POLICY_ALLOWED, restriction_state=state,
+                  reason="policy evaluated")
+    recorder.finish_run()
+    return recorder.events()[1]
 
 
 class TestTheStoreKeepsTheExactFacts:
@@ -218,3 +238,109 @@ def test_the_trust_boundary_is_stated_not_hidden():
     notice = trust_boundary_notice()
     assert "NOT strong isolation" in notice
     assert "filesystem" in notice
+class TestAbsenceOfAnEventIsNotAbsenceOfRestriction:
+    """The same lesson as ``unknown != zero != redacted``, one level up.
+
+    Concluding "no RLS was applied" from the absence of a ``rows.restricted``
+    event cannot distinguish two opposite truths: policy evaluated and no rule
+    matched, versus governance never being evaluated at all. The determination
+    is therefore recorded, not inferred.
+    """
+
+    def test_applied_is_reported_as_applied(self, rls_event):
+        view = project(rls_event, ANALYST)
+        assert view.restriction_state == RestrictionState.APPLIED
+        assert view.restriction_state.is_determined
+
+    def test_not_applicable_is_not_the_same_as_unknown(self):
+        event = _run_started(RestrictionState.NOT_APPLICABLE)
+        view = project(event, ANALYST)
+        assert view.restriction_state == RestrictionState.NOT_APPLICABLE
+        assert view.restriction_state != RestrictionState.UNKNOWN
+        assert view.restriction_state.is_determined
+
+    def test_not_evaluated_is_not_reported_as_unrestricted(self):
+        """Governance was bypassed, so AAR must not claim the run was clean."""
+        event = _run_started(RestrictionState.NOT_EVALUATED)
+        view = project(event, ANALYST)
+        assert view.restriction_state == RestrictionState.NOT_EVALUATED
+        assert view.restriction_state != RestrictionState.NOT_APPLICABLE
+
+    def test_an_undetermined_run_says_unknown(self):
+        """An interrupted run, or one predating the field, must not guess."""
+        event = _run_started("")
+        assert project(event, ANALYST).restriction_state == \
+            RestrictionState.UNKNOWN
+
+    def test_the_state_is_not_inferred_from_event_absence(self):
+        """This event has no rule attached, and says so explicitly."""
+        event = _run_started(RestrictionState.NOT_APPLICABLE)
+        assert not event.rule_id
+        assert project(event, ANALYST).restriction_state == \
+            RestrictionState.NOT_APPLICABLE
+
+    def test_the_state_is_part_of_the_hash(self):
+        """A rewritten determination must break verification."""
+        from dataclasses import replace as dc_replace
+
+        event = _run_started(RestrictionState.NOT_APPLICABLE)
+        assert event.verify()
+        assert not dc_replace(
+            event, restriction_state=RestrictionState.UNKNOWN).verify()
+
+    def test_only_unknown_is_undetermined(self):
+        for state in (RestrictionState.APPLIED, RestrictionState.NOT_APPLICABLE,
+                      RestrictionState.NOT_EVALUATED):
+            assert state.is_determined, state
+        assert not RestrictionState.UNKNOWN.is_determined
+
+
+class TestIntegrityStatusIsSafeButDiagnosticsAreNot:
+    def test_any_reader_sees_valid_or_broken(self, rls_event):
+        """Status reveals no protected business data, and suppressing it would
+        only teach readers to distrust the word VALID."""
+        assert project(rls_event, ANALYST, chain_verified=True).\
+            chain_verified is True
+
+    def test_the_verify_capability_gates_the_diagnostics(self, rls_event):
+        analyst = project(rls_event, ANALYST, chain_verified=False)
+        auditor = project(rls_event, COMPLIANCE, chain_verified=False)
+        assert analyst.integrity_detail_permitted is False
+        assert auditor.integrity_detail_permitted is True
+
+    def test_a_break_without_permission_names_no_diagnostics(self, rls_event):
+        text = project(rls_event, ANALYST, chain_verified=False).render()
+        assert "BROKEN" in text
+        assert "audit.verify_integrity" in text
+
+    def test_the_capability_is_not_decorative(self):
+        """It gates something real rather than existing and doing nothing."""
+        assert _viewer("dana", *ANALYST_CAPS).may_verify() is False
+        assert _viewer("priya", *COMPLIANCE_CAPS).may_verify() is True
+
+
+class TestTheWithholdingMessageNamesNoRole:
+    def test_the_human_message_names_no_role(self):
+        message = summarise_withheld(("rows_before", "rows_removed"))
+        for word in ("compliance", "auditor", "admin", "role"):
+            assert word not in message.lower()
+
+    def test_the_human_message_names_no_internal_field(self):
+        """Enumerating them reveals what privileged evidence exists."""
+        message = summarise_withheld(("rows_before", "restricted_group_count",
+                                      "suppression_reason"))
+        assert "restricted_group_count" not in message
+        assert "suppression_reason" not in message
+
+    def test_the_human_message_says_detail_is_restricted(self):
+        message = summarise_withheld(("rows_before",))
+        assert "restricted" in message
+        assert "current access" in message
+
+    def test_nothing_withheld_means_nothing_announced(self):
+        assert summarise_withheld(()) == ""
+
+    def test_the_json_still_names_every_field(self, rls_event):
+        """Clients need deterministic semantics even when people do not."""
+        view = project(rls_event, ANALYST)
+        assert "rows_before" in view.redacted_fields

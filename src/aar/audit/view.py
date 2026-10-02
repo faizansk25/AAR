@@ -94,6 +94,49 @@ class FieldState(str, enum.Enum):
         return self.value
 
 
+class RestrictionState(str, enum.Enum):
+    """Whether row-level security actually governed a run. Four states, not two.
+
+    The tempting implementation is "look for a ``rows.restricted`` event; if
+    there isn't one, no RLS was applied". That is wrong, and it is wrong in the
+    direction that matters: absence of evidence is not evidence of absence.
+
+    Four situations collapse into two under that shortcut, and the two are
+    opposites:
+
+    * policy evaluated, no rule matched this subject - genuinely unrestricted;
+    * governance was bypassed, or the run died before determination - we do not
+      know, and must not say "unrestricted".
+
+    So the determination is recorded explicitly on every event
+    (:attr:`EvidenceEvent.restriction_state`) and rendered as one of four
+    values. :attr:`UNKNOWN` is the load-bearing one: it is what an old evidence
+    version, or a run interrupted before the policy was consulted, resolves to.
+    """
+
+    #: A matching rule was found and executed.
+    APPLIED = "applied"
+    #: Policy evaluated successfully; no rule applied to this subject or source.
+    NOT_APPLICABLE = "not_applicable"
+    #: Governance was explicitly bypassed (``--unsafe-disable-policy``).
+    NOT_EVALUATED = "not_evaluated"
+    #: The run ended, or predates this field, before a determination.
+    UNKNOWN = "unknown"
+
+    def __str__(self) -> str:  # pragma: no cover - display
+        return self.value
+
+    @property
+    def is_determined(self) -> bool:
+        """Whether this is a claim about the run rather than about AAR."""
+        return self not in (self.UNKNOWN,)
+
+    @property
+    def label(self) -> str:
+        """How to say it to a person, without leaking the authorization model."""
+        return self.name.replace("_", " ").upper()
+
+
 @dataclass(frozen=True, slots=True)
 class FieldValue:
     """A value together with why it is or is not available.
@@ -202,10 +245,20 @@ class EvidenceView:
     chain_verified: bool
     visible: dict[str, Any]
     #: Names of fields withheld, so the omission is stated rather than inferred
-    #: from a missing key.
+    #: from a missing key. Machine-readable and deterministic, because a client
+    #: needs to know exactly what it did not get.
     redacted_fields: tuple[str, ...] = ()
     #: Names of fields never measured - a different fact again.
     unknown_fields: tuple[str, ...] = ()
+    #: :class:`~aar.audit.view.RestrictionState` value for this run, recorded
+    #: rather than inferred from the presence of a restriction event.
+    restriction_state: str = RestrictionState.UNKNOWN
+    #: Whether the *result* of integrity verification is safe to show this
+    #: viewer. It is, for anyone who may read the run: a valid chain reveals
+    #: no protected business data, and suppressing it would just teach readers
+    #: to distrust the word VALID. The diagnostics behind a *break* are a
+    #: different matter and need :attr:`Capability.AUDIT_VERIFY_INTEGRITY`.
+    integrity_detail_permitted: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -235,11 +288,28 @@ class EvidenceView:
         lines.append(f"  Evidence event: {self.source_event_id}")
         lines.append(f"  Evidence hash:  {self.source_event_hash[:16]}...")
         state = "VALID" if self.chain_verified else "BROKEN"
-        lines.append(f"  Chain verified: {state}")
+        lines.append(f"  Evidence integrity: {state}")
+        if not self.chain_verified and not self.integrity_detail_permitted:
+            lines.append("  Break details require "
+                         "audit.verify_integrity")
         if self.redacted_fields:
-            lines.append("  Restricted detail withheld: "
-                         + ", ".join(self.redacted_fields))
+            lines.append("  Restricted audit detail withheld: "
+                         + summarise_withheld(self.redacted_fields))
         return "\n".join(lines)
+
+
+#: Withheld fields described in the abstract rather than by name. Enumerating
+#: every one leaks the shape of the privileged evidence: a viewer who learns
+#: that ``restricted_group_count`` exists has been told something about the
+#: system that is not theirs to know, and the list grows every time a field is
+#: added. The machine-readable ``redacted_fields`` keeps the exact names for
+#: clients that need deterministic semantics.
+_WITHHELD_SUMMARY = "additional audit detail is restricted for your current access"
+
+
+def summarise_withheld(fields: "tuple[str, ...]") -> str:
+    """The human-facing phrase. Names nothing, and names no role."""
+    return _WITHHELD_SUMMARY if fields else ""
 
 
 def project(event: EvidenceEvent, authorizer: EvidenceAuthorizer,
@@ -262,6 +332,9 @@ def project(event: EvidenceEvent, authorizer: EvidenceAuthorizer,
             chain_verified=chain_verified,
             visible={"access": "not permitted for this viewer"},
             redacted_fields=("event contents",),
+            restriction_state=event.restriction_state or
+            RestrictionState.UNKNOWN,
+            integrity_detail_permitted=authorizer.may_verify(),
         )
 
     visible: dict[str, Any] = {}
@@ -328,6 +401,13 @@ def project(event: EvidenceEvent, authorizer: EvidenceAuthorizer,
         visible=visible,
         redacted_fields=tuple(redacted),
         unknown_fields=tuple(unknown),
+        # Read from the record, never deduced from the presence of a
+        # restriction event. An event absent because governance was bypassed
+        # must not be reported as one absent because no rule applied.
+        restriction_state=event.restriction_state or RestrictionState.UNKNOWN,
+        # Integrity *status* is safe for any reader; the diagnostics behind a
+        # break are what the capability actually gates.
+        integrity_detail_permitted=authorizer.may_verify(),
     )
 
 
