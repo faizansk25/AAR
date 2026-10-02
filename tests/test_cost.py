@@ -19,11 +19,11 @@ from aar.cost import (CostBreakdown, CostModel, ExecutionHistory, Priors,
                       ResourceBudget, TransferProfile, default_cost_model,
                       node_operation)
 from aar.hardware.calibrate import CalibrationPoint, CalibrationStore
-from aar.ir import Node, NodeType
+from aar.ir import BinOp, Col, Lit, Node, NodeType
 
 
-def _node(node_type: NodeType) -> Node:
-    return Node(node_type)
+def _node(node_type: NodeType, **kw) -> Node:
+    return Node(node_type, **kw)
 
 
 class TestSavedCalibrationIsUsed:
@@ -708,9 +708,15 @@ class TestExecutionHistory:
     These tests used to record under ``node.id`` - a per-instance UUID - and
     then predict from the same node. That worked only because it was the same
     object: two parses of one pipeline could never share a measurement, so the
-    history filled with singletons and never learned anything. Recording under
-    ``semantic_operation_id`` is what makes the store worth having.
+    history filled with singletons and never learned anything.
+
+    They also used to assert that history *takes precedence over calibration*.
+    It no longer does, and that is the point: ``ExecutionHistory`` defaults to
+    ``observe_only``, so a plan is built from calibration and priors while
+    observations accumulate for diagnosis.
     """
+
+    TARGET = "aar-target-v1:test"
 
     @staticmethod
     def _key(node) -> str:
@@ -718,67 +724,158 @@ class TestExecutionHistory:
 
         return semantic_operation_id(node)
 
+    @staticmethod
+    def _obs(key, engine="duckdb", size=1000, total_ms=50.0,
+             compute_ms="same", target="aar-target-v1:test", success=True):
+        """An observation. ``compute_ms="same"`` means the times were separable.
+
+        The explicit ``None`` matters: it builds a record carrying wall time
+        only, which is what an executor that cannot separate acquisition from
+        dispatch produces - and such a record must not be able to support a
+        slope, because the fixed startup cost it contains is not a per-byte
+        term.
+        """
+        from aar.cost.history import ExecutionRecord
+
+        compute = total_ms if compute_ms == "same" else compute_ms
+        return ExecutionRecord(
+            operation_id=key, graph_node_id=None, target_id=target,
+            resource_snapshot="budget:4GiB", engine=engine,
+            input_bytes=(size,), input_rows=(size // 100,),
+            output_rows=size // 100, output_bytes=size // 10,
+            actual_elapsed_total_ms=total_ms,
+            actual_compute_ms=compute,
+            success=success)
+
+    def _history(self, **kw):
+        return ExecutionHistory(target_id=self.TARGET, **kw)
+
     def test_no_history_means_no_prediction(self):
-        h = ExecutionHistory()
-        assert h.predict(_node(NodeType.GROUPBY), "duckdb", 1000) is None
+        h = self._history()
+        got = h.predict_for_node(_node(NodeType.GROUPBY), "duckdb", 1000)
+        assert not got.usable
+        assert got.seconds is None
+        assert "no successful observation" in got.reason
 
     def test_single_observation_is_a_lookup(self):
-        h = ExecutionHistory()
+        h = self._history()
         node = _node(NodeType.GROUPBY)
-        h.record(self._key(node), "duckdb", 1000, 10, elapsed_ms=50.0)
-        assert h.predict(node, "duckdb", 1000) == pytest.approx(0.05)
+        h.record(self._obs(self._key(node), total_ms=50.0))
+        got = h.predict_for_node(node, "duckdb", 1000)
+        assert got.usable
+        assert got.basis == "lookup"
+        assert got.seconds == pytest.approx(0.050)
+
+    def test_a_single_observation_never_extrapolates_to_another_size(self):
+        """The defect: ``1 MB -> 4 ms`` used to imply ``40 GB -> 4 ms``.
+
+        Reproduced before this change. A lookup answers only for the size it
+        actually observed, and refuses elsewhere rather than holding a timing
+        measured on a table forty thousand times smaller.
+        """
+        h = self._history()
+        key = self._key(_node(NodeType.GROUPBY))
+        h.record(self._obs(key, size=1_000_000, total_ms=4.0))
+
+        near = h.predict(key, "duckdb", (1_000_000,))
+        assert near.usable and near.seconds == pytest.approx(0.004)
+
+        far = h.predict(key, "duckdb", (40_000_000_000,))
+        assert not far.usable
+        assert far.seconds is None
+        assert "one point is not a trend" in far.reason
+
+    def test_a_sparse_series_refuses_to_extrapolate_but_interpolates(self):
+        """Two sizes are a line, not a trend; three is the default minimum."""
+        h = self._history()
+        key = self._key(_node(NodeType.GROUPBY))
+        for size, ms in ((1_000_000, 4.0), (2_000_000, 8.0)):
+            h.record(self._obs(key, size=size, total_ms=ms))
+
+        inside = h.predict(key, "duckdb", (1_500_000,))
+        assert inside.usable
+        assert inside.basis == "ewma", (
+            "below the distinct-size minimum, so an average, not a slope")
+
+        outside = h.predict(key, "duckdb", (500_000_000,))
+        assert not outside.usable
+        assert "refusing to extrapolate" in outside.reason
+
+    def test_three_sizes_buy_a_slope(self):
+        h = self._history()
+        key = self._key(_node(NodeType.GROUPBY))
+        for size in (1_000_000, 2_000_000, 4_000_000):
+            h.record(self._obs(key, size=size, total_ms=size / 250_000.0))
+        small = h.predict(key, "duckdb", (1_000_000,))
+        big = h.predict(key, "duckdb", (32_000_000_000,))
+        assert big.usable and big.basis == "regression"
+        assert big.seconds > small.seconds
 
     def test_predictions_are_separated_by_engine(self):
+        h = self._history()
+        node = _node(NodeType.GROUPBY)
+        h.record(self._obs(self._key(node), engine="duckdb", total_ms=50.0))
+        assert not h.predict_for_node(node, "polars_cpu", 1000).usable
+
+    def test_evidence_without_a_target_answers_for_nothing(self):
+        """A record that cannot name its machine cannot speak for one."""
         h = ExecutionHistory()
         node = _node(NodeType.GROUPBY)
-        h.record(self._key(node), "duckdb", 1000, 10, elapsed_ms=50.0)
-        assert h.predict(node, "polars_cpu", 1000) is None
+        h.record(self._obs(self._key(node), target="", total_ms=50.0))
+        got = h.predict_for_node(node, "duckdb", 1000)
+        assert not got.usable
+        assert "no target id" in got.reason
 
     def test_failures_are_never_averaged_in(self):
         """A crashed run's duration is not a cost."""
-        h = ExecutionHistory()
+        h = self._history()
         node = _node(NodeType.GROUPBY)
         key = self._key(node)
-        h.record(key, "duckdb", 1000, 10, elapsed_ms=10.0, success=True)
-        h.record(key, "duckdb", 1000, 10, elapsed_ms=9999.0, success=False)
-        assert h.predict(node, "duckdb", 1000) == pytest.approx(0.010)
+        h.record(self._obs(key, total_ms=10.0, success=True))
+        h.record(self._obs(key, total_ms=9999.0, success=False))
+        assert h.predict_for_node(node, "duckdb", 1000).seconds == \
+            pytest.approx(0.010)
+        # ...but the failure is still there to be asked about.
+        assert len(h.records(key, "duckdb", successful_only=False)) == 2
 
-    def test_regression_extrapolates_with_size(self):
-        h = ExecutionHistory(min_samples_for_regression=3)
-        node = _node(NodeType.GROUPBY)
-        key = self._key(node)
-        for size, ms in ((1000, 10.0), (2000, 20.0), (3000, 30.0),
-                         (4000, 40.0)):
-            h.record(key, "duckdb", size, size, elapsed_ms=ms)
-        assert h.predict(node, "duckdb", 8000) > h.predict(node, "duckdb", 2000)
+    def test_a_failed_record_claims_no_output(self):
+        from aar.cost.history import ExecutionRecord
+
+        h = self._history()
+        key = self._key(_node(NodeType.GROUPBY))
+        failed = ExecutionRecord(
+            operation_id=key, graph_node_id=None, target_id=self.TARGET,
+            resource_snapshot="budget:4GiB", engine="duckdb",
+            input_bytes=(100, 200), input_rows=(10, 20),
+            actual_elapsed_total_ms=1.0, success=False, failure_kind="boom")
+        h.record(failed)
+        assert failed.output_bytes is None
+        assert failed.output_rows is None
+        assert failed.failure_kind == "boom"
+        assert not h.predict(key, "duckdb", (300,)).usable
 
     def test_history_never_predicts_negative_time(self):
-        h = ExecutionHistory(min_samples_for_regression=3)
-        node = _node(NodeType.GROUPBY)
-        key = self._key(node)
+        h = self._history()
+        key = self._key(_node(NodeType.GROUPBY))
         for size, ms in ((1000, 100.0), (2000, 10.0), (3000, 50.0),
                          (4000, 20.0)):
-            h.record(key, "duckdb", size, size, elapsed_ms=ms)
-        for size in (1, 1000, 10_000_000):
-            assert h.predict(node, "duckdb", size) >= 0
+            h.record(self._obs(key, size=size, total_ms=ms))
+        for size in (1000, 2000, 3000):
+            assert h.predict(key, "duckdb", (size,)).seconds >= 0
 
-    def test_history_takes_precedence_over_calibration(self):
+    def test_history_does_not_steer_planning_by_default(self):
+        """The point of this round: observations report, they do not decide."""
         store = CalibrationStore()
         store.add_points([CalibrationPoint("groupby", "cpu", 1000, 99.0)])
-        h = ExecutionHistory()
+        h = self._history()
         m = CostModel(calibration=store, registry=CapabilityRegistry(),
                       history=h)
-        node = _node(NodeType.GROUPBY)
-        h.record(self._key(node), "duckdb", 1000, 10, elapsed_ms=5.0)
-        value, source = m.compute_s(node, "duckdb", 1000)
-        assert source == "history"
-        assert value == pytest.approx(0.005)
-
-    def test_render_reports_totals(self):
-        h = ExecutionHistory()
-        h.record("op1", "duckdb", 1000, 10, elapsed_ms=25.0)
-        text = h.render()
-        assert "duckdb" in text and "25.0" in text
+        node = _node(NodeType.GROUPBY, estimated_bytes=1000)
+        h.record(self._obs(self._key(node), total_ms=5.0))
+        _, source = m.compute_s(node, "duckdb", 1000)
+        assert source != "history", (
+            "an observation must not become the plan while observe_only holds")
+        assert source.startswith("calibration")
 
     def test_a_rebuilt_pipeline_finds_the_first_runs_evidence(self):
         """The property the whole subsystem exists for.
@@ -788,24 +885,42 @@ class TestExecutionHistory:
         This is the test that fails if identity silently regresses to the
         transient id.
         """
-        h = ExecutionHistory()
+        h = self._history()
         first = _node(NodeType.GROUPBY)
         key = self._key(first)
-        h.record(key, "duckdb", 1000, 10, elapsed_ms=50.0)
+        h.record(self._obs(key, total_ms=50.0))
 
         rebuilt = _node(NodeType.GROUPBY)
         assert rebuilt.id != first.id, (
             "precondition: these must be distinct instances")
         assert self._key(rebuilt) == key
-        assert h.predict(rebuilt, "duckdb", 1000) == pytest.approx(0.05), (
-            "history recorded for one parse must be found by another")
+        assert h.predict_for_node(rebuilt, "duckdb", 1000).seconds == \
+            pytest.approx(0.05), (
+                "history recorded for one parse must be found by another")
+
+    def test_identity_is_not_a_lambda_over_the_node_type(self):
+        """A regression guard on *how* identity is derived.
+
+        The old suite proved cross-parse reuse with a key function returning
+        ``"aar-op-v1:" + node.type``, which is stable for the wrong reason: it
+        ignores the predicate, so ``amount > 100`` and ``amount > 999`` would
+        share every measurement. The real identity must separate them.
+        """
+        h = self._history()
+        a = Node(NodeType.FILTER, inputs=[],
+                 predicate=BinOp(Col("amount"), ">", Lit(100)))
+        b = Node(NodeType.FILTER, inputs=[],
+                 predicate=BinOp(Col("amount"), ">", Lit(999)))
+        h.record(self._obs(self._key(a), total_ms=50.0))
+        assert not h.predict_for_node(b, "duckdb", 1000).usable, (
+            "two filters differing only in their predicate must not share "
+            "measurements; a type-only key would serve one for the other")
 
     def test_a_node_without_stable_identity_predicts_nothing(self):
         """A UDF with no recoverable source has no identity, so no prediction.
 
         Returning a number here would mean inventing an identity and pooling
-        unrelated UDFs together, which is the failure the refusal exists to
-        prevent.
+        unrelated UDFs together, which is the failure the refusal prevents.
         """
         from aar.ir.identity import UnstableSemanticIdentity
 
@@ -817,8 +932,80 @@ class TestExecutionHistory:
         with pytest.raises(UnstableSemanticIdentity):
             self._key(node)
         # And the history declines to guess.
+        got = self._history().predict_for_node(node, "duckdb", 1000)
+        assert not got.usable
+        assert "no stable semantic identity" in got.reason
+
+    def test_a_join_predicts_from_its_inputs_not_its_output(self):
+        """Planning and execution must use the same physical quantity.
+
+        The executor observes input bytes; regressing on the node's output size
+        and then predicting from its inputs compares two different things and
+        calls the result a cost.
+        """
+        from aar.cost.history import ExecutionRecord
+
+        h = self._history()
+        left = _node(NodeType.SCAN_PARQUET, estimated_bytes=5_000)
+        right = _node(NodeType.SCAN_PARQUET, estimated_bytes=45_000)
+        join = Node(NodeType.JOIN, inputs=[left, right], estimated_bytes=500)
+        h.record(ExecutionRecord(
+            operation_id=self._key(join), graph_node_id=None,
+            target_id=self.TARGET, resource_snapshot="budget:4GiB",
+            engine="duckdb", input_bytes=(5_000, 45_000), input_rows=(5, 45),
+            actual_elapsed_total_ms=50.0, actual_compute_ms=50.0))
+        got = h.predict_for_node(join, "duckdb", 500)
+        assert got.seconds == pytest.approx(0.050, rel=0.05), (
+            "a model trained on 50k input bytes must not predict from the "
+            "join's 500-byte output")
+
+    def test_unseparated_times_cannot_support_a_slope(self):
+        """Wall time carries a fixed acquisition cost, not a per-byte one."""
+        h = self._history()
+        key = self._key(_node(NodeType.GROUPBY))
+        for size, ms in ((1_000_000, 104.0), (2_000_000, 108.0),
+                         (4_000_000, 116.0)):
+            h.record(self._obs(key, size=size, total_ms=ms, compute_ms=None))
+        assert h.predict(key, "duckdb", (32_000_000_000,)).usable is False
+    def test_opting_in_is_possible_but_not_default(self):
+        store = CalibrationStore()
+        store.add_points([CalibrationPoint("groupby", "cpu", 1000, 99.0)])
+        h = self._history(observe_only=False)
+        m = CostModel(calibration=store, registry=CapabilityRegistry(),
+                      history=h)
+        node = _node(NodeType.GROUPBY)
+        h.record(self._obs(self._key(node), total_ms=5.0))
+        value, source = m.compute_s(node, "duckdb", 1000)
+        assert source == "history"
+        assert value == pytest.approx(0.005)
+
+    def test_render_reports_totals_and_mode(self):
+        h = self._history()
+        h.record(self._obs("op1", total_ms=25.0))
+        text = h.render()
+        assert "duckdb" in text and "25.0" in text
+        assert "observe-only" in text
+        assert self.TARGET in text
+
+    def test_render_says_when_nothing_was_observed(self):
+        assert "No execution history" in self._history().render()
+        """A record that cannot name its machine cannot speak for one."""
         h = ExecutionHistory()
-        assert h.predict(node, "duckdb", 1000) is None
+        node = _node(NodeType.GROUPBY)
+        h.record(self._obs(self._key(node), target="", total_ms=50.0))
+        got = h.predict_for_node(node, "duckdb", 1000)
+        assert not got.usable
+        assert "no target id" in got.reason
+
+    def test_two_machines_do_not_pool(self):
+        h = ExecutionHistory(target_id="aar-target-v1:aaa")
+        key = self._key(_node(NodeType.GROUPBY))
+        h.record(self._obs(key, target="aar-target-v1:aaa", total_ms=50.0))
+        h.record(self._obs(key, target="aar-target-v1:bbb", total_ms=5000.0))
+        assert h.predict(key, "duckdb", (1000,)).seconds == pytest.approx(0.050)
+        other = h.predict(key, "duckdb", (1000,),
+                         target_id="aar-target-v1:bbb")
+        assert other.seconds == pytest.approx(5.000)
 
 
 class TestExplain:

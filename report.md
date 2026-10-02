@@ -4,11 +4,132 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 992 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1006 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
 including both macOS jobs. Verified from the Actions API, job by job.
+
+---
+
+---
+
+## Open items, in the order they should be done
+
+**1. RLS pushdown into SQL/Mongo.** Now purely a performance question:
+`SECURITY_FILTER` above the scan is slower but preserves the answer and the
+rule. When it is done, the logical barrier must remain; a connector returns a
+`PushdownResult` naming what it accepted, and a security predicate becomes a
+no-op locally *only* when the connector confirms exact translation. Partial
+pushdown may prefilter, never discharge.
+
+**2. Planner/runtime segment and `DataHandle` alignment.** The planner's
+segments and the executor's dispatches do not correspond, which is why
+fused-vs-per-operation cost was a judgement call rather than a measurement.
+
+**3. Persistent history.** Only once the in-memory record's units are shown
+good, and only with physical-plan versioning - pushdown changes a logical
+operation's speed for an unrelated physical reason, so stored measurements
+must be partitioned by physical plan or they will contaminate each other.
+
+**4. Historical cost correction in the optimizer.** `observe_only` is flipped
+deliberately, once predictions like
+
+```text
+FILTER  / duckdb  / 100 MB   predicted 42 ms   actual 47 ms
+GROUPBY / polars /   1 GB   predicted 310 ms  actual 295 ms
+```
+
+hold across enough samples. `Confidence.usable` already exists so the gate can
+be a stated condition rather than a mood.
+
+**5. Statistical-disclosure controls.** Correctly-applied RLS does not stop
+`GROUP BY department` + `AVG(salary)` from revealing a single person's salary.
+That is a separate policy layer (minimum group size, small-cell suppression),
+deliberately not solved by banning role-scoped aggregates.
+
+**6. Workbench POST hardening.** Startup token, Origin/Host validation,
+pipeline-root restriction, refusal to bind non-loopback. The RLS round makes
+this more urgent, not less: an exposed Workbench is an exposed policy engine.
+
+---
+
+### Round 27 — history was steering plans on numbers with the wrong units
+
+PR #1 (`feature/semantic-execution-history`) is **not** mergeable and was not
+merged. Its `history_executor.py` is a second `Executor` subclass shadowing the
+real one, which is the duplicate execution-loop problem this codebase already
+paid for once. What was worth keeping was a handful of *test intents*, and
+those have been migrated against the real implementation instead.
+
+I measured all four suspected defects on `1581d10` before changing anything:
+
+```text
+ScanParquet  arrow  elapsed=95.44 ms   <- cold, includes engine construction
+             arrow  elapsed=16.60 ms   <- warm
+Filter       arrow  elapsed= 1.90 ms   <- the actual work
+
+predict(1 MB)  = 4.0 ms
+predict(40 GB) = 4.0 ms               <- one observation, every size
+
+recorded with NO target_key; predict() = 0.004
+```
+
+That third line is the one that matters most: **a `1 MB -> 4 ms` measurement
+implied `40 GB -> 4 ms`.** And `compute_s()` was returning that figure as the
+*compute* term while `segment_cost` charged startup, read and transfer on top —
+so the same seconds were billed twice, from two directions.
+
+#### What changed
+
+**History is observe-only.** `ExecutionHistory(observe_only=True)` is the
+default, and `CostModel.compute_s` no longer consults it. Calibration and
+priors decide plans; observations accumulate for diagnosis. Verified: a record
+claiming a 5-second filter yields `0.019 s from 'prior'`.
+
+**Wall time and compute time are separate fields.** The executor times engine
+acquisition apart from dispatch (`acquire_ms` / `compute_ms`), because
+constructing an engine is a fixed cost that does not scale with data. A
+measurement that cannot separate them carries `None` rather than a guess, and
+such a record is barred from supporting a slope.
+
+**Confidence rules, with reasons.** `predict` returns a `Confidence`, not a
+float: `seconds`, `basis`, `usable`, `samples`, `distinct_sizes`, `reason`. One
+distinct size is a lookup valid only near that size; two use a weighted average;
+three earn a regression. Outside the observed range it refuses unless a slope
+was actually measured. The refusal is the interesting output:
+
+```text
+40 GB -> None (usable=False)
+  asked about 40,000,000,000 bytes on evidence from a single size
+  (1,000,000); one point is not a trend
+```
+
+**Provenance is required.** `ExecutionRecord` now carries `target_id`,
+`resource_snapshot`, `engine_version`, `cost_model_version` and
+`schema_version`. Evidence with no target answers for nobody.
+
+**One `ExecutionHistory`, in `cost/history.py`.** Moved in a single refactor
+rather than coexisting with the old copy — two definitions of a statistics
+model that callers may pick between is worse than either.
+
+**Cross-parse reuse is proven with the real identity.** The superseded branch
+demonstrated it with `lambda n: "aar-op-v1:" + n.type`, which is stable for the
+*wrong* reason: it ignores the predicate, so `amount > 100` and `amount > 999`
+would share every measurement and the test would still pass. There is now a
+regression test that two filters differing only in their predicate do **not**
+share evidence.
+
+**No persistence.** Deliberately. An in-memory record with wrong units is a bug
+that dies with the process; the same record in SQLite is a bug that outlives it.
+
+**996 passed, 10 skipped, 0 failed; ruff clean.**
+
+Not done, and named: RLS pushdown into SQL/Mongo. It is now purely a
+performance question - `SECURITY_FILTER` above the scan is slower but correct -
+so it can wait. Doing it will require physical-plan versioning, because pushdown
+makes the same logical operation dramatically faster for an unrelated physical
+reason and would immediately contaminate stored measurements.
 
 ---
 

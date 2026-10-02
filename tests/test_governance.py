@@ -467,18 +467,79 @@ class TestPolicyInExecution:
 
 # -------------------------------------------------------- history feedback
 class TestHistoryFeedback:
+    """A real run must leave observations behind, with real units.
+
+    These go through the actual executor rather than a stub, because the units
+    are the whole point: an observation carrying a plausible number in the
+    wrong field is worse than none, since nothing downstream can tell.
+    """
+
     def test_a_run_records_what_it_observed(self, tmp_path):
         from aar.cost import ExecutionHistory
         from aar.runtime import Executor
 
         plan = TestPolicyInExecution()._pipeline(tmp_path, with_pii=True)
-        history = ExecutionHistory()
+        history = ExecutionHistory(target_id="aar-target-v1:test")
         with Executor(history=history) as ex:
             ex.execute(plan)
         assert len(history) > 0
-        for rec in history._records:
+        for rec in history.all():
             assert rec.success
-            assert rec.elapsed_ms >= 0.0
+            assert rec.actual_elapsed_total_ms >= 0.0
+            assert rec.target_id == "aar-target-v1:test", (
+                "an observation that cannot name its machine cannot be used")
+
+    def test_every_record_carries_provenance(self, tmp_path):
+        from aar.cost import ExecutionHistory
+        from aar.runtime import Executor
+
+        plan = TestPolicyInExecution()._pipeline(tmp_path, with_pii=True)
+        history = ExecutionHistory(target_id="aar-target-v1:test",
+                                   resource_snapshot="budget:4GiB")
+        with Executor(history=history) as ex:
+            ex.execute(plan)
+        assert history.all()
+        for rec in history.all():
+            assert rec.operation_id, "an observation with no identity is junk"
+            assert rec.resource_snapshot == "budget:4GiB"
+            assert rec.engine
+
+    def test_a_record_is_not_stored_under_a_transient_id(self, tmp_path):
+        """``Node.id`` is a fresh UUID each parse, so it cannot key a store."""
+        from aar.cost import ExecutionHistory
+        from aar.runtime import Executor
+
+        plan = TestPolicyInExecution()._pipeline(tmp_path, with_pii=True)
+        history = ExecutionHistory(target_id="aar-target-v1:test")
+        with Executor(history=history) as ex:
+            ex.execute(plan)
+        node_ids = {n.id for n in plan.root.walk()}
+        for rec in history.all():
+            assert rec.operation_id not in node_ids, (
+                "an observation keyed on Node.id cannot be found again")
+
+    def test_compute_time_is_separated_from_engine_acquisition(self, tmp_path):
+        """Wall time is not kernel time, and the record says which it has.
+
+        Acquisition is a fixed cost that does not scale with data. Folding it
+        into ``elapsed_ms`` and reading that as compute time is what let a cold
+        16 ms scan be reported as 95 ms of kernel work, with startup charged a
+        second time by the cost model.
+        """
+        from aar.cost import ExecutionHistory
+        from aar.runtime import Executor
+
+        plan = TestPolicyInExecution()._pipeline(tmp_path, with_pii=True)
+        history = ExecutionHistory(target_id="aar-target-v1:test")
+        with Executor(history=history) as ex:
+            ex.execute(plan)
+        records = history.all()
+        assert records
+        for rec in records:
+            if rec.acquire_ms:
+                assert rec.actual_compute_ms is not None
+                assert rec.actual_compute_ms <= rec.actual_elapsed_total_ms, (
+                    "compute time cannot exceed the wall time it sits inside")
 
     def test_a_failed_node_is_recorded_as_a_failure(self, tmp_path):
         from aar.cost import ExecutionHistory
@@ -497,10 +558,10 @@ class TestHistoryFeedback:
         plan = AdaptivePlanner().plan(
             write_csv(udf(parquet(path), boom, name="boom"),
                       str(tmp_path / "o.csv")))
-        history = ExecutionHistory()
+        history = ExecutionHistory(target_id="aar-target-v1:test")
         with Executor(history=history) as ex:
             with pytest.raises(Exception):
                 ex.execute(plan)
-        failed = [r for r in history._records if not r.success]
+        failed = [r for r in history.all() if not r.success]
         assert failed, "a crashed node must be recorded as a failure"
 

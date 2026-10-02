@@ -427,19 +427,32 @@ class CostModel:
         Returns ``(seconds, source)`` where source is one of
         ``"history"``, ``"calibration"``, ``"calibration(penalised)"`` or
         ``"prior"``.
+
+        **History is deliberately not consulted here.** It used to be, and it
+        was premature for three measured reasons:
+
+        * the executor times a node from *before* engine acquisition, so the
+          recorded figure contains a fixed startup cost. Treating that as
+          kernel time and then adding startup, read and transfer on top
+          double-charges the same seconds;
+        * a single observation answered for any input size, so one
+          ``1 MB -> 4 ms`` measurement implied ``40 GB -> 4 ms``;
+        * evidence stored without a target answered for every machine.
+
+        History now reports (``ExecutionHistory.render``) and can be compared
+        against these predictions, but it does not produce them. A prediction
+        source of ``"history"`` can therefore only appear if a caller has
+        deliberately disabled ``observe_only`` - which is the point at which
+        the units above have to be demonstrated good rather than assumed.
         """
         op = node_operation(node)
         device = self.device_for(engine_id)
 
-        if self._history is not None:
-            # The observed shape is what the executor measured - inputs, not
-            # the node's own output size - so the prediction and the training
-            # agree about what "size" means.
-            observed = self._history.predict(
-                node, engine_id, nbytes,
-                input_bytes=tuple(_node_input_bytes(node)))
-            if observed is not None:
-                return observed, "history"
+        if self._history is not None and not self._history.predictions_disabled():
+            confidence = self._history.predict_for_node(node, engine_id,
+                                                         nbytes)
+            if confidence.usable and confidence.seconds is not None:
+                return confidence.seconds, "history"
 
         curve = self._calibration.get(op, device)
         if curve is not None:
@@ -753,56 +766,15 @@ class CostModel:
         return " | ".join(bits)
 
 
-# ----------------------------------------------------------------- history
-@dataclass(frozen=True, slots=True)
-class ExecutionRecord:
-    """One observed execution, the raw material for learning.
-
-    ``operation_key`` is a **semantic** identity (``aar-op-v1:...``), not a
-    ``Node.id``. The old key was a per-instance UUID, which meant two parses of
-    one pipeline could never share a measurement - so the store filled up with
-    singletons and never learned anything.
-
-    Input shape is a vector. ``input_bytes`` keeps every input in declared
-    order, because a join's cost is driven by *both* sides and a scalar taken
-    from ``inputs[0]`` silently discards one. The scalar ``nbytes``/``rows``
-    fields are retained as convenience totals, never as the stored truth.
-
-    Measured quantities default to ``None``, not ``0``. "Peak memory was zero"
-    and "peak memory was never measured" are different facts, and a store that
-    conflates them will eventually average absent data into a confident number.
-    """
-
-    operation_key: str
-    engine: str
-    #: Stable identity of the machine, when the caller knows it. Measurements
-    #: from different machines must not be pooled: the same operation costs
-    #: different amounts on different hardware, and mixing them produces a
-    #: number that describes no machine at all.
-    target_key: str | None = None
-    #: Every input, in declared order.
-    input_bytes: tuple[int, ...] = ()
-    input_rows: tuple[int, ...] = ()
-    #: Total across all inputs. A convenience total, always derived.
-    nbytes: int = 0
-    rows: int = 0
-    output_bytes: int | None = None
-    output_rows: int | None = None
-    elapsed_ms: float = 0.0
-    #: ``None`` until actually measured.
-    peak_memory: int | None = None
-    bytes_transferred: int | None = None
-    success: bool = True
-
-    @property
-    def max_input_bytes(self) -> int:
-        """The largest single input - what a working-set limit actually bites."""
-        return max(self.input_bytes, default=0)
-
-    @property
-    def arity(self) -> int:
-        """How many inputs this operation had."""
-        return len(self.input_bytes)
+# ------------------------------------------------------------------ history
+#: Re-exported from :mod:`aar.cost.history`, which is now the single
+#: definition. It lived here once; moving it in one refactor rather than
+#: maintaining two copies is the whole point - two definitions of a statistics
+#: model that callers may pick between is worse than either one.
+from .history import (  # noqa: F401
+    HISTORY_SCHEMA_VERSION, Confidence, ExecutionHistory, ExecutionRecord,
+    Observation,
+)
 
 
 # ------------------------------------------------------ estimation accuracy
@@ -919,205 +891,6 @@ class EstimationLog:
                 "mean_relative_error": self.mean_relative_error(),
                 "worst_relative_error": self.worst_relative_error(),
                 "offenders": len(self.offenders)}
-
-
-class ExecutionHistory:
-    """Learns cost from what actually happened, locally and deterministically.
-
-    No LLM, no ML model, no network. Three estimators, chosen by how much
-    evidence exists:
-
-    * **one observation** - a lookup, the plainest possible thing,
-    * **several at similar sizes** - an exponentially weighted moving average,
-      which tracks a machine that is drifting,
-    * **several across sizes** - least-squares on size, which recovers the
-      fixed/per-byte split the calibration layer estimates but from *this*
-      workload on *this* machine.
-
-    Failures are never averaged in. A record with ``success=False`` is kept
-    for diagnosis and excluded from the model, because a crashed run's
-    duration is not a cost.
-    """
-
-    __slots__ = ("_records", "_ewma_alpha", "_min_samples_for_regression")
-
-    def __init__(self, ewma_alpha: float = 0.3,
-                 min_samples_for_regression: int = 4) -> None:
-        self._records: list[ExecutionRecord] = []
-        self._ewma_alpha = ewma_alpha
-        self._min_samples_for_regression = min_samples_for_regression
-
-    def record(
-        self,
-        operation_key: str,
-        engine: str,
-        nbytes: int = 0,
-        rows: int = 0,
-        elapsed_ms: float = 0.0,
-        peak_memory: int | None = None,
-        bytes_transferred: int | None = None,
-        success: bool = True,
-        *,
-        target_key: str | None = None,
-        input_bytes: "tuple[int, ...] | list[int] | None" = None,
-        input_rows: "tuple[int, ...] | list[int] | None" = None,
-        output_bytes: int | None = None,
-        output_rows: int | None = None,
-        actual_peak_memory: int | None = None,
-        actual_transfer_bytes: int | None = None,
-    ) -> ExecutionRecord:
-        """Record one observation.
-
-        Scalars stay supported: a caller with a single input passes ``nbytes``
-        and it becomes a one-element vector. That keeps every existing caller
-        working while making the multi-input case representable.
-
-        ``actual_peak_memory``/``actual_transfer_bytes`` are aliases accepted
-        because that is the vocabulary the executor observes in; they land in
-        the same ``None``-until-measured fields.
-        """
-        ib = tuple(input_bytes) if input_bytes is not None else (
-            (int(nbytes),) if nbytes else ())
-        ir = tuple(input_rows) if input_rows is not None else (
-            (int(rows),) if rows else ())
-        rec = ExecutionRecord(
-            operation_key=operation_key,
-            engine=engine,
-            target_key=target_key,
-            input_bytes=ib,
-            input_rows=ir,
-            nbytes=sum(ib),
-            rows=sum(ir),
-            output_bytes=output_bytes,
-            output_rows=output_rows,
-            elapsed_ms=elapsed_ms,
-            peak_memory=(peak_memory if peak_memory is not None
-                         else actual_peak_memory),
-            bytes_transferred=(bytes_transferred if bytes_transferred is not None
-                               else actual_transfer_bytes),
-            success=success,
-        )
-        self._records.append(rec)
-        return rec
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-    def records(self, operation_key: str, engine: str,
-                target_key: str | None = None) -> list[ExecutionRecord]:
-        """Evidence for one operation on one engine, optionally per target.
-
-        ``target_key=None`` means "do not restrict by machine", which is what a
-        caller with no target information wants. Passing a key restricts to that
-        machine, so measurements from a different one cannot be pooled into a
-        prediction for it.
-        """
-        return [r for r in self._records
-                if r.success and r.operation_key == operation_key
-                and r.engine == engine
-                and (target_key is None or r.target_key == target_key)]
-
-    def predict(self, node: Node, engine_id: str, nbytes: int,
-                target_key: str | None = None,
-                operation_key: str | None = None,
-                input_bytes: "tuple[int, ...] | list[int] | None" = None,
-                ) -> float | None:
-        """Predicted seconds, or ``None`` when there is not enough evidence.
-
-        Keyed on the **semantic** operation id, not ``node.id``. The old
-        implementation looked records up by ``node.id``, a per-instance UUID,
-        so a freshly parsed pipeline could never find a previous run's
-        measurement - which is why this store existed and never learned.
-
-        ``input_bytes`` lets a caller predict against the shape the operation
-        was *trained* on. A join measured on a 2 GB and an 8 GB input should be
-        predicted on those two inputs, not on its own much smaller output
-        size, which would understate the work by an order of magnitude.
-        """
-        key = operation_key
-        if key is None:
-            try:
-                from ..ir.identity import semantic_operation_id
-
-                key = semantic_operation_id(node)
-            except Exception:  # noqa: BLE001 - a node without stable identity
-                return None
-        obs = self.records(key, engine_id, target_key)
-        if not obs:
-            return None
-        if len(obs) == 1:
-            return obs[-1].elapsed_ms / 1e3
-        if len(obs) < self._min_samples_for_regression:
-            return self._ewma(obs) / 1e3
-        line = self._regress(obs, input_bytes)
-        if line is not None:
-            return max(0.0, line(nbytes)) / 1e3
-        return self._ewma(obs) / 1e3
-
-    def _ewma(self, obs: list[ExecutionRecord]) -> float:
-        value = obs[0].elapsed_ms
-        for rec in obs[1:]:
-            value = (self._ewma_alpha * rec.elapsed_ms
-                     + (1 - self._ewma_alpha) * value)
-        return value
-
-    def _regress(self, obs: list[ExecutionRecord],
-                 input_bytes: "tuple[int, ...] | list[int] | None" = None):
-        """Least-squares ``t = a + b*n`` over recent observations.
-
-        ``input_bytes`` selects the *predictor axis*. A join is driven by the
-        bytes it reads, not the bytes it emits, and its output can be an order
-        of magnitude smaller than its inputs. Regressing on output and then
-        predicting from output would have been consistent - but the executor
-        observes inputs, so the training and the prediction would disagree
-        about what "size" means.
-
-        Falls back to the total input bytes when no shape is supplied, which is
-        what a caller with only a scalar knows.
-        """
-        if input_bytes is None:
-            pts = [(r.nbytes, r.elapsed_ms) for r in obs]
-        else:
-            shape = tuple(int(b) for b in input_bytes)
-            # Only fit on records observed with the same arity. Mixing a unary
-            # record with a binary one would compare a 1 GB total against a
-            # 10 GB total as though they were the same measurement.
-            pts = [(sum(r.input_bytes), r.elapsed_ms) for r in obs
-                   if len(r.input_bytes) == len(shape)]
-            if len(pts) < 2:
-                pts = [(r.nbytes, r.elapsed_ms) for r in obs]
-        n = len(pts)
-        if n < 2:
-            return None
-        sx = sum(p[0] for p in pts)
-        sy = sum(p[1] for p in pts)
-        sxx = sum(p[0] * p[0] for p in pts)
-        sxy = sum(p[0] * p[1] for p in pts)
-        det = n * sxx - sx * sx
-        if det == 0:
-            return None
-        b = (n * sxy - sx * sy) / det
-        a = (sy - b * sx) / n
-        if b < 0:
-            # Non-monotone history: fall back to a constant at the worst
-            # observation rather than predicting that bigger is faster.
-            worst = max(p[1] for p in pts)
-            return lambda _n: worst
-        return lambda size: a + b * size
-
-    def render(self) -> str:
-        if not self._records:
-            return "No execution history on this machine."
-        ok = [r for r in self._records if r.success]
-        failed = len(self._records) - len(ok)
-        lines = [f"Execution history: {len(ok)} successful, {failed} failed"]
-        for engine in sorted({r.engine for r in self._records}):
-            rs = [r for r in ok if r.engine == engine]
-            if rs:
-                total = sum(r.elapsed_ms for r in rs)
-                lines.append(f"  {engine:<14} {len(rs):>4} runs, "
-                             f"{total:>9.1f} ms total")
-        return "\n".join(lines)
 
 
 _DEFAULT_MODEL: CostModel | None = None

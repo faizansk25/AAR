@@ -6,15 +6,18 @@ device-to-host transfers are counted. That outcome must fall out of
 arithmetic, not be asserted, and it does.
 """
 
+from .history import (  # noqa: F401
+    HISTORY_SCHEMA_VERSION, Confidence, ExecutionHistory, ExecutionRecord,
+    Observation,
+)
 from .model import (  # noqa: F401
     CostBreakdown, CostModel, DEFAULT_PRIORS, EstimationError, EstimationLog,
-    ExecutionHistory, ExecutionRecord, Priors, ResourceBudget,
-    TransferProfile, default_cost_model, node_operation,
+    Priors, ResourceBudget, TransferProfile, default_cost_model, node_operation,
 )
 
 __all__ = [
-    "CostBreakdown", "CostModel", "DEFAULT_PRIORS", "EstimationError",
-    "EstimationLog", "ExecutionHistory", "ExecutionRecord", "Priors",
-    "ResourceBudget", "TransferProfile", "default_cost_model",
-    "node_operation",
+    "HISTORY_SCHEMA_VERSION", "Confidence", "CostBreakdown", "CostModel",
+    "DEFAULT_PRIORS", "EstimationError", "EstimationLog", "ExecutionHistory",
+    "ExecutionRecord", "Observation", "Priors", "ResourceBudget",
+    "TransferProfile", "default_cost_model", "node_operation",
 ]

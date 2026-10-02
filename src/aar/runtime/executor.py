@@ -76,10 +76,22 @@ class NodeOutcome:
     #: Stable graph-node identity, likewise optional and likewise paired with
     #: ``operation_id``: same operation, different position in the pipeline.
     graph_node_id: str | None = None
+    #: Dispatch time alone - what the cost model would call kernel work.
+    #: ``None`` when it could not be separated from acquisition, which is the
+    #: honest answer rather than a guess.
+    compute_ms: float | None = None
+    #: Time spent acquiring (constructing) the engine. Separated from dispatch
+    #: because the two are different quantities: constructing an engine is a
+    #: fixed cost that does not scale with data, so folding it into a node's
+    #: time made a cold 16 ms scan look like 95 ms of kernel work - which the
+    #: cost model then charged a second time as startup.
+    acquire_ms: float | None = None
     input_rows: tuple[int, ...] = ()
     rows_out: int = 0
     input_bytes: tuple[int, ...] = ()
     bytes_out: int = 0
+    #: Wall time for the whole node, acquisition included. This is what the
+    #: analyst sees; it is *not* the quantity the cost model reasons about.
     elapsed_ms: float = 0.0
     #: ``None`` until something actually measures it. See the class docstring.
     actual_peak_memory: int | None = None
@@ -273,12 +285,23 @@ class Executor:
                 outcome.operation_id = None
                 outcome.graph_node_id = None
             try:
+                # Acquisition and dispatch are timed separately. Constructing
+                # an engine is a fixed startup cost that does not scale with
+                # the data, and folding it into the node's time makes a cold
+                # 16 ms scan look like 95 ms of kernel work - which is then
+                # charged a second time as startup by the cost model.
+                acquire_started = time.perf_counter()
                 engine, degraded = self._engine(
                     requested, result.ledger, node)
+                outcome.acquire_ms = (time.perf_counter()
+                                      - acquire_started) * 1e3
+                dispatch_started = time.perf_counter()
                 outcome.engine_used = ("executor" if self._runs_in_executor(node.type)
                                   else engine.id)
                 outcome.degraded = degraded
                 table = self._dispatch(node, engine, inputs)
+                outcome.compute_ms = (time.perf_counter()
+                                      - dispatch_started) * 1e3
                 if table is None:
                     # An engine that returns nothing has produced no data.
                     # Letting that flow on fails later with an unrelated
@@ -333,25 +356,37 @@ class Executor:
         """
         if history is None:
             return
+        # The built-in history wants a full observation with provenance; a
+        # user-supplied sink may still want the legacy positional call, so
+        # both are supported rather than one being silently dropped.
+        record_node = getattr(history, "record_node", None)
+        if callable(record_node):
+            try:
+                record_node(node, outcome, engine_version=(
+                    getattr(history, "engine_version", "") or ""),
+                    success=success)
+            except Exception:  # noqa: BLE001
+                return
+            return
         record = getattr(history, "record", None)
         if record is None:
             return
-        key = outcome.operation_id or getattr(node, "operation_id", None)
-        if not key:
-            return
         try:
-            record(key, outcome.engine_used, outcome.bytes_in,
-                   outcome.rows_in, outcome.elapsed_ms, success=success,
-                   input_bytes=outcome.input_bytes, input_rows=outcome.input_rows,
-                   output_bytes=outcome.bytes_out, output_rows=outcome.rows_out,
+            record(outcome.operation_id or "", outcome.engine_used,
+                   outcome.bytes_in, outcome.rows_in, outcome.elapsed_ms,
+                   success=success, input_bytes=outcome.input_bytes,
+                   input_rows=outcome.input_rows,
+                   output_bytes=(outcome.bytes_out if success else None),
+                   output_rows=(outcome.rows_out if success else None),
                    actual_peak_memory=outcome.actual_peak_memory,
                    actual_transfer_bytes=outcome.actual_transfer_bytes)
         except TypeError:
             # A history implementation predating the richer signature. Fall
             # back to the positional form rather than dropping the sample.
             try:
-                record(key, outcome.engine_used, outcome.bytes_in,
-                       outcome.rows_in, outcome.elapsed_ms, success=success)
+                record(outcome.operation_id or "", outcome.engine_used,
+                       outcome.bytes_in, outcome.rows_in, outcome.elapsed_ms,
+                       success=success)
             except Exception:  # noqa: BLE001
                 return
         except Exception:  # noqa: BLE001

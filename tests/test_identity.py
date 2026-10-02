@@ -16,6 +16,7 @@ identity, so each is pinned explicitly.
 from __future__ import annotations
 
 
+import dataclasses
 import pytest
 
 from aar.cost import ExecutionHistory
@@ -526,15 +527,36 @@ class TestHistoryCrossesAPipelineRebuild:
     Everything above proves the hash is stable and discriminating. This proves
     that stability is *reached*: two independently constructed pipelines, no
     shared objects, and the second finds the first one's measurements.
+
+    Every key here is a real :func:`semantic_operation_id`. The superseded
+    branch proved the same property with a key function returning
+    ``"aar-op-v1:" + node.type``, which is stable for the wrong reason - it
+    ignores the predicate, the join keys and the scan spec, so it would pass
+    these tests while pooling genuinely different work together.
     """
 
+    TARGET = "aar-target-v1:test"
+
+    def _history(self, **kw):
+        return ExecutionHistory(target_id=self.TARGET, **kw)
+
+    @staticmethod
+    def _obs(key, size=1_000_000, total_ms=50.0, target="aar-target-v1:test"):
+        from aar.cost.history import ExecutionRecord
+
+        return ExecutionRecord(
+            operation_id=key, graph_node_id=None,
+            target_id=target, resource_snapshot="budget:4GiB",
+            engine="duckdb", input_bytes=(size,), input_rows=(size // 1000,),
+            output_rows=size // 1000, output_bytes=size // 10,
+            actual_elapsed_total_ms=total_ms, actual_compute_ms=total_ms)
+
     def test_a_rebuilt_pipeline_finds_a_previous_runs_evidence(self):
-        history = ExecutionHistory()
+        history = self._history()
 
         first = _pipeline()
         for node in first.walk():
-            history.record(semantic_operation_id(node), "duckdb",
-                           nbytes=1_000_000, rows=1000, elapsed_ms=50.0)
+            history.record(self._obs(semantic_operation_id(node)))
 
         second = _pipeline()
         first_ids = {n.id for n in first.walk()}
@@ -543,51 +565,56 @@ class TestHistoryCrossesAPipelineRebuild:
             "precondition: the two pipelines share no node instances")
 
         found = [n for n in second.walk()
-                 if history.predict(n, "duckdb", 1_000_000) is not None]
+                 if history.predict_for_node(n, "duckdb").usable]
         assert len(found) == 6, (
             "a rebuilt pipeline must find every measurement the first one "
             f"recorded; found {len(found)} of 6")
 
     def test_the_operation_id_is_what_matched(self):
         """Not an accident of the graph-node id, and not the transient id."""
-        history = ExecutionHistory()
+        history = self._history()
         node = Node(NodeType.FILTER,
                     predicate=BinOp(Col("amount"), ">", Lit(100)))
-        history.record(semantic_operation_id(node), "duckdb", 1000, 10,
-                       elapsed_ms=42.0)
+        history.record(self._obs(semantic_operation_id(node), size=1000,
+                                 total_ms=42.0))
         rebuilt = Node(NodeType.FILTER,
                        predicate=BinOp(Col("amount"), ">", Lit(100)))
         assert rebuilt.id != node.id
         assert semantic_operation_id(rebuilt) == semantic_operation_id(node)
-        assert history.predict(rebuilt, "duckdb", 1000) == pytest.approx(0.042)
+        got = history.predict_for_node(rebuilt, "duckdb")
+        assert got.seconds == pytest.approx(0.042)
 
     def test_a_different_operation_is_not_served_from_that_history(self):
-        history = ExecutionHistory()
-        history.record(semantic_operation_id(_filter()), "duckdb", 1000, 10,
-                       elapsed_ms=42.0)
+        """The guard that a type-only key function would fail.
+
+        Both nodes are ``Filter``. Only the real identity - which hashes the
+        predicate - tells them apart.
+        """
+        history = self._history()
+        history.record(self._obs(semantic_operation_id(_filter()), size=1000,
+                                 total_ms=42.0))
         changed = Node(NodeType.FILTER,
                        predicate=BinOp(Col("amount"), ">", Lit(999)))
-        assert history.predict(changed, "duckdb", 1000) is None
+        assert changed.type is _filter().type, (
+            "precondition: same node type, different predicate")
+        assert not history.predict_for_node(changed, "duckdb").usable
 
     def test_the_same_operation_on_two_machines_does_not_pool(self):
         """Evidence from machine A must not answer for machine B."""
-        history = ExecutionHistory()
+        history = ExecutionHistory(target_id="aar-target-v1:aaa")
         node = Node(NodeType.FILTER,
                     predicate=BinOp(Col("amount"), ">", Lit(100)))
         key = semantic_operation_id(node)
-        history.record(key, "duckdb", 1000, 10, elapsed_ms=50.0,
-                       target_key="aar-target-v1:aaa")
-        history.record(key, "duckdb", 1000, 10, elapsed_ms=500.0,
-                       target_key="aar-target-v1:bbb")
+        history.record(self._obs(key, size=1000, total_ms=50.0,
+                                 target="aar-target-v1:aaa"))
+        history.record(self._obs(key, size=1000, total_ms=5000.0,
+                                 target="aar-target-v1:bbb"))
 
-        a = Node(NodeType.FILTER, predicate=BinOp(Col("amount"), ">", Lit(100)))
-        b = Node(NodeType.FILTER, predicate=BinOp(Col("amount"), ">", Lit(100)))
-        assert history.predict(a, "duckdb", 1000,
-                               target_key="aar-target-v1:aaa") == \
+        assert history.predict(key, "duckdb", (1000,)).seconds == \
             pytest.approx(0.050)
-        assert history.predict(b, "duckdb", 1000,
-                               target_key="aar-target-v1:bbb") == \
-            pytest.approx(0.500)
+        other = history.predict(key, "duckdb", (1000,),
+                                target_id="aar-target-v1:bbb")
+        assert other.seconds == pytest.approx(5.000)
 
 
 class TestObservationsKeepEveryInput:
@@ -622,24 +649,60 @@ class TestObservationsKeepEveryInput:
         assert outcome.bytes_out == 0
 
     def test_a_record_also_keeps_none_for_unmeasured(self):
-        rec = ExecutionHistory().record("k", "duckdb", 1000, 10, elapsed_ms=5.0)
-        assert rec.peak_memory is None
-        assert rec.bytes_transferred is None
+        """A zero peak-memory reading and "never measured" are different facts."""
+        from aar.cost.history import ExecutionRecord
+
+        rec = ExecutionRecord(
+            operation_id="k", graph_node_id=None, target_id="t",
+            resource_snapshot="b", engine="duckdb", input_bytes=(1000,),
+            actual_elapsed_total_ms=5.0, actual_compute_ms=5.0)
+        assert rec.actual_peak_memory is None
+        assert rec.actual_transfer_bytes is None
         assert rec.output_bytes is None
 
     def test_a_measured_zero_is_still_distinguishable(self):
-        rec = ExecutionHistory().record("k", "duckdb", 1000, 10, elapsed_ms=5.0,
-                                        actual_peak_memory=0)
-        assert rec.peak_memory == 0
-        assert rec.peak_memory is not None
+        from aar.cost.history import ExecutionRecord
 
-    def test_a_scalar_call_becomes_a_one_element_vector(self):
-        rec = ExecutionHistory().record("k", "duckdb", 4096, 10, elapsed_ms=5.0)
-        assert rec.input_bytes == (4096,)
-        assert rec.arity == 1
+        rec = ExecutionRecord(
+            operation_id="k", graph_node_id=None, target_id="t",
+            resource_snapshot="b", engine="duckdb", input_bytes=(1000,),
+            actual_elapsed_total_ms=5.0, actual_compute_ms=5.0,
+            actual_peak_memory=0)
+        assert rec.actual_peak_memory == 0
+        assert rec.actual_peak_memory is not None
+
+    def test_a_record_is_the_full_contract(self):
+        """Every field the subsystem needs, present and named.
+
+        Asserted as a set because each of these was once missing: without a
+        target an observation cannot be attributed, without a compute time it
+        cannot be compared with a predicted kernel cost, and without a resource
+        snapshot a 4 GB measurement sits beside a 64 GB one as though they were
+        the same experiment.
+        """
+        from aar.cost.history import ExecutionRecord
+
+        fields = {f.name for f in dataclasses.fields(ExecutionRecord)}
+        required = {
+            "operation_id", "graph_node_id", "target_id", "resource_snapshot",
+            "engine", "engine_version", "input_rows", "input_bytes",
+            "output_rows", "output_bytes", "actual_elapsed_total_ms",
+            "actual_compute_ms", "acquire_ms", "actual_transfer_bytes",
+            "actual_peak_memory", "cost_model_version", "schema_version",
+            "success", "failure_kind", "timestamp",
+        }
+        assert required <= fields, f"missing: {sorted(required - fields)}"
+
+    def test_the_schema_version_is_recorded_on_every_row(self):
+        from aar.cost.history import HISTORY_SCHEMA_VERSION, ExecutionRecord
+
+        rec = ExecutionRecord(
+            operation_id="k", graph_node_id=None, target_id="t",
+            resource_snapshot="b", engine="duckdb", input_bytes=(1,))
+        assert rec.schema_version == HISTORY_SCHEMA_VERSION
 
 
-
+class TestIdentityIsDiscriminating:
     """The negative half. An over-stable identity is worse than none."""
 
     def test_a_changed_filter_literal_changes_it(self):
