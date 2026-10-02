@@ -143,6 +143,142 @@ Workbench is an exposed policy engine.
 
 ---
 
+### Round 31 — auditing the audit: which of these gaps are real
+
+A long external analysis arrived claiming seven gaps. Most survived contact with
+the code. Two did not, and the recommended ordering is wrong in a way that would
+have cost real time. Checking each claim rather than accepting the report's own
+account of itself.
+
+### Confirmed, and worse than reported: the executor never sees segments
+
+The analysis called this a "segment mismatch". Understating it. `segment_id` is
+written in exactly one place:
+
+```python
+# planner.py:643
+node.segment_id = sp.segment.index
+```
+
+and read in **none**. The executor opens with:
+
+```python
+# executor.py:259
+for node in topological_order(plan.root):
+```
+
+— flat, per node, no segment loop at all. `segment_id` appears five times
+repo-wide: the field's definition, the planner's write, the identity module's
+*exclusion* list, and two tests that only assert the write. The executor is not
+misaligned with the planner's segments; it has no concept of them.
+
+So fused-vs-per-operation cost is not a judgement call needing refinement. The
+fused cost is what the planner prices and the per-node cost is what the machine
+does, and nothing anywhere reconciles the two.
+
+### A latent trap this surfaced: `estimated_ms` is overcounted N-fold
+
+```python
+# planner.py:645
+node.estimated_ms = sp.cost.total_s * 1e3
+```
+
+`sp.cost.total_s` is the **segment's total**, written onto **every node** in
+that segment. A three-node segment stamps the same 300 ms three times; summing
+`estimated_ms` yields 900 ms for 300 ms of work. Worse, `total_s` includes
+`inbound_s`, a segment-level transition cost, so the bus crossing is charged
+once per node as well.
+
+`estimated_peak_memory` has the same shape but is harmless — a max replicates
+without distortion, a sum does not.
+
+No consumer sums it today, so this is a trap rather than a live wrong number.
+That is exactly why it is worth writing down: it is one line away from a
+planner report that is confidently wrong, and nothing in the suite would catch
+it. The fix is to attribute per-node share rather than segment total, and to
+charge `inbound_s` once, to the segment.
+
+### Two claims that did not survive
+
+**"sqlite" is also missing from `ENGINE_FACTORIES`.** The analysis listed SQLite
+as a working category while separately listing engines as unimplemented, without
+noting that these reconcile: the *connector* reads SQLite, DuckDB or Arrow
+executes the compute. There is no SQLite *engine*, and there should not be —
+SQLite is a file format, and a compute engine that executes it would be slower
+than the engine already reading it. Adding one to close a spreadsheet-shaped gap
+would be the exact failure this codebase has spent 31 rounds refusing.
+
+**"Sixteen declared, six implemented."** That is my own report text at Round 20,
+and it is stale: eight are implemented now, eight are not. More to the point,
+the 8-of-16 split is not a debt. `implemented <= declared` is a *test*
+(`test_runtime.py`), and the planner refuses to name an unimplemented engine
+rather than substituting one. Declaring a 500 GB Ray tier that AAR will not
+silently fake is the honest behaviour; the count is a roadmap, not a discrepancy.
+
+### The ordering I disagree with
+
+The analysis puts the segment fix first, on the grounds that it is "the
+load-bearing claim". True for the runtime thesis, and I want to be precise about
+why I still rank it below the Workbench, because both can be true at once:
+
+```text
+cost mis-estimate  ->  a slower plan.  Still correct, still explainable.
+exposed POST       ->  policy bypass.  An analyst reads rows they must not see.
+```
+
+AAR's differentiator is provable governance. An optimizer that picks a plan 30%
+slower than optimal does not falsify a single audit claim. A POST endpoint that
+executes a caller-supplied pipeline outside the governed path does — and it is
+reachable *today*, by anyone who can reach the port.
+
+There is also a cost asymmetry the analysis underweights. Segment alignment is
+not a small fix: it means segment-level fused execution plans and engines that
+accept multi-operation work, which is a change to the `Engine` interface and
+every implementation behind it. That is weeks, and doing it while the security
+surface is open means doing it under pressure.
+
+### The dependency the ordering missed
+
+The analysis lists "flip `observe_only`" last and independent. It is not
+independent — it is **blocked by** the segment fix:
+
+```text
+executor measures per node
+planner predicts per segment
+  -> history learns per-node costs from segment-level predictions
+  -> predictions look bad for a reason that is a units mismatch, not drift
+  -> observe_only stays on
+```
+
+This is the same contamination that turned history off in Round 25. Flipping the
+gate before the measurement unit matches the planning unit would re-poison it,
+and the confidence gate would then be gating on numbers that were never capable
+of being right. Sequence here is a dependency, not a preference.
+
+### Where the analysis underrates an item
+
+Small-cell suppression is ranked sixth. It is the only item on the list where
+*not* doing it produces an answer that looks correct and is wrong. An RLS
+barrier that permits `GROUP BY department + AVG(salary)` over five people
+returns a plausible number that discloses an individual salary — and it does so
+*with full audit evidence attached*, every field populated, integrity chain
+valid. A governance product whose differentiator is "we can prove who saw what"
+has just proven that someone saw something nobody should have.
+
+That is the precise failure the entire audit spine exists to prevent, and it
+would be committed by a system that reports itself as clean. It is also the
+cheapest item on the list: the policy layer, the rewrite layer, and the barrier
+placement from Round 26 all exist already. And the evidence work feeds it
+directly — the `rows_before` / `rows_after` counts already recorded per event are
+the input a minimum-group-size check needs.
+
+**Recommended order:** Workbench hardening (days) ∥ small-cell suppression (days,
+reuses the governance spine) -> PostgreSQL engine -> segment alignment (weeks,
+and it unblocks history) -> GPU evidence (free the next time a T4 is to hand) ->
+distributed last, and only once segment semantics are settled.
+
+---
+
 ### Round 30 — absence of an event is not absence of a restriction
 
 Three refinements to the view layer. The third is the sharpest: **I had been
