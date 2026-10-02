@@ -294,7 +294,11 @@ class TestRowSecurity:
         with pytest.raises(PolicyDenied) as exc:
             PolicyEngine(policy).enforce_write(
                 self._sales(), "excel", Subject(roles=frozenset({"x"})))
-        assert "not in the result" in str(exc.value)
+        # The wording changed when the write path began sharing the parser with
+        # the logical rewrite; what matters is that the column is named and the
+        # refusal is explicit rather than an empty result.
+        assert "territory" in str(exc.value)
+        assert "does not exist" in str(exc.value)
 
     def test_sql_in_a_rule_is_not_smuggled_through(self):
         from aar.failures import PolicyDenied

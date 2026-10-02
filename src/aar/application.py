@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .cost import EstimationLog
+from .governance.rewrite import apply_row_security, assert_barriers_intact
 
 __all__ = ["PipelineService", "RunReport"]
 
@@ -38,6 +39,10 @@ class RunReport:
     root: Any
     #: What the profiler measured before planning, keyed by node type.
     profiles: dict = field(default_factory=dict)
+    #: Row-level-security barriers injected into the logical plan, in the order
+    #: they were applied. Present so a front end can say what was protected
+    #: without re-deriving it, and so a caller can prove a plan was secured.
+    barriers: list = field(default_factory=list)
 
 
 class PipelineService:
@@ -69,13 +74,29 @@ class PipelineService:
 
     @staticmethod
     def _load_policy(path: str | None) -> Any:
+        """Build the policy engine for a run.
+
+        ``None`` means *no policy file was supplied*, and it builds the safe
+        baseline :class:`PolicyEngine` rather than disabling governance. The
+        old behaviour - ``return None``, and have the executor skip every
+        check - meant the default-deny egress rule only existed for whoever
+        remembered to instantiate a policy, which is the opposite of what a
+        default is for.
+
+        The baseline permits local processing and local output and denies
+        network egress, which keeps ordinary local use working while making
+        "no policy file" a *restrictive* state rather than a permissive one. A
+        genuine bypass is explicit and separate: ``--unsafe-disable-policy``.
+        """
+        from .governance import Policy, PolicyEngine
+
         if not path:
-            return None
+            return PolicyEngine(Policy())
         if not os.path.isfile(path):
             raise FileNotFoundError(f"no such policy file: {path}")
         from .governance import load_policy
 
-        return load_policy(path)
+        return PolicyEngine(load_policy(path))
 
     @staticmethod
     def _subject(role: str | None, actor: str | None) -> Any:
@@ -99,8 +120,10 @@ class PipelineService:
         """Produce a physical plan for an already-loaded root."""
         return self._make_planner().plan(root)
 
-    def prepare(self, path: str, profile: bool = True) -> tuple:
-        """Load, profile, then plan - returning ``(root, plan)``.
+    def prepare(self, path: str, profile: bool = True,
+               role: str | None = None, policy_path: str | None = None,
+               actor: str | None = None) -> tuple:
+        """Load, secure, profile, then plan - returning ``(root, plan)``.
 
         Exists because a front end that wants to *show* a plan before
         running it used to plan twice, and the first plan was made before
@@ -111,19 +134,32 @@ class PipelineService:
         first.
 
         This is the same sequence :meth:`run` uses, which is the point: one
-        order, one behaviour, whichever front end asks.
+        order, one behaviour, whichever front end asks. That includes the
+        security rewrite - ``aar explain`` must show the secured plan, or an
+        analyst is shown row counts they are not entitled to see.
         """
-        root = self.load(path)
-        self.profile_sources(root) if profile else {}
-        return root, self.plan(root)
+        from .governance import Subject
 
-    def explain(self, path: str) -> Any:
+        policy = self._load_policy(policy_path)
+        subject = (self._subject(role, actor)
+                   or Subject(name="explain"))
+        root = self.load(path)
+        barriers = apply_row_security(root, policy.policy, subject)
+        self.profile_sources(root) if profile else {}
+        plan = self.plan(root)
+        assert_barriers_intact(root, barriers)
+        return root, plan
+
+    def explain(self, path: str, role: str | None = None,
+                policy_path: str | None = None,
+                actor: str | None = None) -> Any:
         """Load and plan a file, returning the plan for display.
 
         Profiles first, like :meth:`prepare`, so ``aar explain`` and
         ``aar run`` cannot disagree about the same pipeline.
         """
-        return self.prepare(path)[1]
+        return self.prepare(path, role=role, policy_path=policy_path,
+                            actor=actor)[1]
 
     def run(self, path: str, role: str | None = None,
             policy_path: str | None = None,
@@ -160,13 +196,34 @@ class PipelineService:
         subject = self._subject(role, actor)
 
         root = self.load(path)
+
+        # Row-level security is injected into the *logical* plan, before
+        # profiling and before planning. Two reasons, and the second is the
+        # one that is easy to miss:
+        #
+        # 1. RLS decides which rows are legally input to a computation. Once an
+        #    aggregate has run, "region = 'EU'" cannot be applied to its output
+        #    - the filter belongs below the group-by, not above it.
+        # 2. Profiling an unsecured source measures what the analyst is *not*
+        #    allowed to see. If the table holds 1e9 rows and the subject may
+        #    read 2e6, planning from 1e9 is both a worse plan and a disclosure
+        #    of the restricted size.
+        #
+        # This is where an ambiguity in the policy becomes an error, before
+        # anything has been read, measured or scheduled.
+        barriers = apply_row_security(root, policy.policy, subject)
+
         predicted = self.profile_sources(root) if profile else {}
         plan = self.plan(root)
+        # Re-check the obligations *after* planning: a barrier that was removed,
+        # weakened or hoisted above an aggregation between here and execution
+        # must fail loudly rather than leak.
+        assert_barriers_intact(root, barriers)
         with Executor(policy=policy, subject=subject,
                       history=self._history) as executor:
             result = executor.execute(plan)
         report = RunReport(plan=plan, result=result, root=root,
-                           profiles=predicted)
+                           profiles=predicted, barriers=barriers)
         self.score_estimates(root, result)
         return report
 

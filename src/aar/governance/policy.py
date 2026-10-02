@@ -175,6 +175,34 @@ class Sink:
 
 # ------------------------------------------------------------------ policy
 @dataclass(frozen=True, slots=True)
+class RLSRule:
+    """One row-level restriction, addressed to a named source.
+
+    ``source`` is the logical name a :class:`~aar.ir.ScanSpec` declares (or the
+    one derived from its table, collection or file stem). The empty string
+    means "unscoped", which is accepted only when exactly one source could
+    mean it - see :func:`aar.governance.rewrite.apply_row_security`.
+
+    Scoping exists because a bare predicate is ambiguous the moment a pipeline
+    reads more than one source::
+
+        Orders --\\
+                   JOIN  --  region = 'EU' belongs to which side?
+        Users  --/
+
+    Answering "the first one" or "both" would be a guess, and a guess in this
+    position decides whose rows an analyst may see.
+    """
+
+    predicate: str
+    source: str = ""
+
+    def describe(self) -> str:
+        where = self.source or "<any single source>"
+        return f"{where}: WHERE {self.predicate}"
+
+
+@dataclass(frozen=True, slots=True)
 class Policy:
     """A set of rules. Absent rules deny; that is the whole design.
 
@@ -188,8 +216,15 @@ class Policy:
     max_sensitivity:
         The highest sensitivity permitted to reach a network sink.
     rls:
-        role -> SQL predicate. A role with no entry sees every row, because
-        row filtering is a grant, not a default; a *deny* needs a rule.
+        role -> SQL predicate. A role with no entry sees every row,
+        because row filtering is a grant, not a default; a *deny*
+        needs a rule.
+
+        Accepts either a bare predicate string (unscoped - legal only when the
+        pipeline has exactly one source that could mean it) or a list of
+        :class:`RLSRule`-shaped mappings with ``source`` and ``predicate``
+        keys. Both forms normalise to :attr:`rls_rules`, which is what the
+        rewrite pass reads.
     cls_mask:
         role -> list of (column, mask_kind). Applied on the way out.
     cls_drop:
@@ -205,13 +240,35 @@ class Policy:
     allow_network: bool = False
     allow_network_kinds: frozenset[str] = frozenset()
     max_sensitivity: Sensitivity = Sensitivity.INTERNAL
-    rls: Mapping[str, str] = field(default_factory=dict)
+    rls: Mapping[str, Any] = field(default_factory=dict)
+    #: ``role -> (RLSRule, ...)``, derived from :attr:`rls` in
+    #: ``__post_init__``. Declared as a field rather than computed on demand so
+    #: that a frozen dataclass still exposes it as data.
+    rls_rules: Mapping[str, tuple[RLSRule, ...]] = field(default_factory=dict)
     cls_mask: Mapping[str, Sequence[tuple[str, str]]] = field(
         default_factory=dict)
     cls_drop: Mapping[str, Sequence[str]] = field(default_factory=dict)
     mask_default: str = "redact"
     mask_threshold: Sensitivity = Sensitivity.CONFIDENTIAL
     name: str = "default"
+
+    def __post_init__(self) -> None:
+        """Normalise ``rls`` into :attr:`rls_rules` once, at construction.
+
+        Storing both shapes and interpreting at each use site would mean two
+        readers that could disagree. Normalising in one place means
+        :attr:`rls_rules` is the only thing the rewrite pass has to understand,
+        and a caller who wrote the legacy bare-string form gets identical
+        behaviour to one who was explicit.
+        """
+        normalised: dict[str, tuple[RLSRule, ...]] = {}
+        for role, value in dict(self.rls).items():
+            normalised[role] = _coerce_rls_rules(role, value)
+        object.__setattr__(self, "rls_rules", normalised)
+
+    def rules_for_role(self, role: str) -> tuple[RLSRule, ...]:
+        """Every row rule that applies to ``role``."""
+        return tuple(self.rls_rules.get(role, ()))
 
     def permits_network_kind(self, kind: str) -> bool:
         if self.allow_network:
@@ -227,8 +284,9 @@ class Policy:
                else ""))
         lines.append(f"  max sensitivity at a network sink: "
                      f"{self.max_sensitivity.name}")
-        for role in sorted(self.rls):
-            lines.append(f"  RLS {role}: WHERE {self.rls[role]}")
+        for role in sorted(self.rls_rules):
+            for rule in self.rls_rules[role]:
+                lines.append(f"  RLS {role}: {rule.describe()}")
         for role in sorted(self.cls_drop):
             lines.append(f"  CLS {role}: drop {list(self.cls_drop[role])}")
         for role in sorted(self.cls_mask):
@@ -239,6 +297,57 @@ class Policy:
 
 
 # ------------------------------------------------------------------ masks
+def _coerce_rls_rules(role: str, value: Any) -> tuple[RLSRule, ...]:
+    """Accept both RLS spellings, reject the rest.
+
+    Two forms are supported, because the second is a strict superset of the
+    first and existing policies must keep working::
+
+        "rls": {"analyst": "region = 'EU'}
+
+        "rls": {"analyst": [
+            {"source": "orders", "predicate": "region = 'EU'"}]}
+
+    Anything else raises. A policy file is not a place to be forgiving: a rule
+    that is silently misread is a rule that silently fails to protect.
+    """
+    if isinstance(value, str):
+        return (RLSRule(predicate=value),) if value.strip() else ()
+    if isinstance(value, RLSRule):
+        return (value,)
+    if isinstance(value, Mapping):
+        value = [value]
+    if isinstance(value, Sequence):
+        rules: list[RLSRule] = []
+        for item in value:
+            if isinstance(item, str):
+                rules.append(RLSRule(predicate=item))
+                continue
+            if not isinstance(item, Mapping):
+                raise PolicyDenied(
+                    f"RLS rule for role {role!r} must be a string or a mapping "
+                    f"with 'source' and 'predicate'; got "
+                    f"{type(item).__name__}", rule=f"rls.{role}")
+            unknown = sorted(set(item) - {"source", "predicate"})
+            if unknown:
+                raise PolicyDenied(
+                    f"RLS rule for role {role!r} has unknown key(s) "
+                    f"{', '.join(unknown)}; expected 'source' and 'predicate'",
+                    rule=f"rls.{role}")
+            predicate = str(item.get("predicate", "") or "").strip()
+            if not predicate:
+                raise PolicyDenied(
+                    f"RLS rule for role {role!r} has an empty predicate; a "
+                    f"rule that matches everything protects nothing",
+                    rule=f"rls.{role}")
+            rules.append(RLSRule(predicate=predicate,
+                                 source=str(item.get("source", "") or "")))
+        return tuple(rules)
+    raise PolicyDenied(
+        f"RLS rules for role {role!r} must be a string or a list of rules; "
+        f"got {type(value).__name__}", rule=f"rls.{role}")
+
+
 _MASKERS: dict[str, Any] = {}
 
 
@@ -303,6 +412,57 @@ def _build_maskers() -> dict[str, Any]:
 
 
 
+def _retype_literals(predicate: Any, table: Any) -> None:
+    """Re-type a parsed predicate's literals against the real schema.
+
+    The parser in :mod:`aar.governance.rewrite` types literals from the text,
+    because at rewrite time it has only a *declared* schema and often none at
+    all. By the time a rule reaches the write boundary the real Arrow types
+    are known, and that is strictly better information.
+
+    It matters most for numerics. A float64 column compared against the string
+    ``"3.0"`` is unequal to every value, so the rule silently filters the whole
+    relation - and the analyst sees an empty result, indistinguishable from
+    "no EU rows today". This walks the parsed predicate and rebuilds each
+    literal as the type its column actually holds.
+    """
+    from ..ir import BinOp, Col, Lit
+
+    if isinstance(predicate, BinOp):
+        left, right = predicate.left, predicate.right
+        if (isinstance(left, Col) and isinstance(right, Lit)
+                and predicate.op == "="):
+            column = left.name
+            try:
+                field = table.schema.get(column)
+            except Exception:  # noqa: BLE001 - unknown column, leave as parsed
+                return
+            typed = _typed_literal(right.value, field)
+            if typed != right.value:
+                object.__setattr__(predicate, "right", Lit(typed))
+            return
+        _retype_literals(left, table)
+        _retype_literals(right, table)
+
+
+def _typed_literal(value: Any, field: Any) -> Any:
+    """The value ``field``'s type implies, when that is unambiguous."""
+    if not isinstance(value, str):
+        return value
+    kind = str(getattr(getattr(field, "type", None), "kind", "")).upper()
+    if "INT" in kind:
+        try:
+            return int(float(value))
+        except ValueError:
+            return value
+    if "FLOAT" in kind or "DOUBLE" in kind or "DECIMAL" in kind:
+        try:
+            return float(value)
+        except ValueError:
+            return value
+    return value
+
+
 # ------------------------------------------------------------------ engine
 class PolicyEngine:
     """Applies a :class:`Policy` to data and to plans.
@@ -362,21 +522,49 @@ class PolicyEngine:
 
     # -------------------------------------------------------------- rls
     def row_predicate(self, subject: Subject) -> Decision:
-        """The predicate this subject's rows must satisfy, if any."""
-        for role in sorted(self.policy.rls):
-            if subject.has_role(role):
-                expr = self.policy.rls[role]
-                d = Decision(True,
-                             f"role {role!r} restricts rows to WHERE {expr}",
-                             action=Action.FILTER_ROWS,
-                             obligations=(
-                                 Obligation(Action.FILTER_ROWS,
-                                            expression=expr,
-                                            rule=f"rls.{role}",
-                                            reason="row-level security"),),
-                             rule=f"rls.{role}")
-                self.decisions.append(d)
-                return d
+        """The write-time row predicate, for a plan that carries no barrier.
+
+        The *primary* application of RLS is
+        :func:`aar.governance.rewrite.apply_row_security`, which puts the
+        restriction into the logical plan before anything is computed. This
+        method is the fallback for a plan that was never rewritten - a bare
+        :class:`~aar.runtime.Executor` used directly, or a run with policy
+        enforcement explicitly disabled - and it can only express the simple
+        case, because a single output table has no notion of which input a
+        scoped rule belonged to.
+
+        So it applies the rules for the *first* matching role, and refuses
+        outright if that role's rules are source-scoped. Applying one rule of a
+        multi-source policy and ignoring the rest would be a partial grant
+        presented as a complete one.
+        """
+        for role in sorted(self.policy.rls_rules):
+            if not subject.has_role(role):
+                continue
+            rules = self.policy.rls_rules[role]
+            if not rules:
+                continue
+            scoped = [r for r in rules if r.source]
+            if scoped:
+                raise PolicyDenied(
+                    f"role {role!r} has source-scoped row rules "
+                    f"({', '.join(r.source for r in scoped)}) but this plan "
+                    f"carries no security barriers, so there is no way to "
+                    f"apply them to the right input. Run the pipeline through "
+                    f"aar's policy rewrite, which injects them per source.",
+                    rule=f"rls.{role}")
+            expr = rules[0].predicate
+            d = Decision(True,
+                         f"role {role!r} restricts rows to WHERE {expr}",
+                         action=Action.FILTER_ROWS,
+                         obligations=(
+                             Obligation(Action.FILTER_ROWS,
+                                        expression=expr,
+                                        rule=f"rls.{role}",
+                                        reason="row-level security"),),
+                         rule=f"rls.{role}")
+            self.decisions.append(d)
+            return d
         d = Decision(True, "no row-level rule applies to this subject",
                      rule="rls.none")
         self.decisions.append(d)
@@ -426,13 +614,32 @@ class PolicyEngine:
 
     # --------------------------------------------------------- enforcement
     def enforce_write(self, table: Any, sink: Sink | str,
-                      subject: Subject) -> Any:
+                      subject: Subject, rls_applied: bool = False) -> Any:
         """Apply every obligation to ``table`` and return the result.
 
         Raises on egress or sensitivity denial; applies RLS and CLS otherwise.
         The returned table keeps its classification tags, so a value that
         left masked is still *known* to have been masked by policy rather
         than by someone remembering to.
+
+        ``rls_applied`` says the plan already carried row-level security
+        barriers, injected by :func:`aar.governance.rewrite.apply_row_security`.
+        It must be true whenever the pipeline was secured, and it changes what
+        happens here in a way that is not cosmetic:
+
+        * the rows were already restricted *before* every join, group-by and
+          window, so filtering again would be redundant work; and
+        * more importantly, applying the predicate here could **refuse** the
+          write. ``region = 'EU'`` against the output of
+          ``GROUP BY region`` matches; the same rule against the output of
+          ``AVG(salary)`` names a column that does not exist, and a strict
+          implementation raises - so a correctly-secured analytic query would
+          fail at the write, having computed the right answer.
+
+        So: with barriers in the plan, RLS is the plan's job and only CLS and
+        egress remain. Without them - a bare :class:`Executor` used directly,
+        or an explicitly disabled policy - this method still applies RLS
+        itself, which is the only safe reading of a plan nobody secured.
         """
         schema = getattr(table, "schema", None)
         decision = self.check_egress(sink, subject, schema)
@@ -443,9 +650,10 @@ class PolicyEngine:
                 sink=str(sink), subject=subject.name)
 
         result = table
-        predicate = self.row_predicate(subject)
-        if predicate.obligations:
-            result = self._apply_rls(result, predicate.obligations[0])
+        if not rls_applied:
+            predicate = self.row_predicate(subject)
+            if predicate.obligations:
+                result = self._apply_rls(result, predicate.obligations[0])
 
         obligations = self.column_actions(subject, getattr(result, "schema",
                                                             None))
@@ -471,49 +679,21 @@ class PolicyEngine:
         silently filtering nothing.
         """
         from ..engines.arrow_engine import ArrowEngine
-        from ..ir import BinOp, Col, Lit
+        from .rewrite import parse_row_predicate
 
         expression = (obligation.expression or "").strip()
         if not expression:
             return table
-        lower = {name.lower(): name for name in table.column_names}
-        parts: list[Any] = []
-        for term in expression.split(" and "):
-            name, eq, raw = term.strip().partition("=")
-            if not eq:
-                raise PolicyDenied(
-                    f"row-level rule {expression!r} uses an unsupported term "
-                    f"{term.strip()!r}; AAR understands only conjunctions "
-                    f"of 'column = literal'",
-                    rule=obligation.rule, term=term.strip())
-            column = lower.get(name.strip().lower())
-            if column is None:
-                raise PolicyDenied(
-                    f"row-level rule references column {name.strip()!r}, "
-                    f"which is not in the result "
-                    f"(have: {', '.join(table.column_names)})",
-                    rule=obligation.rule, column=name.strip())
-            # The literal is typed from the column, not from the string.
-            # Comparing a float column to "3.0" as text matches nothing, and
-            # a rule that silently filters every row looks identical to one
-            # that works until someone checks the output.
-            raw_value = raw.strip()
-            if raw_value[:1] in ("'", '"') and raw_value[-1:] == raw_value[:1]:
-                literal: Any = raw_value[1:-1]
-            else:
-                field_type = table.schema.get(column).type
-                kind = getattr(field_type, "kind", None)
-                if kind is not None and "INT" in str(kind).upper():
-                    literal = int(float(raw_value))
-                elif kind is not None and "FLOAT" in str(kind).upper():
-                    literal = float(raw_value)
-                else:
-                    literal = raw_value
-            parts.append(BinOp(Col(column), "=", Lit(literal)))
-
-        predicate = parts[0]
-        for extra in parts[1:]:
-            predicate = BinOp(predicate, "AND", extra)
+        # The same parser the logical rewrite uses, so a rule cannot behave one
+        # way when injected into the plan and another when applied at the
+        # write. Literals are then re-typed from the *actual* schema, which is
+        # the one advantage this path has: "3" against a float column has to
+        # become 3.0, because comparing as text matches nothing and a rule
+        # that silently filters every row looks exactly like one that works.
+        predicate = parse_row_predicate(
+            expression, columns=tuple(table.column_names),
+            rule=obligation.rule, source="<result>")
+        _retype_literals(predicate, table)
         return ArrowEngine().filter(table, predicate)
 
 
@@ -597,7 +777,14 @@ EXAMPLE_POLICY: dict[str, Any] = {
     "max_sensitivity": "INTERNAL",
     "mask_threshold": "CONFIDENTIAL",
     "mask_default": "redact",
-    "rls": {"emea": "region = EU"},
+    # Row rules are *source-scoped*. The bare-string form ("emea": "region = EU")
+    # is still accepted, but it is only legal when the pipeline reads exactly
+    # one source that could mean it - in a join, "region = EU" does not say
+    # whether it constrains Orders or Users, and guessing that decides whose
+    # rows an analyst may see.
+    "rls": {
+        "emea": [{"source": "orders", "predicate": "region = EU"}],
+    },
     "cls_drop": {"junior": ["ssn", "national_id"]},
     "cls_mask": {
         "analyst": [["email", "email"]],

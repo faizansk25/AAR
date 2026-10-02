@@ -4,11 +4,98 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 942 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 992 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
 including both macOS jobs. Verified from the Actions API, job by job.
+
+---
+
+### Round 26 — RLS was applied after the average had already been taken
+
+Row-level security ran in `PolicyEngine.enforce_write`, at the *end* of a run.
+For the analyst's actual question that is not a slightly-wrong filter, it is
+the wrong query. Measured on `region/salary` with EU rows `[100, 300]` and
+non-EU `[200, 400, 500]`:
+
+```text
+aar run pipeline.py --role analyst
+  before:  "region","avg"   the average over EVERY row (300) - or
+           "not in the result" a refusal, because AVG drops `region`
+  after:   "region","avg"
+           "EU",200
+```
+
+`AVG` cannot be un-averaged. Filtering the single output row of an aggregate
+either drops the whole result or names a column the aggregate no longer has.
+
+**The fix is injection, not a ban on aggregates.** `NodeType.SECURITY_FILTER`
+goes directly above each secured source, before profiling, before planning:
+
+```text
+ScanSQL -- SECURITY_FILTER(tenant = 42) -- FILTER(amount > 100) -- ...
+                    ^ dominates everything downstream
+```
+
+For a join each input is secured *before* the join, which is why rules are now
+source-scoped (`{"source": "orders", "predicate": "region = 'EU'"}`). The
+bare-string form still loads and is legal only when exactly one source could
+mean it; with two, AAR refuses:
+
+```text
+aar: could not load two.py: PolicyDenied: rls.analyst is an unscoped
+row-level rule ('region = EU') but this pipeline reads 2 sources (cust,
+emp). An unscoped predicate cannot say which input it belongs to, and
+guessing decides whose rows the subject may see.
+```
+
+#### Three bugs the new tests found in the new code
+
+Worth recording, because all three were invisible on inspection:
+
+1. **`_assert_dominates` walked the wrong way.** It used `Node.walk`, which is
+   ancestors-only, to answer "what does this filter feed". That flags every
+   *healthy* plan - a barrier above a source is always above a group-by - so
+   the checker rejected the correct arrangement. It now walks the barrier's own
+   ancestors, which is the question that matters: did any combining operation
+   happen *before* this filter?
+2. **The predicate-integrity check compared a value with itself.**
+   `node.predicate != barrier.node.predicate` is always false, because those
+   are the same object. It would have reported every barrier as intact,
+   including one whose predicate had been rewritten. The barrier now snapshots
+   its predicate at injection.
+3. **`1=1; DROP TABLE users --` parsed as a column named `1`.** Not injection -
+   the engine quotes identifiers - but a rule silently meaning something nobody
+   wrote, filtering on a column that does not exist. Requiring an identifier to
+   start with a letter or underscore refuses it, without a blocklist of attack
+   strings that would only ever catch the ones already thought of.
+
+#### `policy=None` meant "governance off"
+
+With no `--policy` the executor skipped every check, so the default-deny egress
+rule existed only for whoever remembered to supply a file. Now `None` builds
+`PolicyEngine(Policy())`: local processing and local output allowed, network
+egress denied, no RLS configured. The bypass is explicit and separately named -
+`aar run --unsafe-disable-policy` - and announces itself on stderr.
+
+RLS also had to stop re-applying at the write. With barriers in the plan,
+`region = 'EU'` against the output of `AVG(salary)` names a column that does
+not exist, so a correctly-secured analytic query would have been *refused* at
+the write, having computed the right answer.
+
+**982 passed, 10 skipped, 0 failed; ruff clean.** 50 new checks, including a
+differential one: the secured rowset and the secured aggregate are compared
+across Arrow, DuckDB, pandas and Polars, so a plan that is secure on Arrow and
+leaks on DuckDB fails. Engine discovery refuses degradation - the same trap
+`test_cross_engine_semantics` documents, where a silent substitution makes the
+comparison DuckDB-with-DuckDB and proves nothing.
+
+Not done, and deliberately: RLS pushdown into SQL/Mongo. The barrier is placed
+directly above the scan rather than folded into its `WHERE`, which is correct
+but slower. Folding it in requires connector-level verification I have not
+done, and an unverified rewrite of where a security filter lands is exactly
+what the last two rounds were spent removing.
 
 ---
 

@@ -83,15 +83,22 @@ class Tier(int, enum.Enum):
 #: Operations every SQL-speaking source can push down. A source that supports
 #: none of these still appears in the registry as a scan-only engine.
 _PUSHDOWN_OPS = frozenset({
-    NodeType.SCAN_SQL, NodeType.FILTER, NodeType.PROJECT,
+    NodeType.SCAN_SQL, NodeType.FILTER, NodeType.SECURITY_FILTER,
+    NodeType.PROJECT,
     NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT,
     NodeType.DEDUPLICATE, NodeType.LIMIT, NodeType.JOIN, NodeType.WINDOW,
 })
 
 #: Everything a general-purpose columnar engine can do in memory.
+#: ``SECURITY_FILTER`` is listed everywhere ``FILTER`` is: it is the same
+#: computation. The barrier property says the predicate may not be *removed or
+#: relocated*, not that a particular engine is forbidden from evaluating it -
+#: refusing every engine here would make a secured plan unplannable, which is
+#: the opposite of "the secure path is the easy path".
 _COLUMNAR_OPS = frozenset({
     NodeType.SCAN_PARQUET, NodeType.SCAN_CSV, NodeType.SCAN_JSON,
-    NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.PROJECT, NodeType.JOIN,
+    NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.SECURITY_FILTER,
+    NodeType.PROJECT, NodeType.JOIN,
     NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT, NodeType.WINDOW,
     NodeType.DEDUPLICATE, NodeType.CAST, NodeType.NULL_HANDLE,
     NodeType.LIMIT, NodeType.UNION, NodeType.CACHE, NodeType.MATERIALIZE,
@@ -158,16 +165,22 @@ def _kind_chain(dt: DataType) -> Iterable[TypeKind]:
 #: Operations every SQL-speaking source can push down. A source that supports
 #: none of these still appears in the registry as a scan-only engine.
 _PUSHDOWN_OPS = frozenset({
-    NodeType.SCAN_SQL, NodeType.FILTER, NodeType.PROJECT,
+    NodeType.SCAN_SQL, NodeType.FILTER, NodeType.SECURITY_FILTER,
+    NodeType.PROJECT,
     NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT,
     NodeType.DEDUPLICATE, NodeType.LIMIT, NodeType.JOIN, NodeType.WINDOW,
 })
 
 #: Everything a general-purpose columnar engine can do in memory.
+#: ``SECURITY_FILTER`` is listed everywhere ``FILTER`` is: it is the same
+#: computation. The barrier property says the predicate may not be *removed or
+#: relocated*, not that a particular engine is forbidden from evaluating it -
+#: refusing every engine here would make a secured plan unplannable, which is
+#: the opposite of "the secure path is the easy path".
 _COLUMNAR_OPS = frozenset({
     NodeType.SCAN_PARQUET, NodeType.SCAN_CSV, NodeType.SCAN_JSON,
     NodeType.SCAN_ARROW, NodeType.SCAN_CONST,
-    NodeType.FILTER, NodeType.PROJECT, NodeType.JOIN,
+    NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT, NodeType.JOIN,
     NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT, NodeType.WINDOW,
     NodeType.DEDUPLICATE, NodeType.CAST, NodeType.NULL_HANDLE,
     NodeType.LIMIT, NodeType.UNION, NodeType.CACHE, NodeType.MATERIALIZE,
@@ -207,7 +220,7 @@ ENGINES: tuple[EngineSpec, ...] = (
     EngineSpec(
         id="mongodb", label="MongoDB", device=Device.REMOTE,
         tier=Tier.SOURCE_PUSHDOWN, probe="pymongo", distribution="pymongo",
-        ops=frozenset({NodeType.SCAN_MONGO, NodeType.FILTER, NodeType.PROJECT,
+        ops=frozenset({NodeType.SCAN_MONGO, NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT,
                        NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT,
                        NodeType.LIMIT, NodeType.WRITE}),
         remote=True,
@@ -258,7 +271,7 @@ ENGINES: tuple[EngineSpec, ...] = (
         id="polars_gpu", label="Polars GPU (RAPIDS)", device=Device.GPU,
         tier=Tier.GPU_ACCELERATION, probe="cudf", distribution="cudf-cu12",
         ops=frozenset({NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
-                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.PROJECT,
+                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT,
                        NodeType.JOIN, NodeType.GROUPBY, NodeType.AGGREGATE,
                        NodeType.SORT, NodeType.DEDUPLICATE, NodeType.CAST,
                        NodeType.NULL_HANDLE, NodeType.LIMIT, NodeType.UNION,
@@ -270,7 +283,7 @@ ENGINES: tuple[EngineSpec, ...] = (
         id="cudf", label="cuDF (cudf.pandas)", device=Device.GPU,
         tier=Tier.GPU_ACCELERATION, probe="cudf", distribution="cudf-cu12",
         ops=frozenset({NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
-                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.PROJECT,
+                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT,
                        NodeType.JOIN, NodeType.GROUPBY, NodeType.AGGREGATE,
                        NodeType.SORT, NodeType.DEDUPLICATE, NodeType.CAST,
                        NodeType.NULL_HANDLE, NodeType.LIMIT, NodeType.UNION,
@@ -285,7 +298,7 @@ ENGINES: tuple[EngineSpec, ...] = (
         id="ray", label="Ray", device=Device.ACCEL_REMOTE,
         tier=Tier.DISTRIBUTED, probe="ray", distribution="ray",
         ops=frozenset({NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
-                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.PROJECT,
+                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT,
                        NodeType.JOIN, NodeType.GROUPBY, NodeType.AGGREGATE,
                        NodeType.SORT, NodeType.DEDUPLICATE, NodeType.CAST,
                        NodeType.NULL_HANDLE, NodeType.LIMIT, NodeType.UNION,
@@ -298,7 +311,7 @@ ENGINES: tuple[EngineSpec, ...] = (
         id="dask", label="Dask", device=Device.ACCEL_REMOTE,
         tier=Tier.DISTRIBUTED, probe="dask.dataframe", distribution="dask",
         ops=frozenset({NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
-                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.PROJECT,
+                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT,
                        NodeType.JOIN, NodeType.GROUPBY, NodeType.AGGREGATE,
                        NodeType.SORT, NodeType.DEDUPLICATE, NodeType.CAST,
                        NodeType.NULL_HANDLE, NodeType.LIMIT, NodeType.UNION,
@@ -310,7 +323,7 @@ ENGINES: tuple[EngineSpec, ...] = (
         id="spark_rapids", label="Spark RAPIDS", device=Device.ACCEL_REMOTE,
         tier=Tier.DISTRIBUTED, probe="pyspark", distribution="pyspark",
         ops=frozenset({NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
-                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.PROJECT,
+                       NodeType.SCAN_ARROW, NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT,
                        NodeType.JOIN, NodeType.GROUPBY, NodeType.AGGREGATE,
                        NodeType.SORT, NodeType.DEDUPLICATE, NodeType.CAST,
                        NodeType.NULL_HANDLE, NodeType.LIMIT, NodeType.UNION,
@@ -325,7 +338,7 @@ ENGINES: tuple[EngineSpec, ...] = (
         tier=Tier.COMPATIBILITY, probe="pandas", distribution="pandas",
         ops=frozenset({NodeType.SCAN_PARQUET, NodeType.SCAN_CSV,
                        NodeType.SCAN_JSON, NodeType.SCAN_ARROW,
-                       NodeType.FILTER, NodeType.PROJECT, NodeType.JOIN,
+                       NodeType.FILTER, NodeType.SECURITY_FILTER, NodeType.PROJECT, NodeType.JOIN,
                        NodeType.GROUPBY, NodeType.AGGREGATE, NodeType.SORT,
                        NodeType.WINDOW, NodeType.DEDUPLICATE, NodeType.CAST,
                        NodeType.NULL_HANDLE, NodeType.LIMIT, NodeType.UNION,

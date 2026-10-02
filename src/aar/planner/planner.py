@@ -65,6 +65,10 @@ class NodeTypeAffinity:
         NodeType.AGGREGATE: (Device.GPU, Device.CPU),
         # Row-at-a-time work belongs on the CPU.
         NodeType.FILTER: (Device.CPU,),
+        # A barrier is costed and scheduled like the filter it is. Its
+        # non-elidable property is enforced by the rewrite pass, not by making
+        # it expensive to plan around.
+        NodeType.SECURITY_FILTER: (Device.CPU,),
         NodeType.PROJECT: (Device.CPU,),
         NodeType.CAST: (Device.CPU,),
         NodeType.NULL_HANDLE: (Device.CPU,),

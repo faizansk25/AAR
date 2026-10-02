@@ -43,6 +43,14 @@ class NodeType(str, enum.Enum):
     SCAN_CONST = "ScanConst"
 
     FILTER = "Filter"
+    #: A row-level-security barrier. Computed exactly like ``FILTER``, but it
+    #: is a *logical obligation* rather than an optimisation: the rewrite pass
+    #: inserts it directly above a secured source, and the rule is that no later
+    #: stage may remove it, hoist it above an aggregation or a join, or weaken
+    #: its predicate. RLS decides which rows are legally *input* to a
+    #: computation, so a barrier that is applied afterwards is not a weaker
+    #: filter - it is the wrong filter. See :mod:`aar.governance.rewrite`.
+    SECURITY_FILTER = "SecurityFilter"
     PROJECT = "Project"
     JOIN = "Join"
     GROUPBY = "GroupBy"
@@ -419,6 +427,16 @@ class ScanSpec:
     batch_size: int = 8192
     options: dict[str, Any] = field(default_factory=dict)
 
+    #: The logical name a row-level-security rule is written against.
+    #:
+    #: A rule of the form ``region = 'EU'`` does not say whether it belongs to
+    #: Orders, to Users, or to both. In a single-source pipeline the question
+    #: has an obvious answer; in a join of two sources it does not, and
+    #: guessing attaches the restriction to the wrong input. So the scope is
+    #: declared here, and a rule naming no source is only accepted when exactly
+    #: one source could mean it.
+    source_name: str = ""
+
     def describe(self) -> str:
         if self.kind == "excel":
             loc = self.path or "<in-memory>"
@@ -460,6 +478,30 @@ class ScanSpec:
             self.collection, self.database, tuple(self.columns),
             self.delimiter, self.encoding, stamp,
         )
+
+    def source_scope(self) -> str:
+        """The name a security rule must use to address *this* source.
+
+        Prefers the declared ``source_name``. Failing that it derives one from
+        the most identifying thing the spec carries - a table, a collection, a
+        file stem - so that the common single-source case needs no annotation at
+        all.
+
+        Returns ``""`` when nothing identifies the source. That is not an
+        error here; it becomes one at rewrite time, because a rule that cannot
+        be attached to a source must be refused rather than guessed at.
+        """
+        if self.source_name:
+            return self.source_name
+        for candidate in (self.table_name, self.collection, self.table,
+                          self.named_range, self.sheet):
+            if candidate:
+                return str(candidate)
+        if self.path:
+            import os
+
+            return os.path.splitext(os.path.basename(self.path))[0]
+        return ""
 
 
 
@@ -510,6 +552,13 @@ class Node:
     #: the function's source and raises if that is impossible; it is never
     #: silently faked from a name or an address.
     semantic_version: str | None = None
+    #: Free-text provenance for a row-level-security barrier: which rule
+    #: produced it and which logical source it secures. Kept on the node so an
+    #: explain panel can answer "why is this filter here?" without re-deriving
+    #: it from the policy file, and so a barrier can be traced back to the
+    #: obligation it discharges.
+    security_rule: str = ""
+    source_scope: str = ""
     limit: int | None = None
     target: str | None = None
     write_format: str | None = None
@@ -591,6 +640,13 @@ class Node:
             return self.scan.describe()
         if t is NodeType.FILTER:
             return f"filter {self.predicate}"
+        if t is NodeType.SECURITY_FILTER:
+            # Named differently on purpose. An explain panel that renders this
+            # as an ordinary "filter" invites exactly the reasoning the barrier
+            # exists to prevent - that it is a tidy-up the optimiser may drop.
+            where = self.source_scope or "source"
+            return (f"SECURITY filter ({self.security_rule or 'rls'}) "
+                    f"on {where}: {self.predicate}")
         if t is NodeType.PROJECT:
             return f"project {', '.join(self.columns) or '*'}"
         if t is NodeType.JOIN:

@@ -188,7 +188,7 @@ about itself.
 With conda active:
 
 ```powershell
-python -m pytest -q                   # 942 tests
+python -m pytest -q                   # 992 tests
 python tools\check_syntax.py          # parse every module
 python tools\smoke_run.py             # build a plan, run it, check the numbers
 python tools\manual_test.py           # guided tour, by hand
@@ -356,6 +356,15 @@ instead — which is strictly worse.
 
 Four properties worth knowing:
 
+- **Row rules are injected before anything is computed.** RLS is a
+  `SECURITY_FILTER` placed directly above each secured source, *before* the
+  profiler reads it and before the planner runs. Applied at the write instead,
+  `region = 'EU'` would arrive after `AVG(salary)` had already consumed every
+  region — which is not a weaker filter but a different, and wrong, query.
+- **Row rules are source-scoped.** `{"source": "orders", "predicate": ...}`
+  says which input a restriction belongs to. An unscoped rule is accepted only
+  when exactly one source could mean it; in a join, AAR refuses rather than
+  guessing whose rows the analyst may see.
 - **Enforcement happens before the bytes move.** A write that lands and is
   then noticed is a breach that already happened.
 - **An unknown key in a policy file is an error, not a no-op.** A misspelled
@@ -367,8 +376,18 @@ Four properties worth knowing:
   column stays unclassified, or the policy would mask everything and get
   switched off.
 
-A run with no `--policy` is unrestricted, and says so rather than pretending
-otherwise.
+A run with no `--policy` is **not** unrestricted. AAR applies its baseline:
+local processing and local output are allowed, network egress is denied, and no
+RLS is configured because none was asked for. The bypass is explicit and
+separately named:
+
+```powershell
+aar run pipeline.py --unsafe-disable-policy   # turns every check off
+```
+
+`aar explain` accepts `--role` and `--policy` too, and shows the *secured*
+plan — an explain that printed unrestricted row counts would disclose the very
+statistics the restriction exists to withhold.
 
 
 ---

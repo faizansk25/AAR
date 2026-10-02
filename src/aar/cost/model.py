@@ -50,6 +50,7 @@ _OP_FOR_NODE: dict[NodeType, str] = {
     NodeType.SCAN_SQL: "scan",
     NodeType.SCAN_MONGO: "scan",
     NodeType.FILTER: "filter",
+    NodeType.SECURITY_FILTER: "filter",
     NodeType.PROJECT: "filter",
     NodeType.JOIN: "hash_join",
     NodeType.GROUPBY: "groupby",

@@ -82,6 +82,13 @@ def build_parser() -> argparse.ArgumentParser:
                            help=argparse.SUPPRESS)
     p_explain.add_argument("--json", action="store_true",
                            help="emit JSON instead of text")
+    # An explain is a disclosure surface too: it prints per-source row counts.
+    # So it accepts the same role and policy as a run, and shows the *secured*
+    # plan rather than the unrestricted one.
+    p_explain.add_argument("--policy", default=None, metavar="PATH",
+                           help="JSON policy file to enforce while planning")
+    p_explain.add_argument("--role", default=None,
+                           help="role to plan as, for row/column rules")
 
     p_run = sub.add_parser(
         "run", help="plan and execute a pipeline file")
@@ -96,7 +103,14 @@ def build_parser() -> argparse.ArgumentParser:
                        help="rows to preview in the output (0 for none)")
     p_run.add_argument("--policy", default=None, metavar="PATH",
                        help="JSON policy file to enforce (see `aar policy` "
-                            "for the format)")
+                            "for the format). Without one, AAR still "
+                            "enforces its baseline: local only, network "
+                            "egress denied.")
+    p_run.add_argument("--unsafe-disable-policy", action="store_true",
+                       dest="unsafe_disable_policy",
+                       help="DISABLE every policy check, including the "
+                            "deny-network-egress default. For local debugging "
+                            "only.")
     p_run.add_argument("--role", default=None,
                        help="role the run acts as, for row/column rules")
     p_run.add_argument("--as", dest="actor", default="cli",
@@ -200,8 +214,10 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
     return _EXIT_OK
 
 
-def _plan_for(path: str, profile: bool = True):
-    """Load, profile and plan a pipeline file. Returns ``(root, plan)``.
+def _plan_for(path: str, profile: bool = True, role: str | None = None,
+              policy_path: str | None = None,
+              actor: str | None = None):
+    """Load, secure, profile and plan a pipeline file. Returns ``(root, plan)``.
 
     Delegates to :class:`PipelineService` so the CLI and the Workbench plan
     through the same code. The CLI's own ``SystemExit`` behaviour is kept
@@ -214,12 +230,19 @@ def _plan_for(path: str, profile: bool = True):
     ``--json``, so the same pipeline planned differently depending on the
     output format - two answers to one question, chosen by a flag that has
     nothing to do with planning.
+
+    **Row-level security is injected before profiling**, for the same reason:
+    the planner must not size segments from rows the subject may not see. The
+    policy and role are threaded in here rather than applied afterwards at the
+    write, because a rule applied after an aggregate is not a filter, it is a
+    different - and usually wrong - query.
     """
     from .application import PipelineService
     from .failures import PlanInfeasible
 
     try:
-        return PipelineService().prepare(path, profile=profile)
+        return PipelineService().prepare(path, profile=profile, role=role,
+                                         policy_path=policy_path, actor=actor)
     except FileNotFoundError as exc:
         print(f"aar: {exc}", file=sys.stderr)
         raise SystemExit(_EXIT_USER_ERROR) from exc
@@ -232,22 +255,35 @@ def _plan_for(path: str, profile: bool = True):
         raise SystemExit(_EXIT_USER_ERROR) from exc
 
 
-def _load_policy(path: str | None):
-    """Load a policy from JSON, or return None.
+def _load_policy(path: str | None, disable: bool = False):
+    """Build the policy engine for a run, or ``None`` when explicitly disabled.
 
     Absent rules deny, so a policy that fails to load must not quietly
     become an empty one - that would turn a typo in a file path into a
     silently unprotected run. Failure here is a hard error.
+
+    With no ``--policy`` this builds the *baseline* engine rather than
+    returning ``None``. Returning ``None`` used to mean "governance switched
+    off", which made the deny-network-egress default conditional on someone
+    remembering to supply a file - the opposite of what a default is for. The
+    bypass is now explicit and separately named.
     """
-    if not path:
+    if disable:
+        print("aar: WARNING - policy enforcement is DISABLED by "
+              "--unsafe-disable-policy.", file=sys.stderr)
         return None
+
+    from .governance import Policy, PolicyEngine
+
+    if not path:
+        return PolicyEngine(Policy())
     if not os.path.isfile(path):
         print(f"aar: no such policy file: {path}", file=sys.stderr)
         raise SystemExit(_EXIT_USER_ERROR)
     from .governance import load_policy
 
     try:
-        return load_policy(path)
+        return PolicyEngine(load_policy(path))
     except Exception as exc:  # noqa: BLE001
         print(f"aar: could not load policy {path}: "
               f"{type(exc).__name__}: {exc}", file=sys.stderr)
@@ -290,9 +326,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
     # not fit, and planning first reported the memory failure instead -
     # sending the user to resize their machine when the real problem was a
     # typo in a path. Absent rules deny, so this must fail loudly and early.
-    policy = _load_policy(getattr(args, "policy", None))
+    policy = _load_policy(getattr(args, "policy", None),
+                          getattr(args, "unsafe_disable_policy", False))
 
-    root, plan = _plan_for(args.pipeline)
+    # The role and policy go into planning, not only into execution: the RLS
+    # rewrite has to happen before the profiler reads anything, or the plan is
+    # costed from rows this subject is not entitled to see.
+    root, plan = _plan_for(
+        args.pipeline,
+        role=getattr(args, "role", None),
+        policy_path=getattr(args, "policy", None) if policy is not None else None,
+        actor=getattr(args, "actor", None))
     if args.explain and not args.json:
         print(plan.render())
         print()
@@ -421,7 +465,9 @@ def _cmd_explain(args: argparse.Namespace) -> int:
               "  aar explain pipeline.py        # the same thing",
               file=sys.stderr)
         return _EXIT_USER_ERROR
-    _root, plan = _plan_for(path)
+    _root, plan = _plan_for(path,
+                        role=getattr(args, "role", None),
+                        policy_path=getattr(args, "policy", None))
 
     if args.json:
         print(json.dumps({

@@ -411,6 +411,14 @@ def _semantic_body(node: Any) -> dict[str, Any]:
 
     if node.predicate is not None:
         body["predicate"] = _expr(node.predicate)
+    if getattr(node, "security_rule", ""):
+        # A barrier's *provenance* is part of its identity. Two runs of the
+        # same query under different row-level policies produce different
+        # results from identical IR text, so an identity that ignored the rule
+        # would let a cached result computed under a permissive policy satisfy
+        # a request made under a restrictive one.
+        body["security_rule"] = node.security_rule
+        body["source_scope"] = getattr(node, "source_scope", "")
     if node.columns:
         body["columns"] = list(node.columns)
     if node.expressions:

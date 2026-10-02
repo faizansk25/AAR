@@ -163,7 +163,7 @@ class Executor:
     """Runs a plan and reports what actually happened."""
 
     __slots__ = ("_engines", "_options", "_strict", "_last_result",
-                 "_policy", "_subject", "_history")
+                 "_policy", "_subject", "_history", "_plan_root")
 
     def __init__(self, strict: bool = False, policy: Any = None,
                  subject: Any = None, history: Any = None,
@@ -188,6 +188,10 @@ class Executor:
         self._subject = subject
         #: Where observed timings are recorded so the next plan is better.
         self._history = history
+        #: The plan currently being executed, used to answer "does this DAG
+        #: carry security barriers?" from the plan itself rather than from a
+        #: flag a caller sets and can get wrong.
+        self._plan_root: Plan | None = None
 
     @property
     def last_result(self) -> "ExecutionResult | None":
@@ -236,6 +240,7 @@ class Executor:
         """Run every node of ``plan`` in dependency order."""
         result = ExecutionResult(table=None, started_at=time.time(),
                                  history=self._history)
+        self._plan_root = plan
 
         values: dict[int, Table] = {}
 
@@ -355,6 +360,20 @@ class Executor:
             # not the analyst's results.
             return
 
+    def _has_barriers(self) -> bool:
+        """Whether this run's plan carries row-level security barriers.
+
+        Derived from the plan rather than configured, so a caller cannot
+        accidentally claim the plan is secured when it is not: the flag says
+        what is actually in the DAG. Cached per plan, because it is asked once
+        per write and walks the whole graph.
+        """
+        root = getattr(self._plan_root, "root", None)
+        if root is None:
+            return False
+        return any(n.type is NodeType.SECURITY_FILTER
+                   for n in topological_order(root))
+
     # ------------------------------------------------------------- dispatch
     @staticmethod
     def _runs_in_executor(node_type: NodeType) -> bool:
@@ -377,6 +396,13 @@ class Executor:
                  NodeType.SCAN_MONGO):
             return engine.read_scan(node)
         if t is NodeType.FILTER:
+            return engine.filter(_one(inputs), node.predicate)
+        if t is NodeType.SECURITY_FILTER:
+            # Computed exactly like a filter. The barrier property lives in the
+            # rewrite pass, which guarantees the predicate is placed directly
+            # above its secured source; by the time execution reaches this node
+            # the placement is already correct, and re-deriving it here would
+            # be a second, weaker implementation of the same rule.
             return engine.filter(_one(inputs), node.predicate)
         if t is NodeType.PROJECT:
             return engine.project(_one(inputs), list(node.columns))
@@ -444,7 +470,14 @@ class Executor:
                              else PolicyEngine(self._policy))
             subject = self._subject or Subject()
             sink = Sink.of(node.write_format or "unknown")
-            payload = engine_policy.enforce_write(table, sink, subject)
+            # If the plan carries row-level security barriers, RLS has already
+            # been applied below every join, group-by and window. Re-applying
+            # it to this output would be redundant at best and, for an
+            # aggregate that no longer carries the filtered column, a refusal
+            # of a correctly-secured query. Egress and CLS still apply here:
+            # they are exposure-boundary rules, not input rules.
+            payload = engine_policy.enforce_write(
+                table, sink, subject, rls_applied=self._has_barriers())
         engine.write(payload, node)
         return payload
 
