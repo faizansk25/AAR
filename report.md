@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1006 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1051 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -134,6 +134,109 @@ nobody can query is what most audit logs already are.
 
 The Workbench POST hardening (§Open items 6) moves **up**, not down: an exposed
 Workbench is an exposed policy engine.
+
+---
+
+---
+
+### Round 28 — the evidence contract: a record is not proof
+
+Step 1 of the audit spine, and the step that had to come before
+`GovernedRun`. Persisting convenient Python objects first and versioning them
+later means discovering you cannot make them immutable, order them, or prove
+the ordering — three rounds too late.
+
+### What a plain SQLite row is not
+
+Someone with filesystem access can edit it. AAR does not need an HSM, a
+certificate or a blockchain to say something stronger than "the database has a
+row in it", and does not have them. What it needs is an **inexpensive hash
+chain**:
+
+```text
+event_1.hash = H(event_1)
+event_2.hash = H(event_1.hash || canonical(event_2))
+event_3.hash = H(event_2.hash || canonical(event_3))
+```
+
+So alteration, deletion and reordering all become detectable — and the open
+format supports anchoring or signing a run hash with TPM/KMS/HSM later,
+without changing it.
+
+### The part everything else depends on: canonical encoding
+
+A hash is worth nothing unless the bytes it covers are reproducible. Three
+ways that fails *silently*:
+
+- **`True` and `1`.** In Python they compare equal. A naive encoder lets a
+  forged field hash to the original's exact digest. Every value now carries a
+  type tag.
+- **Strings without a length prefix.** `"a;1"` can imitate structure. Strings
+  are length-prefixed, so nothing inside one can terminate a field.
+- **Floats.** Their shortest round-trip representation is a property of the
+  Python version, not of the event. Floats are **refused**, and durations are
+  recorded as integer microseconds — which is also the honest precision for an
+  audit trail, since sub-microsecond wall-clock noise is not a fact about the
+  data.
+
+Key order is normalised, Unicode is NFC-normalised, and the schema version is
+*hashed*, so evidence from one version cannot verify as another. The digest is
+domain-separated from every other hash in AAR.
+
+### One event type, not five ledgers
+
+`ExecutionResult.outcomes`, `PolicyEngine.decisions`, `DegradationLedger`,
+`LineageEvent` — four independent recorders, written at different points, in
+different units, with no shared ordering. Reconstructing a run meant guessing
+what happened first. Adding a fifth called `GovernedRun.events` and copying
+them in would have made it five.
+
+`EvidenceRecorder` is the canonical stream. It guarantees one order, one chain,
+one clock, and **refuses to guess**: emitting outside a run raises rather than
+producing an event that cannot be placed in the chain.
+
+Every event carries three things a compliance buyer asks for: **who**
+(subject, *plus the identity provider that vouched for them* — AAR does not
+authenticate anyone), **under what authority** (`policy_id` + `policy_hash`,
+so the policy in force is recoverable after the file is edited), and **what
+actually happened** (`engine_planned` beside `engine_used`).
+
+### Two bugs the tests caught in my own code
+
+1. **A deadlock on the first run.** `start_run` called `emit` while holding the
+   same non-reentrant lock. *Every* run hung silently — no error anywhere,
+   because every caller was innocent. Pinned by
+   `test_starting_a_run_does_not_deadlock`.
+2. **`subject=None` stripped the identity.** A caller could pass it and remove
+   the subject from the record of what they did — precisely the field an
+   auditor reads first. The subject is now a run fact that no emitter can
+   override.
+
+A third was mine alone in the smoke script, not the library: I passed the
+*original* events to the verifier, and the chain correctly reported VALID.
+
+### Verification
+
+```
+[0] run.started     hash=503b6d364321 prev=000000000000
+[1] rows.restricted hash=998d2f998890 prev=503b6d364321
+[2] node.executed   hash=20071de7e379 prev=998d2f998890
+[3] run.finished    hash=33cf1116eaa6 prev=20071de7e379
+
+EVIDENCE CHAIN BROKEN at event 1: contents do not match its own hash
+EVIDENCE CHAIN BROKEN at event 2: expected sequence 1; there is a gap
+EVIDENCE CHAIN BROKEN at event 3: does not follow the one before it
+```
+
+The third case is the one a per-event check alone would miss: each event is
+internally valid, and the break is only in the links. That is why
+`previous_hash` exists.
+
+**1041 passed, 10 skipped, 0 failed; ruff clean.** 45 new checks.
+
+Still open, in the agreed order: **Workbench POST hardening** (step zero, not
+started — an exposed Workbench is an exposed policy engine), then `GovernedRun`
++ events, SQLite store, query API, evidence views.
 
 ---
 
