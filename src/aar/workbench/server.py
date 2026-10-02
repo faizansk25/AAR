@@ -22,6 +22,10 @@ from typing import Any
 
 from .. import __version__
 from .i18n import LANGUAGES, STRINGS
+from .security import (
+    Refused, check_body_length,
+    check_mutating_request, is_loopback, new_token, resolve_pipeline,
+)
 
 STATIC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
@@ -132,7 +136,7 @@ def api_explain(path: str) -> dict:
 
 
 def api_run(path: str, role: str | None = None,
-            policy_path: str | None = None) -> dict:
+            policy_path: str | None = None, root: str | None = None) -> dict:
     """Plan and execute a pipeline, returning what actually happened.
 
     This used to call ``Executor().run(node, policy=..., role=...)``. The
@@ -140,9 +144,17 @@ def api_run(path: str, role: str | None = None,
     a plan rather than a root node, so the endpoint raised ``AttributeError``
     for every valid pipeline. The tests passed because they only checked the
     missing-file path, which fails earlier and for a different reason.
+
+    ``root`` confines both paths. The HTTP handler always passes it; the
+    in-process callers do not, because a Python caller already has the
+    operator's privileges and gains nothing from a boundary it could bypass.
     """
     from ..application import PipelineService
 
+    if root:
+        path = resolve_pipeline(path, root)
+        if policy_path:
+            policy_path = resolve_pipeline(policy_path, root)
     try:
         report = PipelineService().run(path, role=role,
                                        policy_path=policy_path)
@@ -236,60 +248,159 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_json(404, {"error": f"no such route: {route}"})
 
     def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length") or 0)
+        """Every state-changing route passes the boundary first.
+
+        The dispatch below is only reachable once the caller has proven it is
+        this session. Before that, three things are refused outright: an
+        oversized body (before it is read), a request that is not ours, and a
+        pipeline path outside the configured root.
+        """
         try:
-            payload = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            return self._send_json(400, {"error": "request body is not JSON"})
-        route = self.path.split("?")[0]
-        if route == "/api/explain":
-            return self._send_json(200, api_explain(payload.get("path", "")))
-        if route == "/api/run":
-            return self._send_json(200, api_run(payload.get("path", ""),
-                                                payload.get("role"),
-                                                payload.get("policy")))
-        if route == "/api/rows":
-            return self._send_json(200, api_rows(
-                payload.get("token", ""),
-                int(payload.get("offset") or 0),
-                int(payload.get("limit") or 100),
-                payload.get("sort", ""),
-                bool(payload.get("descending"))))
-        self._send_json(404, {"error": f"no such route: {route}"})
+            check_mutating_request(
+                self.headers,
+                self.server.session_token,
+                self.server.allowed_hosts,
+                self.server.allowed_origins,
+            )
+            length = int(self.headers.get("Content-Length") or 0)
+            check_body_length(length)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                return self._send_json(400,
+                                       {"error": "request body is not JSON"})
+            route = self.path.split("?")[0]
+            if route == "/api/explain":
+                return self._send_json(
+                    200, api_explain(self._pipeline(payload.get("path", "")),
+                                     self.server.pipeline_root))
+            if route == "/api/run":
+                return self._send_json(
+                    200, api_run(self._pipeline(payload.get("path", "")),
+                                 payload.get("role"),
+                                 self._policy(payload.get("policy")),
+                                 self.server.pipeline_root))
+            if route == "/api/rows":
+                return self._send_json(200, api_rows(
+                    payload.get("token", ""),
+                    int(payload.get("offset") or 0),
+                    int(payload.get("limit") or 100),
+                    payload.get("sort", ""),
+                    bool(payload.get("descending"))))
+            self._send_json(404, {"error": f"no such route: {route}"})
+        except Refused as refusal:
+            # Refusals are answers, not stack traces: the operator needs the
+            # reason, and the reason is not an internal detail.
+            self._send_json(refusal.status, {"error": refusal.reason,
+                                             "refused": True})
+
+    def _pipeline(self, path: str) -> str:
+        """Resolve a caller-supplied pipeline path against the allowed root."""
+        return resolve_pipeline(path, self.server.pipeline_root)
+
+    def _policy(self, path: str) -> str:
+        """A policy path is confined to the same root as the pipeline.
+
+        A policy file is executable content too - it is parsed and compiled -
+        so an unchecked policy path is the same hole as an unchecked pipeline
+        path, and one hop from ``../``.
+        """
+        if not path:
+            return ""
+        return resolve_pipeline(path, self.server.pipeline_root)
 
     def _serve_file(self, name: str) -> None:
-        # Resolve inside STATIC and refuse anything that escapes it.
-        full = os.path.normpath(os.path.join(STATIC, name))
-        if not full.startswith(os.path.normpath(STATIC)) or \
+        # Resolve inside STATIC and refuse anything that escapes it. The
+        # comparison is on resolved path *components*, not a string prefix:
+        # "/static-evil" starts with "/static" and is not inside it.
+        full = os.path.realpath(os.path.join(STATIC, name))
+        root = os.path.realpath(STATIC)
+        if os.path.commonpath([root, full]) != root or \
                 not os.path.isfile(full):
             return self._send_json(404, {"error": f"no such file: {name}"})
         with open(full, "rb") as handle:
             body = handle.read()
+        kind = _ctype(full)
+        if name.endswith(".html"):
+            # The UI is same-origin and needs the session token to make any
+            # mutating request at all. It is served to the page rather than
+            # taken from a URL, so it does not land in shell history, a
+            # Referer header, or a browser bookmark. It is still scoped to this
+            # one process and this one origin.
+            body = self._inject_token(body)
         self.send_response(200)
-        self.send_header("Content-Type", f"{_ctype(full)}; charset=utf-8")
+        self.send_header("Content-Type", f"{kind}; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # No CORS headers at all. That is deliberate and load-bearing: the
+        # absence of `Access-Control-Allow-Origin` is what makes the custom
+        # header requirement in `check_mutating_request` work.
         self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
+    def _inject_token(self, body: bytes) -> bytes:
+        """Publish this session's token to the page it is served with."""
+        meta = (f'<meta name="aar-session-token" '
+                f'content="{self.server.session_token}">').encode()
+        for anchor in (b"</head>", b"</body>"):
+            if anchor in body:
+                return body.replace(anchor, meta + anchor, 1)
+        return meta + body
+
 
 class WorkbenchServer:
-    """A local workbench. Binds to loopback unless told otherwise.
+    """A local workbench. Refuses to bind anywhere but loopback by default.
 
     Loopback is the default for a reason: the workbench executes pipeline
-    files, and the specification's first principle is that outbound is
-    denied by default. Binding to 0.0.0.0 is possible, but it should be a
-    decision the user makes out loud.
+    files, and the specification's first principle is that outbound is denied
+    by default. Binding to 0.0.0.0 is possible, but it should be a decision
+    the user makes out loud - so it takes ``allow_remote=True``, and even then
+    the boundary still applies. Exposure is a separate axis from
+    authentication, and turning one on does not turn the other off.
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 8765,
-                 open_browser: bool = False, verbose: bool = False) -> None:
+                 open_browser: bool = False, verbose: bool = False,
+                 pipeline_root: str | None = None,
+                 allow_remote: bool = False) -> None:
+        if not is_loopback(host) and not allow_remote:
+            # Refused at construction, not at bind: an exception after the
+            # socket is open would leave a listener nobody intended.
+            raise Refused(
+                f"refusing to bind {host!r}: the workbench executes local "
+                f"files, so it binds to loopback unless you pass "
+                f"allow_remote=True to say that you mean it",
+                status=400)
         self.host = host
         self.port = port
         self.open_browser = open_browser
         self.verbose = verbose
-        self._httpd: Any = None
-        self._thread: Any = None
+        #: A fresh token per process. Not persisted, not derived: restarting
+        #: the workbench invalidates every session that was talking to it,
+        #: which is the correct behaviour for a credential of this kind.
+        self.session_token = new_token()
+        #: Pipelines must resolve inside this directory. Defaults to the
+        #: working directory, so an operator who starts the workbench beside
+        #: their pipelines has to configure nothing.
+        self.pipeline_root = os.path.realpath(
+            pipeline_root or os.getcwd())
+
+    @property
+    def allowed_hosts(self) -> tuple[str, ...]:
+        """Names this server answers for, for ``Host`` validation.
+
+        ``localhost`` is included even when bound to ``127.0.0.1``, because
+        a user who types ``localhost:8765`` and a user who types
+        ``127.0.0.1:8765`` are the same person and neither should be told to
+        fix their own address bar.
+        """
+        return tuple(dict.fromkeys((self.host, "localhost")))
+
+    @property
+    def allowed_origins(self) -> tuple[str, ...]:
+        """Same-origin spellings permitted to send a mutating request."""
+        hosts = self.allowed_hosts
+        return tuple(f"http://{h}:{self.port}" for h in hosts)
 
     @property
     def url(self) -> str:
@@ -298,6 +409,13 @@ class WorkbenchServer:
     def start(self) -> None:
         self._httpd = ThreadingHTTPServer((self.host, self.port), _Handler)
         self._httpd.verbose = self.verbose
+        # The handler reads its policy off the server object rather than a
+        # module global: two servers in one process - as the tests do - must
+        # not be able to see each other's token or root.
+        self._httpd.session_token = self.session_token
+        self._httpd.allowed_hosts = self.allowed_hosts
+        self._httpd.allowed_origins = self.allowed_origins
+        self._httpd.pipeline_root = self.pipeline_root
         self._thread = threading.Thread(target=self._httpd.serve_forever,
                                         daemon=True)
         self._thread.start()
@@ -336,8 +454,22 @@ def main(argv: list | None = None) -> int:
     parser.add_argument("--open", action="store_true",
                         help="open a browser window")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--pipeline-root", default=None,
+                        help="only serve pipelines under this directory "
+                             "(defaults to the working directory)")
+    parser.add_argument("--allow-remote", action="store_true",
+                        help="permit a non-loopback bind; this exposes the "
+                             "workbench to your network and is not "
+                             "recommended")
     args = parser.parse_args(argv)
-    WorkbenchServer(host=args.host, port=args.port,
-                    open_browser=args.open,
-                    verbose=args.verbose).serve_forever()
+    try:
+        server = WorkbenchServer(host=args.host, port=args.port,
+                                 open_browser=args.open,
+                                 verbose=args.verbose,
+                                 pipeline_root=args.pipeline_root,
+                                 allow_remote=args.allow_remote)
+    except Refused as refusal:
+        print(f"aar workbench: {refusal.reason}")
+        return 2
+    server.serve_forever()
     return 0

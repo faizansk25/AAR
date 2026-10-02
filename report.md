@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1095 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1124 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -140,6 +140,111 @@ Workbench is an exposed policy engine.
 ---
 
 ---
+
+---
+
+### Round 32 — closing the reachable policy/execution boundary
+
+The step-zero item, and the one that was reachable today. `do_POST` dispatched
+on the request path alone:
+
+```python
+if route == "/api/run":
+    return self._send_json(200, api_run(payload.get("path", ""),
+                                         payload.get("role"),
+                                         payload.get("policy")))
+```
+
+Any process that could open a socket to the port could name **any pipeline file
+on the disk** and have it executed as the user, supplying **its own role and
+policy**. The caller chose both the code and the authority it ran with, which
+is the one combination no amount of row-level security can compensate for: RLS
+constrains what a *legitimate* query may return, and this endpoint decided
+whether the query was legitimate.
+
+The Workbench executes arbitrary Python. Its HTTP layer is therefore a policy
+engine, and it needed the same treatment as the policy engine itself.
+
+### Five checks, and why one of them is not enough
+
+```text
+session token        a local process that guessed or scraped it
+Host validation      a page the analyst is visiting (DNS rebinding)
+Origin validation    a cross-origin page
+custom header        the CORS-simple shape Origin does not cover
+resolved root        ../ , absolute paths, symlinks
+body size cap        a 4 GB Content-Length read into memory first
+```
+
+None of these is redundant, which is the part worth stating. The token alone is
+the obvious control and it is **not sufficient**: a rebound domain and a
+cross-origin page both arrive at loopback with a legitimate-looking request, and
+the token is only unreadable to them by accident of origin. Host validation is
+what makes the token mean something. The custom header exists because
+`Content-Type: application/json` is CORS-*simple* — a form post carries it
+without a preflight, so Origin alone leaves a one-shot path open; a custom
+header forces a preflight the server never answers.
+
+**No CORS headers are sent at all**, and there is a test asserting their
+absence. That is load-bearing rather than tidier: the custom-header defence
+*works because* the preflight fails. Adding a permissive
+`Access-Control-Allow-Origin` later would silently disarm it with no test
+failing.
+
+### Order of checks, and what each refusal says
+
+Host and Origin are checked before the token, so an obviously foreign request
+is rejected before any secret is compared. And every refusal names its cause:
+
+```text
+"refusing a request addressed to 'evil.example'; this workbench
+ answers only for 127.0.0.1, localhost"
+"pipelines must live under C:\...\pipelines; start the workbench from
+ the directory that holds them, or pass --pipeline-root"
+```
+
+"Access denied" from a tool the operator started one second ago is
+indistinguishable from a bug. The resolved root is the one fact that makes it
+fixable.
+
+### Three escapes in the path check, closed in order
+
+`resolve_pipeline` uses `realpath` *then* `commonpath`, and each defeats the
+previous naive approach:
+
+```text
+"../evil.py"                    realpath resolves it
+a symlink inside, pointing out   realpath follows it to the final target
+"pipelines-evil/" vs "pipelines/"  commonpath compares components, not prefixes
+```
+
+The symlink case is the one a prefix check on the *supplied* path cannot see:
+the string is inside the root and the file it names is not. `_serve_file` had
+the same bug — `full.startswith(STATIC)` accepts `/static-evil` — so it now uses
+`commonpath` too. **Policy paths get the same check**, because a policy is
+parsed and compiled; `../` on it is the identical hole.
+
+### Non-loopback is a decision, not a default
+
+`WorkbenchServer(host="0.0.0.0")` now raises at **construction** rather than
+binding quietly. `allow_remote=True` overrides it, and the boundary still
+applies — exposure and authentication are separate axes, and opening one does
+not close the other.
+
+### What the tests are
+
+Thirty checks, and every one of the HTTP ones is an **attack that must fail**.
+A suite of "the happy path still works" would have passed just as happily
+against the old unauthenticated handler, because the happy path was never the
+problem. One test asserts the legitimate request still returns 2 rows: a
+security boundary that breaks the product is not a boundary.
+
+The one existing test that had to change is the proof the gate is real: it
+posted to `/api/rows` with no token and got 403. It now authenticates, because
+a test reaching the handler without a token would be asserting behaviour on a
+path the boundary no longer permits.
+
+**1113 passed, 11 skipped, 0 failed; ruff clean.** 28 new checks.
 
 ---
 

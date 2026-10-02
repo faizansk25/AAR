@@ -22,6 +22,9 @@ from aar.workbench import (  # noqa: E402
     STRINGS, WorkbenchServer, api_explain, api_i18n, api_run, api_state,
     text_direction,
 )
+from aar.workbench.security import (  # noqa: E402
+    Refused, is_loopback, new_token, resolve_pipeline,
+)
 from aar.workbench.server import STATIC  # noqa: E402
 
 
@@ -193,6 +196,251 @@ def server():
 def fetch(url: str):
     with urllib.request.urlopen(url, timeout=10) as response:
         return response.status, response.read(), dict(response.headers)
+
+
+def _auth_headers(server) -> dict:
+    """Headers a legitimate mutating request carries.
+
+    Kept next to the other HTTP helpers rather than inlined at each call site:
+    a test that hand-rolls these is a test that can silently stop testing the
+    thing it means to.
+    """
+    from aar.workbench.security import MUTATING_HEADER, TOKEN_HEADER
+
+    return {"Content-Type": "application/json",
+            MUTATING_HEADER: "1",
+            TOKEN_HEADER: server.session_token}
+
+
+def post(server, route: str, body: dict, headers: dict | None = None):
+    """POST to a running workbench, returning ``(status, decoded)``.
+
+    A 4xx from the boundary is a legitimate outcome here, so the HTTP error is
+    caught rather than raised: a test asserting "this is refused" would
+    otherwise fail with an exception instead of with its own assertion.
+    """
+    data = json.dumps(body).encode()
+    request = urllib.request.Request(
+        server.url + route, data=data,
+        headers=headers if headers is not None else _auth_headers(server))
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read())
+
+
+class TestTheTrustBoundary:
+    """The Workbench executes a caller-supplied file. These are its defences.
+
+    Every test here is an *attack that must fail*. The shape matters: a suite
+    of "the happy path still works" would pass just as happily against the
+    old unauthenticated handler, because the happy path was never the problem.
+    """
+
+    @pytest.fixture(scope="class")
+    def secured(self, tmp_path_factory):
+        """A server whose root is known and which refuses outside it."""
+        directory = tmp_path_factory.mktemp("secroot")
+        _write_pipeline(directory)
+        instance = WorkbenchServer(port=8793, pipeline_root=str(directory))
+        instance.start()
+        yield instance
+        instance.stop()
+
+    def test_a_run_with_no_token_is_refused(self, secured):
+        """The original hole, reproduced: any socket, any pipeline."""
+        status, body = post(secured, "api/run", {"path": "pipeline.py"},
+                            headers={"Content-Type": "application/json"})
+        assert status == 403, body
+        assert body.get("refused") is True
+        assert body["error"]
+
+    def test_a_run_with_a_wrong_token_is_refused(self, secured):
+        headers = _auth_headers(secured)
+        headers["X-AAR-Token"] = "not-the-token"
+        status, body = post(secured, "api/run", {"path": "pipeline.py"},
+                            headers=headers)
+        assert status == 403
+        assert "token" in body["error"].lower()
+
+    def test_a_token_is_required_on_every_mutating_route(self, secured):
+        for route, payload in (("api/run", {"path": "pipeline.py"}),
+                               ("api/explain", {"path": "pipeline.py"}),
+                               ("api/rows", {"token": "x"})):
+            status, _ = post(secured, route, payload,
+                             headers={"Content-Type": "application/json"})
+            assert status == 403, f"{route} accepted an unauthenticated POST"
+
+    def test_a_custom_header_is_required(self, secured):
+        """The preflight forcing function, asserted directly.
+
+        `Content-Type: application/json` is CORS-simple, so a cross-origin
+        form post carries it without a preflight. Without this header a
+        cross-origin page can reach a mutating route in one shot.
+        """
+        headers = _auth_headers(secured)
+        del headers["X-AAR-Workbench"]
+        status, body = post(secured, "api/run", {"path": "pipeline.py"},
+                            headers=headers)
+        assert status == 403
+        assert "X-AAR-Workbench" in body["error"]
+
+    def test_a_foreign_host_is_refused(self, secured):
+        """DNS rebinding: same socket, a Host the server never claimed."""
+        headers = _auth_headers(secured)
+        request = urllib.request.Request(
+            secured.url + "api/run",
+            data=json.dumps({"path": "pipeline.py"}).encode(),
+            headers=headers)
+        request.add_header("Host", "evil.example")
+        try:
+            urllib.request.urlopen(request, timeout=10)
+            raise AssertionError("a foreign Host was accepted")
+        except urllib.error.HTTPError as error:
+            assert error.code == 403
+            assert b"evil.example" in error.read()
+
+    def test_a_cross_origin_post_is_refused(self, secured):
+        headers = _auth_headers(secured)
+        headers["Origin"] = "http://evil.example"
+        status, body = post(secured, "api/run", {"path": "pipeline.py"},
+                            headers=headers)
+        assert status == 403
+        assert "cross-origin" in body["error"]
+
+    def test_same_origin_is_accepted(self, secured):
+        headers = _auth_headers(secured)
+        headers["Origin"] = f"http://{secured.host}:{secured.port}"
+        status, body = post(secured, "api/run", {"path": "pipeline.py"},
+                            headers=headers)
+        assert status == 200, body
+        assert body["ok"] is True
+
+    def test_no_cors_headers_are_sent(self, secured):
+        """The absence is load-bearing, not an omission.
+
+        The custom-header check only works because the server never answers a
+        preflight. Adding a permissive `Access-Control-Allow-Origin` would
+        silently disarm it.
+        """
+        _, _, headers = fetch(secured.url + "api/health")
+        assert "Access-Control-Allow-Origin" not in headers
+
+    def test_a_pipeline_outside_the_root_is_refused(self, secured, tmp_path):
+        """`..` and absolute paths both resolve before the check."""
+        outside = _write_pipeline(tmp_path)
+        for path in (str(outside), "../../../etc/passwd"):
+            status, body = post(secured, "api/run", {"path": path})
+            assert status == 403, f"{path} was allowed"
+            assert body["error"]
+
+
+    def test_a_symlink_out_of_the_root_is_refused(self, secured, tmp_path):
+        """A link inside the root pointing out must not be followed.
+
+        This is the escape a prefix check on the *supplied* path cannot see:
+        the string is inside the root, and the file it names is not.
+        """
+        outside = _write_pipeline(tmp_path)
+        link = os.path.join(secured.pipeline_root, "innocent.py")
+        try:
+            os.symlink(str(outside), link)
+        except (OSError, NotImplementedError, AttributeError):
+            pytest.skip("symlinks unavailable to this user")
+        try:
+            status, _ = post(secured, "api/run", {"path": link})
+            assert status == 403
+        finally:
+            os.unlink(link)
+
+    def test_a_policy_path_is_confined_too(self, secured, tmp_path):
+        """A policy is executable content, so `../` on it is the same hole."""
+        policy = tmp_path / "policy.yaml"
+        policy.write_text("version: 1\nrules: []\n", encoding="utf-8")
+        status, body = post(secured, "api/run",
+                            {"path": "pipeline.py", "policy": str(policy)})
+        assert status == 403, body
+
+    def test_an_oversized_body_is_refused(self, secured):
+        """Refused on the declared length, before the body is read."""
+        from aar.workbench.security import MAX_BODY_BYTES
+
+        request = urllib.request.Request(
+            secured.url + "api/run", data=b"{}",
+            headers=_auth_headers(secured))
+        request.add_header("Content-Length", str(MAX_BODY_BYTES + 1))
+        try:
+            urllib.request.urlopen(request, timeout=10)
+            raise AssertionError("an oversized body was accepted")
+        except urllib.error.HTTPError as error:
+            assert error.code == 413
+
+    def test_a_legitimate_request_still_works(self, secured):
+        """The boundary must not be a wall that breaks the product."""
+        status, body = post(secured, "api/run", {"path": "pipeline.py"})
+        assert status == 200, body
+        assert body["ok"] is True
+        assert body["rows"] == 2
+
+    def test_the_ui_is_served_the_token(self, secured):
+        """The page must be able to authenticate without a URL parameter."""
+        _, body, _ = fetch(secured.url)
+        assert secured.session_token.encode() in body
+        # And not in the URL, where it would leak via Referer or history.
+        assert "?" not in secured.url
+
+    def test_a_remote_bind_is_refused_by_default(self):
+        for host in ("0.0.0.0", "10.0.0.5", "192.168.1.4"):
+            with pytest.raises(Refused):
+                WorkbenchServer(host=host)
+
+    def test_a_remote_bind_is_possible_but_says_so(self):
+        server = WorkbenchServer(host="0.0.0.0", allow_remote=True)
+        assert server.host == "0.0.0.0"
+
+    def test_the_token_is_fresh_per_server(self):
+        assert WorkbenchServer().session_token != WorkbenchServer().session_token
+
+
+class TestTheBoundaryUnits:
+    """The pieces, tested directly so a failure names the actual check."""
+
+    @pytest.mark.parametrize("host,expected", [
+        ("127.0.0.1", True), ("localhost", True), ("::1", True),
+        ("127.0.0.2", True),
+        ("0.0.0.0", False), ("10.0.0.5", False), ("", False),
+        # The case a string prefix check would get wrong.
+        ("127.0.0.1.evil.com", False),
+    ])
+    def test_loopback_is_resolved_not_prefixed(self, host, expected):
+        assert is_loopback(host) is expected
+
+    def test_each_server_generates_a_distinct_token(self):
+        tokens = {new_token() for _ in range(50)}
+        assert len(tokens) == 50
+        assert all(len(t) >= 32 for t in tokens)
+
+    def test_a_sibling_directory_sharing_a_prefix_is_refused(self, tmp_path):
+        root = tmp_path / "pipelines"
+        root.mkdir()
+        evil = tmp_path / "pipelines-evil"
+        evil.mkdir()
+        target = evil / "x.py"
+        target.write_text("# escape\n", encoding="utf-8")
+        with pytest.raises(Refused):
+            resolve_pipeline(str(target), str(root))
+
+    def test_the_root_itself_is_not_a_pipeline(self, tmp_path):
+        with pytest.raises(Refused):
+            resolve_pipeline(str(tmp_path), str(tmp_path))
+
+    def test_a_refusal_explains_itself(self, tmp_path):
+        """A refusal with no reason is indistinguishable from a bug."""
+        with pytest.raises(Refused) as caught:
+            resolve_pipeline(str(tmp_path / "nope.py"), str(tmp_path / "sub"))
+        assert "pipelines must live under" in caught.value.reason
+        assert caught.value.status == 403
 
 
 class TestServer:
@@ -432,12 +680,17 @@ class TestAccessibilityClaims:
             assert needed in source, f"the UI lost {needed!r}"
 
     def test_a_rows_request_for_nothing_is_a_clean_error(self, server):
-        """A stale token must say so, not raise."""
+        """A stale token must say so, not raise.
+
+        The request now has to authenticate first: `/api/rows` is a mutating
+        route, and a test that reached the handler without a token would be
+        asserting the behaviour of a path the boundary no longer permits.
+        """
         payload = json.dumps({"token": "r-nope", "offset": 0,
                               "limit": 10}).encode()
         request = urllib.request.Request(
             server.url + "api/rows", data=payload,
-            headers={"Content-Type": "application/json"})
+            headers=_auth_headers(server))
         with urllib.request.urlopen(request, timeout=10) as response:
             body = json.loads(response.read())
         assert body["ok"] is False

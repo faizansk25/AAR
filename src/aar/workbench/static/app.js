@@ -41,9 +41,19 @@ async function getJSON(url) {
 }
 
 async function postJSON(url, body) {
+  // The workbench executes a caller-supplied file, so a mutating request must
+  // carry the session token and a custom header. The custom header is what
+  // makes this a preflighted request: the server sends no CORS headers, so a
+  // cross-origin page cannot get one of these past the browser at all.
+  const token =
+    document.querySelector('meta[name="aar-session-token"]')?.content || "";
   const response = await fetch(url, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: {
+      "Content-Type": "application/json",
+      "X-AAR-Workbench": "1",
+      "X-AAR-Token": token,
+    },
     body: JSON.stringify(body),
   });
   return response.json();
