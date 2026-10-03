@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1151 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1159 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -140,6 +140,87 @@ Workbench is an exposed policy engine.
 ---
 
 ---
+
+---
+
+### Round 34 — two policy bugs that both weakened protection
+
+Both found by review before the next feature, and both were the same mistake
+in different clothing: an aggregation step that silently dropped the *stricter*
+input. Worth stating plainly because "pick the most conservative option" reads
+correct and, here, did the opposite.
+
+### `min()` was selecting the weakest policy
+
+```python
+strictest = min(attached, key=lambda r: r.min_group_size)   # wrong way round
+```
+
+`k` is a **floor** on group size. Raising it suppresses *more* groups, so the
+largest `k` is the strictest rule. `min` therefore picked the weakest policy
+every time two applied, and named it "strictest" in the surrounding code - so
+the reader was told the opposite of what happened:
+
+```text
+policy A  k=5
+policy B  k=10        effective requirement must be 10, was 5
+```
+
+Now `max()`, via `effective_rule()`. The name of the function was the tell: a
+function called `strictest` that returns the loosest option is a bug someone
+should have caught by reading the name.
+
+### And the merge dropped the stricter rule entirely
+
+```python
+if rule.rule not in {r.rule for r in attached}:   # key on name alone
+```
+
+Two rules sharing an id but differing in `k` collapsed to whichever arrived
+first. So `k=5` then `k=10` under one id could discard the `k=10` policy
+outright - not weakened, *gone*, with nothing in the evidence to say a stricter
+policy had been authored and discarded.
+
+Rules are now keyed by `(rule, k)`: genuinely identical rules merge, and a
+same-named rule with a different `k` is retained alongside. The binding rule is
+`max(k)`, and every contributing rule stays on the node:
+
+```text
+k=10 from [strict] binds; also applied: loose k=3
+```
+
+Reducing that to a bare number would lose the fact that two policies were
+involved, which is exactly what an auditor asks.
+
+### k=1 was accepted while the comment said it should not be
+
+The comment claimed "zero **or one** means suppress nothing" and the code
+enforced `< 1`. Since `k=1` permits every non-empty group, it is not a
+control - and "no disclosure rule" already exists as the honest way to say
+protection is off. A `k=1` policy was a second spelling of *disabled* that
+**renders as protection** in an explain panel, which is worse than omitting it.
+
+Now `< 2`. The only way to turn the control off is to leave it out, and that is
+visible in the policy.
+
+### Also: a duplicated decorator, and a comment that said "strictest"
+
+```python
+@staticmethod
+@staticmethod
+def _apply_disclosure(...)
+```
+
+Harmless at runtime - Python evaluates the inner one first and applies the
+outer to the result of `staticmethod(...)`, which is callable - but it is
+noise that hides intent. The local test named `test_the_strictest_rule_wins`
+was also asserting the *inverted* expectation, so the bug and its test agreed
+with each other and the suite was green. That is the failure mode worth
+remembering: **a test written from the same misreading as the code cannot catch
+that misreading.**
+
+**1147 passed, 11 skipped, 0 failed; ruff clean.** 8 new checks, including
+regressions for both bugs.
 
 ---
 

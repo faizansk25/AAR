@@ -74,7 +74,6 @@ class PipelineService:
         return self._planner
 
     @staticmethod
-    @staticmethod
     def _apply_disclosure(root: Any, policy: Any, subject: Any
                           ) -> list[DisclosureGuard]:
         """Attach small-cell suppression to every aggregate in ``root``.

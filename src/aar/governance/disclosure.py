@@ -60,6 +60,7 @@ from ..failures import PolicyDenied
 __all__ = [
     "GROUP_COUNT_COLUMN", "DisclosureRule", "DisclosureGuard", "Suppression",
     "apply_disclosure_control", "disclosure_guards", "strip_group_counts",
+    "merge_rules", "effective_rule", "enforced_rule", "group_count_aggregate",
 ]
 
 
@@ -77,6 +78,12 @@ class DisclosureRule:
     A rule of ``k=5`` on ``AVG(salary)`` permits a department of six and
     suppresses one of four, and the group is suppressed rather than rounded -
     rounding an average over four people is still an average over four people.
+
+    **Larger ``k`` is stricter, not looser.** ``k`` is a floor on group size:
+    raising it suppresses *more* groups, so ``max()`` selects the binding
+    requirement and ``min()`` would silently pick the weakest policy and weaken
+    protection whenever two policies both applied. That inversion is easy to
+    write and reads as "be conservative" while doing the opposite.
     """
 
     min_group_size: int = 5
@@ -84,14 +91,19 @@ class DisclosureRule:
     rule: str = "disclosure.min_group_size"
 
     def __post_init__(self) -> None:
-        if self.min_group_size < 1:
-            # A k of zero or one means "suppress nothing", which would be a rule
-            # that appears configured and protects nothing - the exact failure
-            # mode this codebase refuses elsewhere.
+        if self.min_group_size < 2:
+            # k=1 permits every non-empty group, so it is not a control: it
+            # appears configured and protects nothing. And "no disclosure rule"
+            # already exists as the honest way to say protection is off, so a
+            # k=1 policy would only be a second spelling of that with extra
+            # steps - and one that reads as protection in an explain panel.
+            # Rejecting it here means the only way to disable the control is
+            # to omit it, which is visible.
             raise ValueError(
-                f"min_group_size must be at least 1, got "
-                f"{self.min_group_size}: a rule that suppresses nothing is "
-                f"not a disclosure control")
+                f"min_group_size must be at least 2, got "
+                f"{self.min_group_size}: k=1 permits every non-empty group, so "
+                f"it suppresses nothing and is not a disclosure control. Omit "
+                f"the disclosure rule to turn protection off.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,6 +143,10 @@ class DisclosureGuard:
     rule: DisclosureRule
     subject: str = ""
     reason: str = ""
+    #: Every rule that applied, not only the binding one. Retained so the
+    #: evidence can say "k=10 bound because two policies applied" rather than
+    #: reduce a policy interaction to a bare number.
+    contributing: tuple[DisclosureRule, ...] = ()
 
     @property
     def count_column(self) -> str:
@@ -139,7 +155,8 @@ class DisclosureGuard:
     def describe(self) -> str:
         return (f"[{self.rule.rule}] groups smaller than "
                 f"{self.rule.min_group_size} contributors are suppressed "
-                f"before {self.node.type.value} results are exposed")
+                f"before {self.node.type.value} results are exposed"
+                + (f" ({self.reason})" if self.reason else ""))
 
     def __repr__(self) -> str:  # pragma: no cover - display
         return f"<DisclosureGuard k={self.rule.min_group_size}>"
@@ -191,28 +208,37 @@ def apply_disclosure_control(root: Any, rules: list[DisclosureRule],
     for node in _aggregates(root):
         if not _requires_cardinality(node):
             continue
-        attached = list(getattr(node, "disclosure_rules", ()))
-        for rule in rules:
-            if rule.rule not in {r.rule for r in attached}:
-                attached.append(rule)
-        strictest = min(attached, key=lambda r: r.min_group_size)
+        attached = merge_rules(tuple(getattr(node, "disclosure_rules", ())),
+                               tuple(rules))
+        # The binding rule is the *largest* k: raising the floor suppresses more
+        # groups, so the strictest policy must be the one that governs.
+        binding = effective_rule(attached)
         try:
-            node.disclosure_rules = tuple(attached)
+            node.disclosure_rules = attached
         except AttributeError:
             raise PolicyDenied(
                 f"this node cannot carry a disclosure rule "
                 f"({type(node).__name__} has no disclosure_rules field), so "
-                f"[{strictest.rule}] cannot be enforced on "
+                f"[{binding.rule}] cannot be enforced on "
                 f"{node.type.value}. Nothing is allowed through, because a "
                 f"disclosure control that cannot be attached must not be "
                 f"assumed to be satisfied.",
-                rule=strictest.rule) from None
+                rule=binding.rule) from None
         guards.append(DisclosureGuard(
-            node=node, rule=strictest,
-            subject=getattr(subject, "name", ""),
-            reason=f"{len(attached)} disclosure rule(s) apply to this "
-                   f"aggregate"))
+            node=node, rule=binding, subject=getattr(subject, "name", ""),
+            contributing=attached,
+            reason=_why(binding, attached)))
     return guards
+
+
+def _why(binding: DisclosureRule, applied: tuple[DisclosureRule, ...]) -> str:
+    """One sentence naming the binding rule and anything that also applied."""
+    if len(applied) == 1:
+        return f"k={binding.min_group_size} from [{binding.rule}]"
+    others = ", ".join(sorted(f"{r.rule} k={r.min_group_size}"
+                             for r in applied if r is not binding))
+    return (f"k={binding.min_group_size} from [{binding.rule}] binds; "
+            f"also applied: {others}")
 
 
 def disclosure_guards(root: Any) -> list[DisclosureGuard]:
@@ -225,17 +251,48 @@ def disclosure_guards(root: Any) -> list[DisclosureGuard]:
     return guards
 
 
-def enforced_rule(node: Any) -> DisclosureRule | None:
-    """The strictest rule attached to ``node``, or ``None``.
+def merge_rules(existing: tuple[DisclosureRule, ...],
+                incoming: tuple[DisclosureRule, ...]
+                ) -> tuple[DisclosureRule, ...]:
+    """Combine rules so the binding one survives and none is lost.
 
-    Strictest rather than first: two rules with different ``k`` on one
-    aggregate is a policy that wants both, and satisfying the looser would
-    satisfy neither the author nor the analyst's expectation.
+    Two separate things go wrong if this is done with ``min`` and a name-keyed
+    set, and both silently *reduce* protection:
+
+    * ``min(k)`` picks the weakest policy, but ``k`` is a floor - the largest
+      ``k`` is the strictest and is the one that must win.
+    * deduplicating by ``rule`` alone drops a second rule that shares the id
+      with a different ``k``, so ``k=5`` and ``k=10`` under one id would
+      collapse to whichever arrived first and the stricter policy would vanish
+      without a trace.
+
+    Rules are therefore keyed by ``(rule, k)``: genuinely identical rules merge,
+    and a same-named rule with a *different* k is retained alongside it so the
+    evidence can name both and explain that the stricter one bound.
     """
-    rules = tuple(getattr(node, "disclosure_rules", ()))
+    merged: dict[tuple[str, int], DisclosureRule] = {}
+    for rule in tuple(existing) + tuple(incoming):
+        merged[(rule.rule, rule.min_group_size)] = rule
+    return tuple(merged[key] for key in sorted(merged))
+
+
+def effective_rule(rules: tuple[DisclosureRule, ...]) -> DisclosureRule | None:
+    """The single rule that governs: the **largest** ``k``, or ``None``.
+
+    Returns the winning rule rather than a synthesised one so that its ``rule``
+    id still names a real policy. The *other* applicable rules stay on the node
+    and are reported as contributing provenance - "k=10 bound because two
+    policies applied" is a fact an auditor needs, and it is lost if the result
+    is reduced to a bare number.
+    """
     if not rules:
         return None
-    return min(rules, key=lambda r: r.min_group_size)
+    return max(rules, key=lambda r: r.min_group_size)
+
+
+def enforced_rule(node: Any) -> DisclosureRule | None:
+    """The binding rule on ``node``, or ``None`` if it is unguarded."""
+    return effective_rule(tuple(getattr(node, "disclosure_rules", ())))
 
 
 def group_count_aggregate() -> Any:

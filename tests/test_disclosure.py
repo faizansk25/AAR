@@ -21,7 +21,8 @@ from aar.application import PipelineService
 from aar.failures import PolicyDenied
 from aar.governance.disclosure import (
     GROUP_COUNT_COLUMN, DisclosureRule, apply_disclosure_control,
-    disclosure_guards, enforced_rule, strip_group_counts,
+    disclosure_guards, effective_rule, enforced_rule, merge_rules,
+    strip_group_counts,
 )
 from aar.ir import Agg, Col, Node, NodeType, ScanSpec
 from aar.runtime.executor import Executor
@@ -144,14 +145,14 @@ class TestTheGuardIsHonestAboutWhatItDid:
         first = service.run(str(pipeline), policy_path=str(policy))
         assert first.result.suppressions[0].suppressed_groups == 1
 
-        policy.write_text(json.dumps({"name": "t", "disclosure": 1}),
+        policy.write_text(json.dumps({"name": "t", "disclosure": 2}),
                           encoding="utf-8")
         second = service.run(str(pipeline), policy_path=str(policy))
         assert second.result.suppressions[0].suppressed_groups == 0
 
 
 class TestTheCountIsNotAThingYouCanSee:
-    @pytest.mark.parametrize("k", [1, 3, 5])
+    @pytest.mark.parametrize("k", [2, 3, 5])
     def test_the_hidden_count_never_reaches_the_result(self, tmp_path, k):
         """An analyst who could read the count would learn the group sizes.
 
@@ -254,14 +255,76 @@ class TestTheRuleIsAttachedToThePlan:
         assert guards[0].rule.min_group_size == 5
 
     def test_the_strictest_rule_wins_when_several_apply(self):
+        """Larger k is stricter: k is a floor, so raising it hides more.
+
+        `min` here would pick the *weaker* rule and silently weaken protection
+        every time two policies applied to one aggregate.
+        """
         node = Node(NodeType.GROUPBY, agg_functions={"a": (Agg("AVG", Col("x")),)})
-        node.disclosure_rules = (DisclosureRule(10, "loose"),
-                                 DisclosureRule(3, "strict"))
-        assert enforced_rule(node).min_group_size == 3
+        node.disclosure_rules = (DisclosureRule(10, "strict"),
+                                 DisclosureRule(3, "loose"))
+        assert enforced_rule(node).min_group_size == 10
+        assert enforced_rule(node).rule == "strict"
 
     def test_an_unguarded_node_has_no_rule(self):
         node = Node(NodeType.GROUPBY, agg_functions={"a": (Agg("AVG", Col("x")),)})
         assert enforced_rule(node) is None
+
+    def test_two_policies_same_name_different_k_both_survive(self):
+        """The name-collapse bug, as a regression.
+
+        Deduplicating by ``rule`` alone dropped the stricter of two rules that
+        shared an id, so a k=10 policy could vanish with no trace and the
+        weaker k=5 would silently govern.
+        """
+        merged = merge_rules((DisclosureRule(5),), (DisclosureRule(10),))
+        assert {r.min_group_size for r in merged} == {5, 10}
+        assert effective_rule(merged).min_group_size == 10
+
+    def test_identical_rules_merge_rather_than_accumulate(self):
+        merged = merge_rules((DisclosureRule(5, "r"),), (DisclosureRule(5, "r"),))
+        assert len(merged) == 1
+
+    def test_applying_twice_does_not_weaken_the_rule(self):
+        """Idempotent: re-running the rewrite pass must not lower k."""
+        from aar.governance.disclosure import apply_disclosure_control
+
+        scan = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="x.csv"))
+        node = Node(NodeType.GROUPBY, inputs=[scan], key_left=("region",),
+                    agg_functions={"a": (Agg("AVG", Col("x")),)})
+        apply_disclosure_control(node, [DisclosureRule(10)], None)
+        apply_disclosure_control(node, [DisclosureRule(5)], None)
+        assert enforced_rule(node).min_group_size == 10
+
+    def test_the_guard_names_what_also_applied(self):
+        """Provenance is retained, not collapsed to a bare number."""
+        from aar.governance.disclosure import apply_disclosure_control
+
+        scan = Node(NodeType.SCAN_CSV, scan=ScanSpec(kind="csv", path="x.csv"))
+        node = Node(NodeType.GROUPBY, inputs=[scan], key_left=("region",),
+                    agg_functions={"a": (Agg("AVG", Col("x")),)})
+        guards = apply_disclosure_control(
+            node, [DisclosureRule(10, "strict"), DisclosureRule(3, "loose")],
+            None)
+        assert guards[0].rule.min_group_size == 10
+        assert len(guards[0].contributing) == 2
+        assert "loose" in guards[0].reason
+
+
+class TestKMustActuallyProtectSomething:
+    @pytest.mark.parametrize("k", [0, 1, -1])
+    def test_a_k_that_suppresses_nothing_is_not_constructible(self, k):
+        """k=1 permits every non-empty group.
+
+        Omitting the rule already means "protection off", so a k=1 policy is a
+        second spelling of that which *reads* as protection in an explain panel.
+        """
+        with pytest.raises(ValueError) as caught:
+            DisclosureRule(min_group_size=k)
+        assert "not a disclosure control" in str(caught.value)
+
+    def test_two_is_accepted(self):
+        assert DisclosureRule(min_group_size=2).min_group_size == 2
 
 
 class TestItFailsClosed:
