@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1159 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1185 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -140,6 +140,105 @@ Workbench is an exposed policy engine.
 ---
 
 ---
+
+---
+
+### Round 35 — GovernedRun: the record of an attempt, not only of a success
+
+AAR had an evidence recorder and no lifecycle. Every run that did not complete
+left nothing: a policy refusal, a missing file, a planner failure - all silent.
+A compliance system that records only successes cannot answer "was anything
+attempted?", which is the first question anyone actually asks.
+
+### The run opens before the policy is read
+
+The lifecycle rule that mattered most, and the one that shaped everything else:
+
+```text
+resolve subject -> start_run -> load -> inject RLS -> attach disclosure
+-> profile -> plan -> execute -> finish_run
+```
+
+The authority is usually not knowable when the run opens, and the trap is
+obvious once named: **write the `policy_id` onto `run.started` afterwards.** That
+event is already hashed, so completing it either breaks the chain or forces a
+rehash - and leaves an opening event describing facts nobody possessed at the
+time it was written. So:
+
+```text
+ 0 run.started       policy_id=(unresolved)   policy_state=unresolved
+ 1 policy.bound      policy_id=policy.json    policy_state=resolved
+ 2 disclosure.evaluated  policy_id=policy.json
+ ...
+ 8 run.finished      policy_id=policy.json   status=success
+```
+
+The chain records *when* authority became known, not only *what* it was. No
+policy file gets a deterministic identity, `aar.baseline-policy-v1`, because
+"no policy file" is itself a governance state and an empty string could equally
+mean "we forgot to record it".
+
+### Denied is not failed
+
+Three outcomes, because "governance deliberately prevented this" and "AAR could
+not complete this" call for opposite responses:
+
+```text
+Dana's egress blocked by policy   ->  denied   (the system working)
+a parser crashed unexpectedly      ->  failed   (a fault to investigate)
+```
+
+Collapsing them reports correctly-refused attempts as errors, which is how
+people learn to read denials as noise. `DENIED` also records *which* control
+refused - a status alone says something was blocked and nothing about what.
+
+### Every guarded aggregate emits, including the ones that pass
+
+```text
+disclosure.evaluated
+  control            = min_group_size
+  effective_minimum  = 10
+  effective_rule_id  = strict
+  contributing_rules = [{strict, 10}, {loose, 3}]
+  verdict            = passed | suppressed | refused
+  suppressed_groups, smallest_group
+  applied_before_exposure = true
+```
+
+Emitting only on suppression would repeat the mistake Round 30 fixed for RLS one
+layer up: absence would have to mean "nothing was removed", when it could
+equally mean the control never ran. `contributing_rules` is structured data
+rather than prose because "k=10 because policy B overrode policy A" is a claim
+a reader must trust, and a list of pairs is a claim they can check.
+
+### GovernedRun is not a recorder
+
+The obvious design - and the wrong one - is a `GovernedRun.events` list
+populated from the other subsystems afterwards. That is a fifth recorder, in a
+different order, which is the problem `EvidenceRecorder` exists to solve.
+
+```text
+GovernedRun
+    |
+    +-- EvidenceRecorder   <- canonical truth
+             ^
+      Executor / Policy / Disclosure
+```
+
+It stores nothing. `events()` returns the recorder's own objects, and a test
+asserts the class holds no event slot. `Suppression` stays as the runtime's
+return value and is *projected* into evidence immediately; there is no
+suppression collection to reconstruct ordering from later.
+
+### A test caught a bug the design review had not
+
+Passing the live handle where the *injected* recorder belonged created a private
+recorder, so a caller's recorder silently saw nothing - the run succeeded, the
+evidence was empty, and nothing failed. The probe printed `0 events verified`
+and passed every assertion that did not check the count. That is the exact
+failure this whole spine exists to prevent, arriving through the new code.
+
+**1173 passed, 11 skipped, 0 failed; ruff clean.** 26 new checks.
 
 ---
 

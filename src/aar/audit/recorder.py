@@ -160,8 +160,38 @@ class EvidenceRecorder:
             )
             self._run = context
             self._recorded = []
-        self.emit(EventType.RUN_STARTED)
+        self.emit(EventType.RUN_STARTED,
+                  attributes={"policy_state": "unresolved" if not policy_id
+                              else "resolved",
+                              "policy_id_at_start": policy_id})
         return context
+
+    def bind_policy(self, policy_id: str, policy_hash: str) -> EvidenceEvent:
+        """Bind an authority to the open run, and to every later event.
+
+        Separate from ``start_run`` because the authority is usually not known
+        when the run opens: the policy file has not been read yet, and a run
+        that failed to read it still has to be recorded. Writing ``policy_id``
+        onto ``run.started`` afterwards would mean rewriting a hashed event -
+        which either breaks verification or, worse, forces the hash to be
+        recomputed and leaves a ``run.started`` that describes facts nobody
+        possessed at the time it was written.
+
+        So the opening event records ``policy_state = unresolved``, this emits
+        ``policy.bound`` with the real identity, and the active context is
+        updated so every subsequent event inherits the authority. Chronology
+        is preserved: the chain shows *when* the authority became known, not
+        just *what* it was.
+        """
+        if not self.is_recording:
+            raise RuntimeError("no run is open")
+        with self._lock:
+            run = self._run
+            run.policy_id = policy_id
+            run.policy_hash = policy_hash
+        return self.emit(EventType.POLICY_BOUND, rule_id=policy_id,
+                         attributes={"policy_hash": policy_hash,
+                                     "policy_state": "resolved"})
 
     def finish_run(self, status: str = "ok", reason: str = "") -> RunContext:
         """Seal the run with a ``run.finished`` carrying the terminal status."""
@@ -170,7 +200,7 @@ class EvidenceRecorder:
                 raise RuntimeError("no run is open")
             context = self._run
         self.emit(EventType.RUN_FINISHED, reason=reason,
-                  attributes={"status": status})
+                  attributes={"status": str(status)})
         with self._lock:
             self._run.status = status
             self._run.finished_at = self._clock()

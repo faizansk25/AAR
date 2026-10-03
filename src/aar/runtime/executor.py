@@ -450,6 +450,8 @@ class Executor:
         self._suppressions.append(Suppression(
             node_id=node.id, rule=rule.rule, suppressed_groups=suppressed,
             smallest_group=smallest,
+            minimum_required=rule.min_group_size,
+            contributing=tuple(getattr(node, "disclosure_rules", ())),
             reason=(f"{suppressed} group(s) below k={rule.min_group_size}"
                     if suppressed else "no group fell below the minimum")))
 

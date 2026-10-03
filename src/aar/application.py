@@ -22,11 +22,12 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 from .cost import EstimationLog
 from .governance.disclosure import DisclosureGuard, apply_disclosure_control
 from .governance.rewrite import apply_row_security, assert_barriers_intact
+from .audit.governed import GovernedRun
 
 __all__ = ["PipelineService", "RunReport"]
 
@@ -56,9 +57,21 @@ class PipelineService:
     """
 
     def __init__(self, planner: Any | None = None,
-                 history: Any | None = None) -> None:
+                 history: Any | None = None,
+                 evidence: Any = None) -> None:
         self._planner = planner
         self._history = history
+        #: A durable evidence sink - an ``EvidenceRecorder``, or anything with
+        #: the same ``start_run``/``emit`` shape. ``None`` means evidence is
+        #: collected in-process and discarded, which is the default: the
+        #: runtime must not force a database into existence just to run a
+        #: pipeline.
+        self._evidence_on_event = evidence
+        #: The live :class:`~aar.audit.governed.GovernedRun` for the run in
+        #: progress, or ``None``. Set for the duration of one run and cleared in
+        #: a ``finally``, so a caller that inspects a report mid-run cannot be
+        #: holding a stale handle.
+        self._evidence: Any = None
         #: Prediction-vs-actual errors from the most recent profiled run, or
         #: ``None`` when nothing was profiled. Public because a caller that
         #: wants to know whether the numbers were any good has to be able to
@@ -205,8 +218,41 @@ class PipelineService:
         recorded. That comparison is the only thing that can catch a
         profiler which is confidently wrong.
         """
-        from .runtime import Executor
 
+        # The evidence run opens *here*, before the policy is read. A run that
+        # fails to load its policy still happened, and a compliance system that
+        # records only successful runs cannot answer "was anything attempted?".
+        # The authority is bound by a later `policy.bound` event rather than
+        # written onto `run.started`, which is already hashed by that point.
+        if self._evidence_on_event is None and not self._evidence:
+            return self._run_governed(path, role, policy_path, actor, profile)
+        # The *injected* recorder, not the live handle - the handle does not
+        # exist yet, and passing it created a private recorder instead, so a
+        # caller's recorder silently saw nothing.
+        with GovernedRun(subject=actor or role or "anonymous",
+                         recorder=self._evidence_on_event) as evidence:
+            try:
+                evidence.bind_policy(policy_path)
+            except Exception as exc:  # noqa: BLE001
+                evidence.policy_bind_failed(f"{type(exc).__name__}: {exc}")
+                raise
+            self._evidence = evidence
+            try:
+                return self._run_governed(path, role, policy_path, actor, profile)
+            finally:
+                self._evidence = None
+
+    def _run_governed(self, path: str, role: str | None,
+                      policy_path: str | None, actor: str | None,
+                      profile: bool) -> Any:
+        """The run itself. Governance lifecycle lives in :meth:`run`.
+
+        Split out so every early return and every raise is inside a block that
+        has already opened an evidence run. Keeping the body here rather than
+        wrapping it inline means the lifecycle is stated once, above, instead of
+        being threaded through a method that already has a ``try`` in it.
+        """
+        from .runtime import Executor
         # Load and validate the policy *before* planning. A policy path that
         # does not exist is a more fundamental error than a plan that does
         # not fit, and planning first reported the memory failure instead -
@@ -236,7 +282,7 @@ class PipelineService:
         # Small-cell control, attached after RLS so the contributor counts are
         # measured over the rows the subject may actually see. Attaching it
         # first would count rows a barrier is about to remove.
-        self._apply_disclosure(root, policy, subject)
+        disclosure_guards = self._apply_disclosure(root, policy, subject)
 
         predicted = self.profile_sources(root) if profile else {}
         plan = self.plan(root)
@@ -250,7 +296,93 @@ class PipelineService:
         report = RunReport(plan=plan, result=result, root=root,
                            profiles=predicted, barriers=barriers)
         self.score_estimates(root, result)
+        if self._evidence is not None:
+            self._record_governed(self._evidence, report, disclosure_guards)
         return report
+
+    def _record_governed(self, run: Any, report: Any,
+                         guards: Sequence[Any]) -> None:
+        """Project a completed run's governance facts into the evidence chain.
+
+        The disclosure verdicts come from the *executor's* suppressions, not
+        from the plan-time guards. A guard says a control was required; the
+        suppression says what it did. Recording the guard would claim a
+        ``passed`` nobody observed, and a plan whose aggregates were never
+        reached would then report a clean result for controls that never ran.
+
+        ``guards`` is only used to explain an aggregate the executor produced no
+        verdict for - which happens when the plan was built and then abandoned.
+        """
+        verdicts = list(getattr(report.result, "suppressions", ()) or ())
+        seen = {getattr(v, "node_id", "") for v in verdicts}
+        for verdict in verdicts:
+            run.record_disclosure(verdict)
+        for guard in guards:
+            node_id = getattr(getattr(guard, "node", None), "id", "") or ""
+            if node_id in seen:
+                continue
+            # Never executed: the obligation existed but nothing resolved it.
+            # Saying "passed" here would be the exact absence-means-nothing
+            # error Round 30 removed, one layer up.
+            run.record_disclosure(self._verdict_from_guard(guard),
+                                  refused="the plan was built but this "
+                                         "aggregate was never evaluated")
+        run.record_restriction_state(
+            self._restriction_state(report),
+            rows_before=self._restricted_rows_before(report),
+            rows_after=getattr(report.result, "rows", None))
+        run.record_nodes(getattr(report.result, "outcomes", ()))
+
+    @staticmethod
+    def _restriction_state(report: Any) -> str:
+        """One of the four :class:`RestrictionState` values, from the barriers.
+
+        Injected barriers mean RLS was evaluated. A run with none could still
+        have been *evaluated and found not to apply*, so this does not claim
+        ``NOT_APPLICABLE`` from the absence of barriers - it claims the weaker,
+        truthful thing and lets the evidence say which.
+        """
+        from .audit.view import RestrictionState
+
+        barriers = getattr(report, "barriers", ()) or ()
+        if barriers:
+            return str(RestrictionState.APPLIED)
+        return str(RestrictionState.NOT_EVALUATED)
+
+    @staticmethod
+    def _restricted_rows_before(report: Any) -> int | None:
+        """Rows the restricted source produced, or ``None`` if not measured.
+
+        ``None`` rather than a guess: "we cannot say how many rows were
+        excluded" and "zero rows were excluded" are very different sentences in
+        a compliance answer, and only one is true when no count was taken.
+        """
+        for profile in (getattr(report, "profiles", None) or {}).values():
+            rows = getattr(profile, "rows", None)
+            if rows is not None:
+                return int(rows)
+        return None
+
+    @staticmethod
+    def _verdict_from_guard(guard: Any) -> Any:
+        """A pre-execution guard's expected verdict: *pending*, not passed.
+
+        A guard attached during the rewrite pass says the control is *required*.
+        It has not run yet, and recording it as ``passed`` would claim a result
+        nobody has. The executor's own :class:`Suppression` - which knows what
+        actually happened - is emitted after execution instead, and this
+        plan-time record is what explains the obligation when the run never
+        reaches the executor at all.
+        """
+        from .governance.disclosure import Suppression
+
+        return Suppression(
+            node_id=getattr(guard.node, "id", "") or "",
+            rule=getattr(guard.rule, "rule", "") or "",
+            suppressed_groups=0, smallest_group=None,
+            reason="control attached; evaluation pending",
+            minimum_required=getattr(guard.rule, "min_group_size", None),
+            contributing=tuple(getattr(guard, "contributing", ()) or ()))
 
     def score_estimates(self, root: Any, result: Any) -> list:
         """Compare each profiled source with what the run actually read.

@@ -38,8 +38,8 @@ from typing import Any, Mapping
 from .canonical import GENESIS_HASH, chain_digest
 
 __all__ = [
-    "EVIDENCE_SCHEMA_VERSION", "EventType", "SubjectIdentity", "EvidenceEvent",
-    "new_event_id", "new_run_id",
+    "EVIDENCE_SCHEMA_VERSION", "EventType", "RunStatus", "SubjectIdentity",
+    "EvidenceEvent", "new_event_id", "new_run_id",
 ]
 
 #: Bumped when the *meaning* of a field changes. Not cosmetic: an event written
@@ -66,6 +66,47 @@ class EventType(str, enum.Enum):
     POLICY_DENIED = "policy.denied"
     EGRESS_ATTEMPTED = "egress.attempted"
     PLAN_DEVIATED = "plan.deviated"
+    #: The authority a run executes under became known *after* it started.
+    #: A separate event rather than a field filled in on ``run.started`` later:
+    #: the opening event is hashed when it is written, so completing it with a
+    #: value learned afterwards would make it a reconstruction of what should
+    #: have been recorded, and a reader could no longer tell which facts the
+    #: system knew at the moment it opened.
+    POLICY_BOUND = "policy.bound"
+    #: Binding failed - the policy file was missing or unparseable. Distinct
+    #: from ``POLICY_DENIED`` because nothing was *refused*; the run never
+    #: obtained an authority to refuse anything with.
+    POLICY_BIND_FAILED = "policy.bind_failed"
+    #: A small-cell disclosure control was evaluated on an aggregate.
+    #: Emitted for **every** guarded aggregate including the ones that passed,
+    #: because absence of an event must never have to mean "nothing was
+    #: suppressed" - it could equally mean the control never ran.
+    DISCLOSURE_EVALUATED = "disclosure.evaluated"
+
+    def __str__(self) -> str:  # pragma: no cover - display
+        return self.value
+
+
+class RunStatus(str, enum.Enum):
+    """How a governed run ended. Three outcomes, not two.
+
+    ``DENIED`` and ``FAILED`` were one value, and the difference is the whole
+    question an analyst asks. "Governance deliberately prevented this" and
+    "AAR could not complete this" call for different responses: the first is
+    the system working, the second is a fault to investigate. Collapsing them
+    reports a correctly-refused attempt as an error, which trains people to
+    treat policy denials as noise.
+
+    A third state would be a lie: ``PARTIAL`` is not offered, because a run that
+    produced some rows but was refused is a run that failed.
+    """
+
+    #: Completed and every control held.
+    SUCCESS = "success"
+    #: Governance deliberately prevented the operation. Working as designed.
+    DENIED = "denied"
+    #: AAR could not complete the operation. A fault to investigate.
+    FAILED = "failed"
 
     def __str__(self) -> str:  # pragma: no cover - display
         return self.value

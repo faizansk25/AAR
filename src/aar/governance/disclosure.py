@@ -121,6 +121,14 @@ class Suppression:
     suppressed_groups: int
     smallest_group: int | None
     reason: str
+    #: The ``k`` that actually governed. Separate from the rule *id* because a
+    #: rule id can be attached to more than one ``k``, and "which policy was
+    #: this" and "what did it require" are different questions.
+    minimum_required: int | None = None
+    #: Every rule that applied, including ones that lost. Retained so the
+    #: evidence can show that two policies were in play and that the stricter
+    #: one bound, rather than reducing the interaction to a single number.
+    contributing: tuple[Any, ...] = ()
 
     def describe(self) -> str:
         if self.suppressed_groups == 0:
