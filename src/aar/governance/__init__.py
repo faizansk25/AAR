@@ -9,6 +9,10 @@ from .policy import (  # noqa: F401
     Policy, PolicyEngine, RLSRule, Sensitivity, Sink, Subject, load_policy,
     mask_value, policy_from_dict, sensitivity_of,
 )
+from .disclosure import (  # noqa: F401
+    GROUP_COUNT_COLUMN, DisclosureGuard, DisclosureRule, Suppression,
+    apply_disclosure_control, disclosure_guards, strip_group_counts,
+)
 from .rewrite import (  # noqa: F401
     SecurityBarrier, apply_row_security, assert_barriers_intact,
     parse_row_predicate, security_barriers,
@@ -20,5 +24,7 @@ __all__ = [
     "Sensitivity", "Sink", "Subject", "apply_row_security",
     "assert_barriers_intact", "load_policy", "mask_value",
     "parse_row_predicate", "policy_from_dict", "security_barriers",
-    "sensitivity_of",
+    "sensitivity_of", "DisclosureRule", "DisclosureGuard", "Suppression",
+    "apply_disclosure_control", "disclosure_guards", "strip_group_counts",
+    "GROUP_COUNT_COLUMN",
 ]

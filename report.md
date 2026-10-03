@@ -4,7 +4,7 @@
 **Workspace:** `d:\AAR`
 **Repository:** https://github.com/faizansk25/AAR.git (branch `main`)
 **Specification:** `system.md`
-**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1124 tests
+**Status:** AAR runs pipelines, propagates privacy, enforces it, and has a Workbench · 1151 tests
 **Last updated:** 2026-09-30
 
 **CI: 6/6 green** on `a56d569` (ubuntu, windows and macos × Python 3.11/3.12),
@@ -140,6 +140,115 @@ Workbench is an exposed policy engine.
 ---
 
 ---
+
+---
+
+### Round 33 — RLS was necessary and not sufficient
+
+RLS removes rows a subject may not see. That is necessary, and it is not
+sufficient, because an aggregate can disclose what RLS correctly withheld:
+
+```sql
+SELECT department, AVG(salary) FROM employees GROUP BY department
+```
+
+RLS has done its job - the analyst sees only their own rows - and the result
+still discloses a colleague's salary whenever a department holds one person.
+Nothing was leaked that RLS was responsible for; the number is an inference
+from a legitimate answer.
+
+This is the one item on the open list where *not* doing it produced an answer
+that looked correct and was wrong. The audit spine makes it worse, not better:
+a suppressed-by-nothing run reports every field populated and an intact
+integrity chain, so a governance product claiming "we can prove who saw what"
+would have proven that someone saw something they should not.
+
+### Contributor cardinality, not source cardinality
+
+The first thing I wrote was wrong, and it was wrong in the exact way you
+predicted. I reached for whole-source `rows_before`/`rows_after` - the counts
+already recorded per event - and that input is wrong twice over:
+
+```text
+measured above the join, not inside the group-by
+a single global number cannot express a per-group rule
+```
+
+A policy written against a global count protects the average department and
+exposes the smallest one, which is the opposite of the intent. The test that
+proves it is 500 contributors in one group and 1 in another: every whole-table
+measure says "large and safe", and only the per-group count sees the group of
+one.
+
+So the count is taken where Round 26 said things must be taken - **above the
+RLS barrier, inside the aggregate** - which is exactly the ordering that
+`AVG` cannot be un-averaged already forced us to get right once.
+
+### Two implementation bugs worth naming
+
+**Counting the output instead of the input.** The first version counted rows in
+the *result* of the group-by. A result has one row per group, so every group
+reported one contributor, everything was suppressed, and the control looked like
+it was working while being useless. It passed a test that only checked that a
+small group disappeared.
+
+**The guard could be silently dropped.** The rule was first held in the rewrite
+pass's return value - which any planner pushdown, clone or tree rebuild
+discards. A plan with no rule attached looks identical to a protected one. The
+obligation now lives on the node (`disclosure_rules`), the same way a
+`SECURITY_FILTER` does, and enforcement reads the node rather than trusting the
+pass that attached it.
+
+### Fail-closed, in four places
+
+```text
+group key absent from the input   -> refuse
+no columnar representation        -> refuse
+aggregate with several inputs     -> refuse
+node cannot carry the rule        -> refuse
+k < 1                             -> not constructible
+```
+
+"I could not measure the group size" must never become "so I allowed the
+group". `DisclosureRule(0)` raises at construction because a rule that
+suppresses nothing is a rule that appears configured and protects nothing.
+
+### The count is internal, and stripped unconditionally
+
+`__aar_group_count` is never projected, never written, and stripped from every
+guarded result *whether or not anything was suppressed* - an analyst who could
+read it would learn precisely the group sizes the rule protects, delivered with
+a column name instead of an aggregate. A test asserts the absence at three
+different `k` values, because a guard that only cleans up when it fires is a
+guard that leaks on the days it decides to.
+
+### The evidence says which, not how many
+
+```text
+[disclosure.min_group_size] suppressed 1 group(s) below the minimum;
+  smallest was 2
+[disclosure.min_group_size] every group had at least enough contributors
+```
+
+A counter would conflate those. "One group suppressed" and "nothing was
+suppressed" are very different facts about a policy and only one is
+reassuring, so a run that suppressed nothing says so rather than staying
+silent.
+
+### Two bugs the tests caught in *my own* test code
+
+- A refusal test installed a descriptor on `Node` **itself**, making every node
+  in the process unwritable. It broke three unrelated Workbench tests that ran
+  after it, and would have been indistinguishable from a product bug. There is
+  now a test asserting the double did not leak.
+- The foreign-`Host` test hit `WinError 10053`: answering while a request body
+  was still in flight aborts the connection, so the caller sees a socket error
+  instead of the 403. My first fix - draining the body - was **worse**: a
+  request declaring more bytes than it sends left the server blocked in `read`
+  until the client timed out. `Connection: close` is the right answer, and the
+  comment now records why the obvious fix is wrong.
+
+**1139 passed, 11 skipped, 0 failed; ruff clean.** 27 new checks.
 
 ---
 

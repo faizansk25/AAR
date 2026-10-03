@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .cost import EstimationLog
+from .governance.disclosure import DisclosureGuard, apply_disclosure_control
 from .governance.rewrite import apply_row_security, assert_barriers_intact
 
 __all__ = ["PipelineService", "RunReport"]
@@ -71,6 +72,26 @@ class PipelineService:
 
         self._planner = AdaptivePlanner()
         return self._planner
+
+    @staticmethod
+    @staticmethod
+    def _apply_disclosure(root: Any, policy: Any, subject: Any
+                          ) -> list[DisclosureGuard]:
+        """Attach small-cell suppression to every aggregate in ``root``.
+
+        Called after row security so the contributor counts are measured over
+        the rows the subject may actually see. A no-op when the policy declares
+        no ``disclosure`` rule, which is the default: a control nobody asked
+        for must not silently change anybody's numbers.
+
+        Returns the guards for the run report, so a plan can say which
+        aggregates were subject to suppression rather than only which ones
+        produced a suppressed group.
+        """
+        rules = list(getattr(policy.policy, "disclosure", ()) or ())
+        if not rules:
+            return []
+        return apply_disclosure_control(root, rules, subject)
 
     @staticmethod
     def _load_policy(path: str | None) -> Any:
@@ -145,6 +166,7 @@ class PipelineService:
                    or Subject(name="explain"))
         root = self.load(path)
         barriers = apply_row_security(root, policy.policy, subject)
+        self._apply_disclosure(root, policy, subject)
         self.profile_sources(root) if profile else {}
         plan = self.plan(root)
         assert_barriers_intact(root, barriers)
@@ -212,6 +234,10 @@ class PipelineService:
         # This is where an ambiguity in the policy becomes an error, before
         # anything has been read, measured or scheduled.
         barriers = apply_row_security(root, policy.policy, subject)
+        # Small-cell control, attached after RLS so the contributor counts are
+        # measured over the rows the subject may actually see. Attaching it
+        # first would count rows a barrier is about to remove.
+        self._apply_disclosure(root, policy, subject)
 
         predicted = self.profile_sources(root) if profile else {}
         plan = self.plan(root)

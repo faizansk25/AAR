@@ -215,11 +215,17 @@ class _Handler(BaseHTTPRequestHandler):
         if getattr(self.server, "verbose", False):
             super().log_message(fmt, *args)
 
-    def _send_json(self, status: int, payload: Any) -> None:
+    def _send_json(self, status: int, payload: Any,
+                    close: bool = False) -> None:
         body = json.dumps(payload, default=str).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if close:
+            # The request body may not have been read, so the connection is no
+            # longer framed correctly and must not be reused.
+            self.send_header("Connection", "close")
+            self.close_connection = True
         self._security_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -289,10 +295,21 @@ class _Handler(BaseHTTPRequestHandler):
                     bool(payload.get("descending"))))
             self._send_json(404, {"error": f"no such route: {route}"})
         except Refused as refusal:
-            # Refusals are answers, not stack traces: the operator needs the
-            # reason, and the reason is not an internal detail.
+            # Reply *without* draining the body, and say so.
+            #
+            # Answering while a body is still in flight makes the OS abort the
+            # connection (WinError 10053): the caller sees a socket error
+            # instead of the 403 and its reason, so the refusal is reported as
+            # a flaky connection rather than as a policy decision. Draining
+            # first looks like the fix and is worse - a request that declares
+            # more bytes than it sends leaves the server blocked in ``read``
+            # until the client times out, which is the same symptom plus a
+            # stuck thread. ``Connection: close`` is the correct signal: the
+            # response is already complete, and the client is told the message
+            # ends here rather than that more is expected.
             self._send_json(refusal.status, {"error": refusal.reason,
-                                             "refused": True})
+                                             "refused": True},
+                            close=True)
 
     def _pipeline(self, path: str) -> str:
         """Resolve a caller-supplied pipeline path against the allowed root."""

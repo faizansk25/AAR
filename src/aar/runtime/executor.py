@@ -24,7 +24,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..engines import create_engine
-from ..failures import (DegradationLedger, FailureKind)
+from ..failures import (DegradationLedger, FailureKind, PolicyDenied)
+from ..governance.disclosure import (
+    Suppression, enforced_rule, strip_group_counts,
+)
 from ..interchange import Table
 from ..ir import Node, NodeType, topological_order
 from ..ir.identity import (
@@ -140,6 +143,10 @@ class ExecutionResult:
     #: observed duration lands here, so the next run on this machine plans
     #: from measurement rather than from a prior.
     history: Any = None
+    #: What each small-cell guard decided, in execution order. Evidence, not
+    #: a counter: "3 groups suppressed" and "no group fell below k" are very
+    #: different facts about a policy and only one of them is reassuring.
+    suppressions: list[Any] = field(default_factory=list)
 
     @property
     def elapsed_s(self) -> float:
@@ -163,6 +170,10 @@ class ExecutionResult:
             lines.append("")
             for target, rows in self.written:
                 lines.append(f"  wrote {target} ({rows:,} rows)")
+        if self.suppressions:
+            lines.append("")
+            for verdict in self.suppressions:
+                lines.append("  " + verdict.describe())
         lines.append("")
         lines.append(f"  {self.elapsed_s * 1e3:.1f} ms total, "
                      f"{self.rows:,} rows out")
@@ -175,13 +186,18 @@ class Executor:
     """Runs a plan and reports what actually happened."""
 
     __slots__ = ("_engines", "_options", "_strict", "_last_result",
-                 "_policy", "_subject", "_history", "_plan_root")
+                 "_policy", "_subject", "_history", "_plan_root",
+                 "_suppressions")
 
     def __init__(self, strict: bool = False, policy: Any = None,
                  subject: Any = None, history: Any = None,
                  **options: Any) -> None:
         #: One engine instance per id, reused across every node in the run.
         self._engines: dict[str, Any] = {}
+        #: What each small-cell guard decided, per guarded aggregate. Evidence
+        #: rather than a counter: a guard that silently fired on every group
+        #: would otherwise be indistinguishable from one that never ran.
+        self._suppressions: list[Any] = []
         self._options = dict(options)
         #: When True, a run that degraded at all is reported as a failure.
         #: Off by default: degrading to a slower engine still produces
@@ -331,6 +347,7 @@ class Executor:
 
         root = plan.root
         result.table = values.get(id(root))
+        result.suppressions = list(self._suppressions)
         result.finished_at = time.time()
         self._last_result = result
         return result
@@ -409,6 +426,117 @@ class Executor:
         return any(n.type is NodeType.SECURITY_FILTER
                    for n in topological_order(root))
 
+    def _enforce_disclosure(self, node: Node, table: Any,
+                           inputs: list[Any]) -> Any:
+        """Suppress aggregate groups below the minimum contributor count.
+
+        Runs here, immediately after the aggregate and before the result can
+        reach any consumer, for the same reason ``SECURITY_FILTER`` is
+        non-elidable: the obligation lives on the node, so it is enforced where
+        the number is produced rather than trusted to a later stage a planner
+        might reorder or drop.
+
+        Fail-closed throughout. If contributor cardinality cannot be
+        established the run is refused - "I could not measure the group size"
+        must never become "so I allowed the group".
+        """
+        rule = enforced_rule(node)
+        if rule is None:
+            return table
+
+        counts = self._group_counts(node, inputs)
+        smallest = min(counts.values()) if counts else None
+        suppressed = sum(1 for c in counts.values() if c < rule.min_group_size)
+        self._suppressions.append(Suppression(
+            node_id=node.id, rule=rule.rule, suppressed_groups=suppressed,
+            smallest_group=smallest,
+            reason=(f"{suppressed} group(s) below k={rule.min_group_size}"
+                    if suppressed else "no group fell below the minimum")))
+
+        if suppressed:
+            table = self._drop_small_groups(node, table, counts,
+                                            rule.min_group_size)
+        # Stripped unconditionally, guard or no suppression. The column is
+        # internal control metadata; leaving it on a result that happened to
+        # pass would hand the analyst the group sizes the rule protects.
+        return strip_group_counts(table)
+
+    def _group_counts(self, node: Node, inputs: list[Any]) -> dict[Any, int]:
+        """Contributor count per output group, counted from the aggregate's input.
+
+        Counted over ``inputs`` - the rows *entering* the aggregate - and not
+        over the result, because a result has one row per group and counting it
+        would report every group as having exactly one contributor, which
+        suppresses everything and looks like a working guard.
+
+        The input is post-RLS by construction: the barrier dominates everything
+        downstream, so these are exactly the rows the subject may see. That is
+        the ordering Round 26 established and the reason the count cannot live
+        after the aggregation.
+        """
+        rule = enforced_rule(node)
+        if rule is None:
+            return {}
+        if len(inputs) != 1:
+            raise PolicyDenied(
+                f"[{rule.rule}] cannot measure contributor cardinality for "
+                f"{node.id}: the aggregate has {len(inputs)} inputs, so 'the "
+                f"rows this group was computed from' is ambiguous. The run is "
+                f"refused rather than exposing aggregates of unknown size.")
+        frame = getattr(inputs[0], "arrow", None)
+        if frame is None:
+            raise PolicyDenied(
+                f"[{rule.rule}] cannot measure group sizes for {node.id}: its "
+                f"input has no columnar representation, so contributor "
+                f"cardinality cannot be established. The run is refused rather "
+                f"than exposing aggregates of unknown group size.")
+        names = set(getattr(inputs[0], "column_names", ()) or ())
+        keys = [k for k in node.key_left if k in names]
+        missing = [k for k in node.key_left if k not in names]
+        if missing:
+            raise PolicyDenied(
+                f"[{rule.rule}] cannot measure group sizes for {node.id}: the "
+                f"grouping column(s) {', '.join(missing)} are not present in "
+                f"the aggregate's input ({', '.join(sorted(names)) or 'none'}). "
+                f"The run is refused rather than guessing a group key.")
+        counts: dict[Any, int] = {}
+        for row in frame.to_pylist():
+            key = tuple(row.get(k) for k in keys) if keys else ()
+            counts[key] = counts.get(key, 0) + 1
+        return counts
+
+    def _drop_small_groups(self, node: Node, table: Any,
+                           counts: dict[Any, int], minimum: int) -> Any:
+        """Drop output groups whose contributor count is below ``minimum``.
+
+        Groups are *removed*, not rounded or jittered. Rounding an average over
+        four people is still an average over four people, and a suppression
+        that left a plausible number in place would be worse than none, because
+        it would look like the control had worked.
+        """
+        frame = getattr(table, "arrow", None)
+        if frame is None:
+            raise PolicyDenied(
+                f"[{enforced_rule(node).rule}] fired on {node.id} but the "
+                f"aggregate result cannot be filtered ({type(table).__name__} "
+                f"has no columnar form). The run is refused rather than "
+                f"exposing a small cell.")
+        names = list(table.column_names)
+        keys = [k for k in node.key_left if k in names]
+        kept = [row for row in frame.to_pylist()
+                if counts.get(tuple(row.get(k) for k in keys) if keys else (),
+                              0) >= minimum]
+        # Rebuilt from the surviving rows and re-typed from the original
+        # schema, so an all-suppressed result is still a well-formed table
+        # with zero rows rather than a schema the caller cannot read.
+        import pyarrow as pa
+
+        from ..interchange.table import Table
+
+        if not kept:
+            return Table.from_arrow(frame.slice(0, 0))
+        return Table.from_arrow(pa.Table.from_pylist(kept, schema=frame.schema))
+
     # ------------------------------------------------------------- dispatch
     @staticmethod
     def _runs_in_executor(node_type: NodeType) -> bool:
@@ -442,10 +570,12 @@ class Executor:
         if t is NodeType.PROJECT:
             return engine.project(_one(inputs), list(node.columns))
         if t is NodeType.GROUPBY:
-            return engine.group_by(_one(inputs), list(node.key_left),
-                                   _aggs(node))
+            table = engine.group_by(_one(inputs), list(node.key_left),
+                                    _aggs(node))
+            return self._enforce_disclosure(node, table, inputs)
         if t is NodeType.AGGREGATE:
-            return engine.group_by(_one(inputs), [], _aggs(node))
+            table = engine.group_by(_one(inputs), [], _aggs(node))
+            return self._enforce_disclosure(node, table, inputs)
         if t is NodeType.SORT:
             return engine.sort(_one(inputs), list(node.sort_keys))
         if t is NodeType.LIMIT:

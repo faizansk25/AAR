@@ -235,12 +235,23 @@ class Policy:
         above ``mask_threshold``.
     mask_threshold:
         Sensitivity at or above which masking applies.
+    disclosure:
+        Optional ``min_group_size`` rules. RLS and CLS both constrain *access*
+        - which rows, which columns. Neither constrains *inference*: a subject
+        who may read every row in their own department can still learn an
+        individual's salary from ``AVG`` over a group of one. This is that
+        separate control, and it is absent unless a policy asks for it.
     """
 
     allow_network: bool = False
     allow_network_kinds: frozenset[str] = frozenset()
     max_sensitivity: Sensitivity = Sensitivity.INTERNAL
     rls: Mapping[str, Any] = field(default_factory=dict)
+    #: Minimum-group-size rules enforced on aggregate results. Empty by
+    #: default: a disclosure control nobody configured must not silently
+    #: change results, and one that is configured must be enforced rather than
+    #: advisory.
+    disclosure: tuple[Any, ...] = ()
     #: ``role -> (RLSRule, ...)``, derived from :attr:`rls` in
     #: ``__post_init__``. Declared as a field rather than computed on demand so
     #: that a frozen dataclass still exposes it as data.
@@ -815,7 +826,7 @@ def policy_from_dict(raw: Any) -> Policy:
             f"a policy must be a JSON object, got {type(raw).__name__}")
     known = {"name", "allow_network", "allow_network_kinds",
              "max_sensitivity", "rls", "cls_drop", "cls_mask",
-             "mask_default", "mask_threshold"}
+             "mask_default", "mask_threshold", "disclosure"}
     unknown = sorted(set(raw) - known)
     if unknown:
         raise ValueError(
@@ -836,4 +847,55 @@ def policy_from_dict(raw: Any) -> Policy:
         cls_drop={k: list(v) for k, v in raw.get("cls_drop", {}).items()},
         cls_mask={k: [tuple(pair) for pair in v]
                   for k, v in raw.get("cls_mask", {}).items()},
+        disclosure=_disclosure_rules(raw.get("disclosure")),
     )
+
+
+def _disclosure_rules(raw: Any) -> tuple[Any, ...]:
+    """Normalise the ``disclosure`` key into :class:`DisclosureRule` objects.
+
+    Accepts an integer (the common case - one minimum group size), a list of
+    integers, or a list of mappings with ``min_group_size`` and an optional
+    ``rule`` name. An unknown key here is rejected for the same reason
+    ``mask_threshold`` is: a misspelled disclosure key would leave a policy that
+    looks like it protects small cells and does not.
+    """
+    from .disclosure import DisclosureRule
+
+    if raw is None:
+        return ()
+    if isinstance(raw, (int, str)) and not isinstance(raw, bool):
+        raw = [raw]
+    rules: list[DisclosureRule] = []
+    for item in raw:
+        if isinstance(item, bool):
+            raise ValueError(
+                f"disclosure must be a minimum group size, got {item!r}")
+        if isinstance(item, int):
+            rules.append(DisclosureRule(min_group_size=item))
+            continue
+        if isinstance(item, str):
+            # A bare string is not accepted: "5" and "five" are both plausible
+            # and neither says what the number counts.
+            raise ValueError(
+                f"disclosure rule {item!r} must be a number or a mapping with "
+                f"'min_group_size'; a string does not say what it counts")
+        if isinstance(item, dict):
+            unknown = sorted(set(item) - {"min_group_size", "rule"})
+            if unknown:
+                raise ValueError(
+                    f"unknown disclosure key(s): {', '.join(unknown)}; valid "
+                    f"keys are min_group_size, rule")
+            rules.append(DisclosureRule(
+                min_group_size=int(item.get("min_group_size", 5)),
+                rule=str(item.get("rule", "disclosure.min_group_size"))))
+            continue
+        raise ValueError(
+            f"a disclosure rule must be a number or a mapping, got "
+            f"{type(item).__name__}")
+    if not rules:
+        raise ValueError(
+            "disclosure is present but empty; omit the key entirely to have no "
+            "small-cell control, because a rule that is written but empty looks "
+            "configured and protects nothing")
+    return tuple(rules)

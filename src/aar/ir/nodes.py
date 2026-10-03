@@ -559,6 +559,12 @@ class Node:
     #: obligation it discharges.
     security_rule: str = ""
     source_scope: str = ""
+    #: Minimum-group-size rules enforced on *this* aggregate's results,
+    #: attached by :func:`aar.governance.disclosure.apply_disclosure_control`.
+    #: Held on the node rather than in a rewrite-time return value so that a
+    #: planner rewrite, a pushdown or a tree rebuild cannot quietly drop an
+    #: obligation that is still in force.
+    disclosure_rules: tuple[Any, ...] = ()
     limit: int | None = None
     target: str | None = None
     write_format: str | None = None
